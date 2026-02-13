@@ -1591,6 +1591,21 @@ if(WITH_TESTS)
       endif()
   endforeach(sourcefile ${TESTS})
 
+  add_executable(simulated_hybrid_file_system_test${ARTIFACT_SUFFIX}
+      tools/nvm_fs/simulated_hybrid_file_system_test.cc
+      tools/nvm_fs/simulated_hybrid_file_system.cc)
+  set_target_properties(simulated_hybrid_file_system_test${ARTIFACT_SUFFIX}
+    PROPERTIES EXCLUDE_FROM_DEFAULT_BUILD_RELEASE 1
+    EXCLUDE_FROM_DEFAULT_BUILD_MINRELEASE 1
+    EXCLUDE_FROM_DEFAULT_BUILD_RELWITHDEBINFO 1
+    OUTPUT_NAME simulated_hybrid_file_system_test${ARTIFACT_SUFFIX}
+  )
+  target_link_libraries(simulated_hybrid_file_system_test${ARTIFACT_SUFFIX}
+    testutillib${ARTIFACT_SUFFIX} testharness gtest ${THIRDPARTY_LIBS}
+    ${ROCKSDB_LIB})
+  gtest_discover_tests(simulated_hybrid_file_system_test DISCOVERY_TIMEOUT 120)
+  add_dependencies(rocksdb_check simulated_hybrid_file_system_test${ARTIFACT_SUFFIX})
+
   if(WIN32)
     # C executables must link to a shared object
     if(ROCKSDB_BUILD_SHARED)
@@ -1613,11 +1628,17 @@ endif()
 
 if(WITH_BENCHMARK_TOOLS)
   add_executable(db_bench${ARTIFACT_SUFFIX}
-    tools/simulated_hybrid_file_system.cc
+    tools/nvm_fs/simulated_hybrid_file_system.cc
     tools/db_bench.cc
     tools/tool_hooks.cc
     tools/db_bench_tool.cc)
   target_link_libraries(db_bench${ARTIFACT_SUFFIX}
+    ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
+
+  add_executable(envfs_profile_tool${ARTIFACT_SUFFIX}
+    tools/nvm_fs/simulated_hybrid_file_system.cc
+    tools/nvm_fs/envfs_profile_tool.cc)
+  target_link_libraries(envfs_profile_tool${ARTIFACT_SUFFIX}
     ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
 
   add_executable(cache_bench${ARTIFACT_SUFFIX}

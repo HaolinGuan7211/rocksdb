@@ -28,9 +28,13 @@
 #include <sys/sysctl.h>
 #endif
 #include <atomic>
+#include <algorithm>
+#include <cctype>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -52,7 +56,9 @@
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/filter_policy.h"
+#include "rocksdb/iostats_context.h"
 #include "rocksdb/memtablerep.h"
+#include "rocksdb/metadata.h"
 #include "rocksdb/options.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/persistent_cache.h"
@@ -75,7 +81,7 @@
 #include "rocksdb/write_batch.h"
 #include "test_util/testutil.h"
 #include "test_util/transaction_test_util.h"
-#include "tools/simulated_hybrid_file_system.h"
+#include "tools/nvm_fs/simulated_hybrid_file_system.h"
 #include "util/cast_util.h"
 #include "util/compression.h"
 #include "util/crc32c.h"
@@ -1456,6 +1462,69 @@ DEFINE_int32(simulate_hybrid_hdd_multipliers, 1,
              "In simulate_hybrid_fs_file or simulate_hdd mode, how many HDDs "
              "are simulated.");
 DEFINE_bool(simulate_hdd, false, "Simulate read/write latency on HDD.");
+DEFINE_bool(
+    simulate_xp_nvm, false,
+    "Enable XP-like NVM latency simulation in the filesystem wrapper.");
+DEFINE_bool(simulate_dimm_nvm, false,
+            "Enable single-DIMM NVM simulation model in the filesystem "
+            "wrapper.");
+DEFINE_uint64(simulate_xp_line_bytes, 256,
+              "XP-like write/read granularity in bytes.");
+DEFINE_uint64(simulate_xp_buffer_bytes, 16 * 1024,
+              "XP-like write buffer size in bytes.");
+DEFINE_uint64(simulate_xp_latency_ns, 300,
+              "Fixed latency in nanoseconds per XP line.");
+DEFINE_uint64(simulate_xp_rpq_depth, 64,
+              "Depth of simulated PMEM read pending queue (RPQ).");
+DEFINE_uint64(simulate_xp_wpq_depth, 64,
+              "Depth of simulated PMEM write pending queue (WPQ).");
+DEFINE_uint64(
+    simulate_xp_wpq_submit_ns, 100,
+    "Write completion latency in nanoseconds when a request is accepted into "
+    "WPQ.");
+DEFINE_uint64(simulate_xp_prefetch_hit_ns, 120,
+              "Read latency in nanoseconds when simulated XP prefetch hits.");
+DEFINE_uint64(simulate_xp_dram_seq_read_ns, 81,
+              "Baseline DRAM-side read latency (ns) for sequential reads.");
+DEFINE_uint64(simulate_xp_dram_rand_read_ns, 101,
+              "Baseline DRAM-side read latency (ns) for random reads.");
+DEFINE_bool(simulate_xp_enable_prefetch, true,
+            "Enable XPBuffer-assisted prefetch optimization for sequential "
+            "reads.");
+DEFINE_bool(simulate_xp_share_buffer_between_rw, true,
+            "Share XPBuffer between read prefetch and write merge to model "
+            "read-write contention.");
+DEFINE_bool(simulate_xp_redirect_to_tmpfs, false,
+            "Redirect files selected by XP simulation to tmpfs root.");
+DEFINE_string(simulate_xp_tmpfs_root, "/dev/shm/tmpfs",
+              "Tmpfs root used when --simulate_xp_redirect_to_tmpfs=1.");
+DEFINE_string(
+    simulate_xp_path_prefix, "",
+    "Optional absolute path prefix to limit XP simulation to matching files. "
+    "Empty means all files.");
+DEFINE_string(simulate_xp_levels, "",
+              "Optional comma-separated SST levels to apply XP simulation to. "
+              "Example: \"0,1\". Empty means all levels.");
+DEFINE_string(simulate_xp_stats_file, "",
+              "Optional output path to dump simulated storage model stats.");
+
+DEFINE_uint64(simulate_dimm_fixed_read_overhead_ns, 1080,
+              "Single-DIMM NVM: fixed host-side read overhead in ns.");
+DEFINE_uint64(simulate_dimm_fixed_write_overhead_ns, 0,
+              "Single-DIMM NVM: fixed host-side write overhead in ns.");
+DEFINE_double(simulate_dimm_seq_read_bw_gbps, 6.6,
+              "Single-DIMM NVM: max sequential read bandwidth in GB/s "
+              "(decimal, 1GB=1e9 bytes).");
+DEFINE_double(simulate_dimm_seq_write_bw_gbps, 2.3,
+              "Single-DIMM NVM: max sequential write bandwidth in GB/s "
+              "(decimal, 1GB=1e9 bytes).");
+DEFINE_double(simulate_dimm_rand_bw_scale, 0.95,
+              "Single-DIMM NVM: random bandwidth multiplier. 0.95 means "
+              "random bandwidth is 95% of sequential (5% drop).");
+DEFINE_double(simulate_dimm_sub_line_random_media_amp, 5.0,
+              "Single-DIMM NVM: for random accesses smaller than the IO line "
+              "size, amplify media bytes by this factor to model additional "
+              "throughput degradation.");
 
 DEFINE_int64(
     preclude_last_level_data_seconds, 0,
@@ -1498,6 +1567,19 @@ DEFINE_int32(thread_status_per_interval, 0,
 
 DEFINE_int32(perf_level, ROCKSDB_NAMESPACE::PerfLevel::kDisable,
              "Level of perf collection");
+
+DEFINE_string(tail_probe_output, "",
+              "If non-empty, append tail seek samples to this CSV file.");
+DEFINE_int64(
+    tail_probe_threshold_us, 0,
+    "Tail latency threshold in microseconds. Tail samples are captured only "
+    "for seek ops with latency >= this threshold. <=0 disables tail probe.");
+DEFINE_uint64(tail_probe_max_samples, 20000,
+              "Maximum tail samples to write per db_bench process.");
+DEFINE_string(tail_probe_case_label, "",
+              "Optional case label attached to each tail sample row.");
+DEFINE_string(tail_probe_scenario, "",
+              "Optional scenario name attached to each tail sample row.");
 
 DEFINE_uint64(soft_pending_compaction_bytes_limit, 64ull * 1024 * 1024 * 1024,
               "Slowdown writes if pending compaction bytes exceed this number");
@@ -1593,6 +1675,62 @@ DEFINE_double(keyrange_dist_d, 0.0,
 DEFINE_int64(keyrange_num, 1,
              "The number of key ranges that are in the same prefix "
              "group, each prefix range will have its key access distribution");
+DEFINE_int64(
+    mix_hot_keyrange_count, 0,
+    "If > 0, keep only this many hot key ranges in mixgraph prefix modeling. "
+    "Selected hot ranges are spread across the key space; non-hot ranges are "
+    "disabled (zero access probability).");
+DEFINE_bool(
+    mix_hotset_enable, false,
+    "Enable paper-style two-level hot set in mixgraph. When enabled, top-K "
+    "hot key-ranges get most accesses and each hot key-range has a contiguous "
+    "hot key window.");
+DEFINE_double(
+    mix_hotset_range_pct, 0.03,
+    "When mix_hotset_enable=1 and mix_hot_keyrange_count=0, the top hot "
+    "key-range ratio. Typical value is 0.01~0.05.");
+DEFINE_double(
+    mix_hotset_range_access_pct, 0.88,
+    "When mix_hotset_enable=1, the share of total requests assigned to top-K "
+    "hot key-ranges. Typical value is 0.85~0.90.");
+DEFINE_double(
+    mix_hotset_range_zipf_theta, 1.0,
+    "When mix_hotset_enable=1, Zipf theta used inside hot and cold key-range "
+    "groups.");
+DEFINE_double(
+    mix_hotset_key_pct, 0.01,
+    "When mix_hotset_enable=1, contiguous hot key window size inside each hot "
+    "key-range as a fraction of that key-range.");
+DEFINE_double(
+    mix_hotset_key_access_pct, 0.80,
+    "When mix_hotset_enable=1, request share to the contiguous hot key window "
+    "inside each hot key-range. Typical value is 0.70~0.90.");
+DEFINE_bool(
+    mix_hotset_evenly_spread_ranges, true,
+    "When mix_hotset_enable=1, spread hot key-ranges across full key space "
+    "instead of packing them at the beginning.");
+DEFINE_bool(
+    mix_shift_enable, false,
+    "Enable time-based hot-range shifting for mixgraph hotset. Requires "
+    "mix_hotset_enable=1.");
+DEFINE_string(
+    mix_shift_mode, "step_jump",
+    "Hot-range shift mode in mixgraph hotset. Supported: step_jump, "
+    "rolling_window.");
+DEFINE_int64(mix_shift_stage_seconds, 300,
+             "Shift stage duration in seconds when mix_shift_enable=1.");
+DEFINE_int64(
+    mix_shift_stride_ranges, 1,
+    "Range shift stride applied per stage when mix_shift_enable=1.");
+DEFINE_int64(
+    mix_shift_jump_multiplier, 4,
+    "In step_jump mode, jump distance multiplier of hot_count per stage.");
+DEFINE_int64(
+    mix_shift_base_start_range, 0,
+    "Start range id of stage-0 hot window when mix_shift_enable=1.");
+DEFINE_bool(
+    mix_shift_log_stage_transitions, false,
+    "If true, log mixgraph hot-range stage transitions to stderr.");
 DEFINE_double(key_dist_a, 0.0,
               "The parameter 'a' of key access distribution model f(x)=a*x^b");
 DEFINE_double(key_dist_b, 0.0,
@@ -2248,6 +2386,317 @@ class ReporterAgent {
   bool stop_;
 };
 
+struct TailProbeSnapshot {
+  uint64_t user_key_comparison_count = 0;
+  uint64_t block_cache_hit_count = 0;
+  uint64_t block_read_count = 0;
+  uint64_t block_read_byte = 0;
+  uint64_t block_read_time = 0;
+  uint64_t block_read_cpu_time = 0;
+  uint64_t block_cache_index_hit_count = 0;
+  uint64_t block_cache_filter_hit_count = 0;
+  uint64_t block_checksum_time = 0;
+  uint64_t block_decompress_time = 0;
+  uint64_t get_post_process_time = 0;
+  uint64_t get_from_output_files_time = 0;
+  uint64_t seek_on_memtable_time = 0;
+  uint64_t seek_child_seek_time = 0;
+  uint64_t seek_min_heap_time = 0;
+  uint64_t seek_max_heap_time = 0;
+  uint64_t seek_internal_seek_time = 0;
+  uint64_t find_next_user_entry_time = 0;
+  uint64_t read_index_block_nanos = 0;
+  uint64_t read_filter_block_nanos = 0;
+  uint64_t new_table_block_iter_nanos = 0;
+  uint64_t new_table_iterator_nanos = 0;
+  uint64_t block_seek_nanos = 0;
+  uint64_t find_table_nanos = 0;
+  uint64_t iter_seek_cpu_nanos = 0;
+  uint64_t get_cpu_nanos = 0;
+  uint64_t iter_read_bytes = 0;
+  uint64_t iter_seek_count = 0;
+  uint64_t bloom_memtable_hit_count = 0;
+  uint64_t bloom_memtable_miss_count = 0;
+  uint64_t bloom_sst_hit_count = 0;
+  uint64_t bloom_sst_miss_count = 0;
+
+  uint64_t io_bytes_read = 0;
+  uint64_t io_read_nanos = 0;
+  uint64_t io_cpu_read_nanos = 0;
+  uint64_t io_bytes_written = 0;
+  uint64_t io_write_nanos = 0;
+};
+
+static inline uint64_t SafeDelta(uint64_t current, uint64_t previous) {
+  return (current >= previous) ? (current - previous) : 0;
+}
+
+static inline std::string SanitizeCsvField(std::string field) {
+  std::replace(field.begin(), field.end(), ',', ';');
+  std::replace(field.begin(), field.end(), '\n', ' ');
+  std::replace(field.begin(), field.end(), '\r', ' ');
+  return field;
+}
+
+static TailProbeSnapshot CaptureTailProbeSnapshot() {
+  TailProbeSnapshot out;
+  const auto* perf = get_perf_context();
+  const auto* io = get_iostats_context();
+  if (perf != nullptr) {
+    out.user_key_comparison_count = perf->user_key_comparison_count;
+    out.block_cache_hit_count = perf->block_cache_hit_count;
+    out.block_read_count = perf->block_read_count;
+    out.block_read_byte = perf->block_read_byte;
+    out.block_read_time = perf->block_read_time;
+    out.block_read_cpu_time = perf->block_read_cpu_time;
+    out.block_cache_index_hit_count = perf->block_cache_index_hit_count;
+    out.block_cache_filter_hit_count = perf->block_cache_filter_hit_count;
+    out.block_checksum_time = perf->block_checksum_time;
+    out.block_decompress_time = perf->block_decompress_time;
+    out.get_post_process_time = perf->get_post_process_time;
+    out.get_from_output_files_time = perf->get_from_output_files_time;
+    out.seek_on_memtable_time = perf->seek_on_memtable_time;
+    out.seek_child_seek_time = perf->seek_child_seek_time;
+    out.seek_min_heap_time = perf->seek_min_heap_time;
+    out.seek_max_heap_time = perf->seek_max_heap_time;
+    out.seek_internal_seek_time = perf->seek_internal_seek_time;
+    out.find_next_user_entry_time = perf->find_next_user_entry_time;
+    out.read_index_block_nanos = perf->read_index_block_nanos;
+    out.read_filter_block_nanos = perf->read_filter_block_nanos;
+    out.new_table_block_iter_nanos = perf->new_table_block_iter_nanos;
+    out.new_table_iterator_nanos = perf->new_table_iterator_nanos;
+    out.block_seek_nanos = perf->block_seek_nanos;
+    out.find_table_nanos = perf->find_table_nanos;
+    out.iter_seek_cpu_nanos = perf->iter_seek_cpu_nanos;
+    out.get_cpu_nanos = perf->get_cpu_nanos;
+    out.iter_read_bytes = perf->iter_read_bytes;
+    out.iter_seek_count = perf->iter_seek_count;
+    out.bloom_memtable_hit_count = perf->bloom_memtable_hit_count;
+    out.bloom_memtable_miss_count = perf->bloom_memtable_miss_count;
+    out.bloom_sst_hit_count = perf->bloom_sst_hit_count;
+    out.bloom_sst_miss_count = perf->bloom_sst_miss_count;
+  }
+  if (io != nullptr) {
+    out.io_bytes_read = io->bytes_read;
+    out.io_read_nanos = io->read_nanos;
+    out.io_cpu_read_nanos = io->cpu_read_nanos;
+    out.io_bytes_written = io->bytes_written;
+    out.io_write_nanos = io->write_nanos;
+  }
+  return out;
+}
+
+static TailProbeSnapshot DeltaTailProbeSnapshot(const TailProbeSnapshot& current,
+                                                const TailProbeSnapshot& prev) {
+  TailProbeSnapshot delta;
+  delta.user_key_comparison_count =
+      SafeDelta(current.user_key_comparison_count, prev.user_key_comparison_count);
+  delta.block_cache_hit_count =
+      SafeDelta(current.block_cache_hit_count, prev.block_cache_hit_count);
+  delta.block_read_count = SafeDelta(current.block_read_count, prev.block_read_count);
+  delta.block_read_byte = SafeDelta(current.block_read_byte, prev.block_read_byte);
+  delta.block_read_time = SafeDelta(current.block_read_time, prev.block_read_time);
+  delta.block_read_cpu_time =
+      SafeDelta(current.block_read_cpu_time, prev.block_read_cpu_time);
+  delta.block_cache_index_hit_count = SafeDelta(
+      current.block_cache_index_hit_count, prev.block_cache_index_hit_count);
+  delta.block_cache_filter_hit_count = SafeDelta(
+      current.block_cache_filter_hit_count, prev.block_cache_filter_hit_count);
+  delta.block_checksum_time =
+      SafeDelta(current.block_checksum_time, prev.block_checksum_time);
+  delta.block_decompress_time =
+      SafeDelta(current.block_decompress_time, prev.block_decompress_time);
+  delta.get_post_process_time =
+      SafeDelta(current.get_post_process_time, prev.get_post_process_time);
+  delta.get_from_output_files_time = SafeDelta(current.get_from_output_files_time,
+                                               prev.get_from_output_files_time);
+  delta.seek_on_memtable_time =
+      SafeDelta(current.seek_on_memtable_time, prev.seek_on_memtable_time);
+  delta.seek_child_seek_time =
+      SafeDelta(current.seek_child_seek_time, prev.seek_child_seek_time);
+  delta.seek_min_heap_time =
+      SafeDelta(current.seek_min_heap_time, prev.seek_min_heap_time);
+  delta.seek_max_heap_time =
+      SafeDelta(current.seek_max_heap_time, prev.seek_max_heap_time);
+  delta.seek_internal_seek_time =
+      SafeDelta(current.seek_internal_seek_time, prev.seek_internal_seek_time);
+  delta.find_next_user_entry_time = SafeDelta(current.find_next_user_entry_time,
+                                              prev.find_next_user_entry_time);
+  delta.read_index_block_nanos =
+      SafeDelta(current.read_index_block_nanos, prev.read_index_block_nanos);
+  delta.read_filter_block_nanos =
+      SafeDelta(current.read_filter_block_nanos, prev.read_filter_block_nanos);
+  delta.new_table_block_iter_nanos = SafeDelta(current.new_table_block_iter_nanos,
+                                               prev.new_table_block_iter_nanos);
+  delta.new_table_iterator_nanos = SafeDelta(current.new_table_iterator_nanos,
+                                             prev.new_table_iterator_nanos);
+  delta.block_seek_nanos = SafeDelta(current.block_seek_nanos, prev.block_seek_nanos);
+  delta.find_table_nanos = SafeDelta(current.find_table_nanos, prev.find_table_nanos);
+  delta.iter_seek_cpu_nanos =
+      SafeDelta(current.iter_seek_cpu_nanos, prev.iter_seek_cpu_nanos);
+  delta.get_cpu_nanos = SafeDelta(current.get_cpu_nanos, prev.get_cpu_nanos);
+  delta.iter_read_bytes = SafeDelta(current.iter_read_bytes, prev.iter_read_bytes);
+  delta.iter_seek_count = SafeDelta(current.iter_seek_count, prev.iter_seek_count);
+  delta.bloom_memtable_hit_count =
+      SafeDelta(current.bloom_memtable_hit_count, prev.bloom_memtable_hit_count);
+  delta.bloom_memtable_miss_count = SafeDelta(current.bloom_memtable_miss_count,
+                                              prev.bloom_memtable_miss_count);
+  delta.bloom_sst_hit_count =
+      SafeDelta(current.bloom_sst_hit_count, prev.bloom_sst_hit_count);
+  delta.bloom_sst_miss_count =
+      SafeDelta(current.bloom_sst_miss_count, prev.bloom_sst_miss_count);
+
+  delta.io_bytes_read = SafeDelta(current.io_bytes_read, prev.io_bytes_read);
+  delta.io_read_nanos = SafeDelta(current.io_read_nanos, prev.io_read_nanos);
+  delta.io_cpu_read_nanos =
+      SafeDelta(current.io_cpu_read_nanos, prev.io_cpu_read_nanos);
+  delta.io_bytes_written =
+      SafeDelta(current.io_bytes_written, prev.io_bytes_written);
+  delta.io_write_nanos = SafeDelta(current.io_write_nanos, prev.io_write_nanos);
+  return delta;
+}
+
+class TailProbeWriter {
+ public:
+  TailProbeWriter(std::string path, uint64_t max_samples)
+      : output_path_(std::move(path)),
+        max_samples_(max_samples == 0 ? 1 : max_samples),
+        file_(nullptr) {
+    bool has_data = false;
+    {
+      std::ifstream in(output_path_);
+      has_data = in.good() &&
+                 in.peek() != std::ifstream::traits_type::eof();
+    }
+
+    file_ = std::fopen(output_path_.c_str(), "a");
+    if (file_ == nullptr) {
+      fprintf(stderr, "tail probe disabled: cannot open %s\n",
+              output_path_.c_str());
+      return;
+    }
+    enabled_ = true;
+    if (!has_data) {
+      WriteHeader();
+    }
+  }
+
+  ~TailProbeWriter() {
+    if (file_ != nullptr) {
+      std::fflush(file_);
+      std::fclose(file_);
+      file_ = nullptr;
+    }
+  }
+
+  bool Enabled() const { return enabled_; }
+
+  bool Record(uint64_t wall_time_us, int thread_id, uint64_t latency_us,
+              const std::string& case_label, const std::string& scenario,
+              const TailProbeSnapshot& delta) {
+    if (!enabled_ || file_ == nullptr) {
+      return false;
+    }
+    const uint64_t sample_id = next_sample_id_.fetch_add(1) + 1;
+    if (sample_id > max_samples_) {
+      dropped_samples_.fetch_add(1);
+      return false;
+    }
+    auto append_u64 = [](std::string* row, uint64_t v) {
+      row->append(std::to_string(v));
+      row->push_back(',');
+    };
+    std::lock_guard<std::mutex> lk(mu_);
+    std::string row;
+    row.reserve(768);
+    append_u64(&row, sample_id);
+    append_u64(&row, wall_time_us);
+    row.append(std::to_string(thread_id));
+    row.push_back(',');
+    append_u64(&row, latency_us);
+    row.append(SanitizeCsvField(case_label));
+    row.push_back(',');
+    row.append(SanitizeCsvField(scenario));
+    row.push_back(',');
+    append_u64(&row, delta.user_key_comparison_count);
+    append_u64(&row, delta.block_cache_hit_count);
+    append_u64(&row, delta.block_read_count);
+    append_u64(&row, delta.block_read_byte);
+    append_u64(&row, delta.block_read_time);
+    append_u64(&row, delta.block_read_cpu_time);
+    append_u64(&row, delta.block_cache_index_hit_count);
+    append_u64(&row, delta.block_cache_filter_hit_count);
+    append_u64(&row, delta.block_checksum_time);
+    append_u64(&row, delta.block_decompress_time);
+    append_u64(&row, delta.get_post_process_time);
+    append_u64(&row, delta.get_from_output_files_time);
+    append_u64(&row, delta.seek_on_memtable_time);
+    append_u64(&row, delta.seek_child_seek_time);
+    append_u64(&row, delta.seek_min_heap_time);
+    append_u64(&row, delta.seek_max_heap_time);
+    append_u64(&row, delta.seek_internal_seek_time);
+    append_u64(&row, delta.find_next_user_entry_time);
+    append_u64(&row, delta.read_index_block_nanos);
+    append_u64(&row, delta.read_filter_block_nanos);
+    append_u64(&row, delta.new_table_block_iter_nanos);
+    append_u64(&row, delta.new_table_iterator_nanos);
+    append_u64(&row, delta.block_seek_nanos);
+    append_u64(&row, delta.find_table_nanos);
+    append_u64(&row, delta.iter_seek_cpu_nanos);
+    append_u64(&row, delta.get_cpu_nanos);
+    append_u64(&row, delta.iter_read_bytes);
+    append_u64(&row, delta.iter_seek_count);
+    append_u64(&row, delta.bloom_memtable_hit_count);
+    append_u64(&row, delta.bloom_memtable_miss_count);
+    append_u64(&row, delta.bloom_sst_hit_count);
+    append_u64(&row, delta.bloom_sst_miss_count);
+    append_u64(&row, delta.io_bytes_read);
+    append_u64(&row, delta.io_read_nanos);
+    append_u64(&row, delta.io_cpu_read_nanos);
+    append_u64(&row, delta.io_bytes_written);
+    row.append(std::to_string(delta.io_write_nanos));
+    row.push_back('\n');
+    std::fwrite(row.data(), 1, row.size(), file_);
+    std::fflush(file_);
+    return true;
+  }
+
+  uint64_t dropped_samples() const { return dropped_samples_.load(); }
+
+ private:
+  void WriteHeader() {
+    static const char* header =
+        "sample_id,wall_time_us,thread_id,latency_us,case_label,scenario,"
+        "delta_user_key_comparison_count,delta_block_cache_hit_count,"
+        "delta_block_read_count,delta_block_read_byte,delta_block_read_time_ns,"
+        "delta_block_read_cpu_time_ns,delta_block_cache_index_hit_count,"
+        "delta_block_cache_filter_hit_count,delta_block_checksum_time_ns,"
+        "delta_block_decompress_time_ns,delta_get_post_process_time_ns,"
+        "delta_get_from_output_files_time_ns,delta_seek_on_memtable_time_ns,"
+        "delta_seek_child_seek_time_ns,delta_seek_min_heap_time_ns,"
+        "delta_seek_max_heap_time_ns,delta_seek_internal_seek_time_ns,"
+        "delta_find_next_user_entry_time_ns,delta_read_index_block_nanos,"
+        "delta_read_filter_block_nanos,delta_new_table_block_iter_nanos,"
+        "delta_new_table_iterator_nanos,delta_block_seek_nanos,"
+        "delta_find_table_nanos,delta_iter_seek_cpu_nanos,"
+        "delta_get_cpu_nanos,delta_iter_read_bytes,delta_iter_seek_count,"
+        "delta_bloom_memtable_hit_count,delta_bloom_memtable_miss_count,"
+        "delta_bloom_sst_hit_count,delta_bloom_sst_miss_count,"
+        "delta_io_bytes_read,delta_io_read_nanos,delta_io_cpu_read_nanos,"
+        "delta_io_bytes_written,delta_io_write_nanos\n";
+    std::fputs(header, file_);
+    std::fflush(file_);
+  }
+
+  std::string output_path_;
+  uint64_t max_samples_;
+  std::FILE* file_;
+  std::atomic<uint64_t> next_sample_id_{0};
+  std::atomic<uint64_t> dropped_samples_{0};
+  std::mutex mu_;
+  bool enabled_ = false;
+};
+
 enum OperationType : unsigned char {
   kRead = 0,
   kWrite,
@@ -2271,6 +2720,12 @@ static std::unordered_map<OperationType, std::string, std::hash<unsigned char>>
                            {kCrc, "crc"},           {kHash, "hash"},
                            {kOthers, "op"},         {kMultiScan, "multiscan"}};
 
+static inline bool SupportsTailSeekProbe(const Slice& bench_name) {
+  return bench_name == "mixgraph" || bench_name == "seekrandom" ||
+         bench_name == "seekrandomwhilewriting" ||
+         bench_name == "seekrandomwhilemerging" || bench_name == "readwhilewriting";
+}
+
 class CombinedStats;
 class Stats {
  private:
@@ -2292,6 +2747,13 @@ class Stats {
   std::string message_;
   bool exclude_from_merge_;
   ReporterAgent* reporter_agent_;  // does not own
+  bool tail_probe_enabled_ = false;
+  uint64_t tail_probe_threshold_us_ = 0;
+  std::string tail_probe_case_label_;
+  std::string tail_probe_scenario_;
+  std::shared_ptr<TailProbeWriter> tail_probe_writer_;
+  bool tail_probe_snapshot_initialized_ = false;
+  TailProbeSnapshot tail_probe_prev_snapshot_;
   friend class CombinedStats;
 
  public:
@@ -2299,6 +2761,20 @@ class Stats {
 
   void SetReporterAgent(ReporterAgent* reporter_agent) {
     reporter_agent_ = reporter_agent;
+  }
+
+  void ConfigureTailProbe(std::shared_ptr<TailProbeWriter> writer,
+                          uint64_t threshold_us,
+                          const std::string& case_label,
+                          const std::string& scenario) {
+    tail_probe_writer_ = std::move(writer);
+    tail_probe_enabled_ = (tail_probe_writer_ != nullptr) &&
+                          tail_probe_writer_->Enabled() &&
+                          threshold_us > 0;
+    tail_probe_threshold_us_ = threshold_us;
+    tail_probe_case_label_ = case_label;
+    tail_probe_scenario_ = scenario;
+    tail_probe_snapshot_initialized_ = false;
   }
 
   void Start(int id) {
@@ -2317,6 +2793,11 @@ class Stats {
     message_.clear();
     // When set, stats from this thread won't be merged with others.
     exclude_from_merge_ = false;
+    tail_probe_snapshot_initialized_ = false;
+    if (tail_probe_enabled_) {
+      tail_probe_prev_snapshot_ = CaptureTailProbeSnapshot();
+      tail_probe_snapshot_initialized_ = true;
+    }
   }
 
   void Merge(const Stats& other) {
@@ -2405,10 +2886,16 @@ class Stats {
     if (reporter_agent_) {
       reporter_agent_->ReportFinishedOps(num_ops);
     }
-    if (FLAGS_histogram) {
-      uint64_t now = clock_->NowMicros();
-      uint64_t micros = now - last_op_finish_;
+    uint64_t now = 0;
+    uint64_t micros = 0;
+    const bool need_latency = FLAGS_histogram || tail_probe_enabled_;
+    if (need_latency) {
+      now = clock_->NowMicros();
+      micros = now - last_op_finish_;
+      last_op_finish_ = now;
+    }
 
+    if (FLAGS_histogram) {
       if (hist_.find(op_type) == hist_.end()) {
         auto hist_temp = std::make_shared<HistogramImpl>();
         hist_.insert({op_type, std::move(hist_temp)});
@@ -2419,7 +2906,26 @@ class Stats {
         fprintf(stderr, "long op: %" PRIu64 " micros%30s\r", micros, "");
         fflush(stderr);
       }
-      last_op_finish_ = now;
+    }
+
+    if (tail_probe_enabled_) {
+      TailProbeSnapshot current = CaptureTailProbeSnapshot();
+      if (tail_probe_snapshot_initialized_ &&
+          op_type == kSeek && micros >= tail_probe_threshold_us_ &&
+          tail_probe_writer_ != nullptr) {
+        TailProbeSnapshot delta =
+            DeltaTailProbeSnapshot(current, tail_probe_prev_snapshot_);
+        const std::string& case_label =
+            tail_probe_case_label_.empty() ? std::string("NA")
+                                           : tail_probe_case_label_;
+        const std::string& scenario =
+            tail_probe_scenario_.empty() ? std::string("seek")
+                                         : tail_probe_scenario_;
+        tail_probe_writer_->Record(now, id_, micros, case_label, scenario,
+                                   delta);
+      }
+      tail_probe_prev_snapshot_ = current;
+      tail_probe_snapshot_initialized_ = true;
     }
 
     done_ += num_ops;
@@ -2442,8 +2948,8 @@ class Stats {
         }
         fprintf(stderr, "... finished %" PRIu64 " ops%30s\r", done_, "");
       } else {
-        uint64_t now = clock_->NowMicros();
-        int64_t usecs_since_last = now - last_report_finish_;
+        uint64_t now_report = clock_->NowMicros();
+        int64_t usecs_since_last = now_report - last_report_finish_;
 
         // Determine whether to print status where interval is either
         // each N operations or each N seconds.
@@ -2458,12 +2964,12 @@ class Stats {
                   "%s ... thread %d: (%" PRIu64 ",%" PRIu64
                   ") ops and "
                   "(%.1f,%.1f) ops/second in (%.6f,%.6f) seconds\n",
-                  clock_->TimeToString(now / 1000000).c_str(), id_,
+                  clock_->TimeToString(now_report / 1000000).c_str(), id_,
                   done_ - last_report_done_, done_,
                   (done_ - last_report_done_) / (usecs_since_last / 1000000.0),
-                  done_ / ((now - start_) / 1000000.0),
-                  (now - last_report_finish_) / 1000000.0,
-                  (now - start_) / 1000000.0);
+                  done_ / ((now_report - start_) / 1000000.0),
+                  (now_report - last_report_finish_) / 1000000.0,
+                  (now_report - start_) / 1000000.0);
 
           if (id_ == 0 && FLAGS_stats_per_interval) {
             std::string stats;
@@ -2515,7 +3021,7 @@ class Stats {
           }
 
           next_report_ += FLAGS_stats_interval;
-          last_report_finish_ = now;
+          last_report_finish_ = now_report;
           last_report_done_ = done_;
         }
       }
@@ -2779,6 +3285,11 @@ struct SharedState {
   long num_initialized;
   long num_done;
   bool start;
+  bool tail_probe_enabled = false;
+  uint64_t tail_probe_threshold_us = 0;
+  std::string tail_probe_case_label;
+  std::string tail_probe_scenario;
+  std::shared_ptr<TailProbeWriter> tail_probe_writer;
 
   SharedState() : cv(&mu), perf_level(FLAGS_perf_level) {}
 };
@@ -2918,7 +3429,99 @@ class Benchmark {
     bool recovery_complete_;
   };
 
+  class SimulatedXpLevelListener : public EventListener {
+   public:
+    ~SimulatedXpLevelListener() override = default;
+
+    const char* Name() const override { return kClassName(); }
+    static const char* kClassName() { return "SimulatedXpLevelListener"; }
+
+    void OnFlushCompleted(DB* /*db*/, const FlushJobInfo& flush_job_info) override {
+      if (IsSstPath(flush_job_info.file_path)) {
+        RegisterSimulatedFsFileLevel(flush_job_info.file_path, 0);
+      }
+    }
+
+    void OnCompactionBegin(DB* /*db*/, const CompactionJobInfo& ci) override {
+      std::lock_guard<std::mutex> lk(mu_);
+      compaction_job_output_level_[ci.job_id] = ci.output_level;
+    }
+
+    void OnCompactionCompleted(DB* /*db*/, const CompactionJobInfo& ci) override {
+      if (ci.status.ok()) {
+        if (!ci.output_file_infos.empty() &&
+            ci.output_file_infos.size() == ci.output_files.size()) {
+          for (size_t i = 0; i < ci.output_files.size(); ++i) {
+            if (IsSstPath(ci.output_files[i])) {
+              RegisterSimulatedFsFileLevel(ci.output_files[i],
+                                           ci.output_file_infos[i].level);
+            }
+          }
+        } else {
+          for (const auto& output_file : ci.output_files) {
+            if (IsSstPath(output_file)) {
+              RegisterSimulatedFsFileLevel(output_file, ci.output_level);
+            }
+          }
+        }
+      }
+      std::lock_guard<std::mutex> lk(mu_);
+      compaction_job_output_level_.erase(ci.job_id);
+    }
+
+    void OnTableFileCreationStarted(
+        const TableFileCreationBriefInfo& info) override {
+      if (!IsSstPath(info.file_path)) {
+        return;
+      }
+      int level = -1;
+      switch (info.reason) {
+        case TableFileCreationReason::kFlush:
+        case TableFileCreationReason::kRecovery:
+          level = 0;
+          break;
+        case TableFileCreationReason::kCompaction:
+          level = LookupCompactionOutputLevel(info.job_id);
+          break;
+        case TableFileCreationReason::kMisc:
+          break;
+      }
+      if (level >= 0) {
+        RegisterSimulatedFsFileLevel(info.file_path, level);
+      }
+    }
+
+    void OnTableFileDeleted(const TableFileDeletionInfo& info) override {
+      if (IsSstPath(info.file_path)) {
+        UnregisterSimulatedFsFileLevel(info.file_path);
+      }
+    }
+
+   private:
+    static bool IsSstPath(const std::string& path) {
+      static const std::string kSstSuffix = ".sst";
+      if (path.size() < kSstSuffix.size()) {
+        return false;
+      }
+      return path.compare(path.size() - kSstSuffix.size(), kSstSuffix.size(),
+                          kSstSuffix) == 0;
+    }
+
+    int LookupCompactionOutputLevel(int job_id) {
+      std::lock_guard<std::mutex> lk(mu_);
+      auto it = compaction_job_output_level_.find(job_id);
+      if (it == compaction_job_output_level_.end()) {
+        return -1;
+      }
+      return it->second;
+    }
+
+    std::mutex mu_;
+    std::unordered_map<int, int> compaction_job_output_level_;
+  };
+
   std::shared_ptr<ErrorHandlerListener> listener_;
+  std::shared_ptr<SimulatedXpLevelListener> xp_level_listener_;
 
   std::unique_ptr<TimestampEmulator> mock_app_clock_;
 
@@ -3410,6 +4013,11 @@ class Benchmark {
     }
 
     listener_.reset(new ErrorHandlerListener());
+    if ((FLAGS_simulate_xp_nvm || FLAGS_simulate_dimm_nvm) &&
+        !FLAGS_simulate_xp_levels.empty()) {
+      ClearSimulatedFsFileLevels();
+      xp_level_listener_.reset(new SimulatedXpLevelListener());
+    }
     if (user_timestamp_size_ > 0) {
       mock_app_clock_.reset(new TimestampEmulator());
     }
@@ -4090,9 +4698,13 @@ class Benchmark {
 
     SetPerfLevel(static_cast<PerfLevel>(shared->perf_level));
     perf_context.EnablePerLevelPerfContext();
+    thread->stats.ConfigureTailProbe(shared->tail_probe_writer,
+                                     shared->tail_probe_threshold_us,
+                                     shared->tail_probe_case_label,
+                                     shared->tail_probe_scenario);
     thread->stats.Start(thread->tid);
     (arg->bm->*(arg->method))(thread);
-    if (FLAGS_perf_level > ROCKSDB_NAMESPACE::PerfLevel::kDisable) {
+    if (shared->perf_level > ROCKSDB_NAMESPACE::PerfLevel::kDisable) {
       thread->stats.AddMessage(std::string("PERF_CONTEXT:\n") +
                                get_perf_context()->ToString());
     }
@@ -4110,10 +4722,30 @@ class Benchmark {
   Stats RunBenchmark(int n, Slice name,
                      void (Benchmark::*method)(ThreadState*)) {
     SharedState shared;
+    const bool tail_probe_requested = !FLAGS_tail_probe_output.empty() &&
+                                      FLAGS_tail_probe_threshold_us > 0 &&
+                                      SupportsTailSeekProbe(name);
     shared.total = n;
     shared.num_initialized = 0;
     shared.num_done = 0;
     shared.start = false;
+    if (tail_probe_requested) {
+      shared.tail_probe_writer = std::make_shared<TailProbeWriter>(
+          FLAGS_tail_probe_output, FLAGS_tail_probe_max_samples);
+      shared.tail_probe_enabled =
+          shared.tail_probe_writer != nullptr &&
+          shared.tail_probe_writer->Enabled();
+      shared.tail_probe_threshold_us =
+          static_cast<uint64_t>(FLAGS_tail_probe_threshold_us);
+      shared.tail_probe_case_label = FLAGS_tail_probe_case_label;
+      shared.tail_probe_scenario =
+          FLAGS_tail_probe_scenario.empty() ? name.ToString()
+                                            : FLAGS_tail_probe_scenario;
+      if (shared.tail_probe_enabled &&
+          shared.perf_level < ROCKSDB_NAMESPACE::PerfLevel::kEnableTime) {
+        shared.perf_level = ROCKSDB_NAMESPACE::PerfLevel::kEnableTime;
+      }
+    }
     if (FLAGS_benchmark_write_rate_limit > 0) {
       shared.write_rate_limiter.reset(
           NewGenericRateLimiter(FLAGS_benchmark_write_rate_limit));
@@ -4178,6 +4810,14 @@ class Benchmark {
       merge_stats.Merge(arg[i].thread->stats);
     }
     merge_stats.Report(name);
+    if (shared.tail_probe_enabled && shared.tail_probe_writer != nullptr &&
+        shared.tail_probe_writer->dropped_samples() > 0) {
+      fprintf(stderr,
+              "tail probe dropped %" PRIu64
+              " samples (max_samples=%" PRIu64 ")\n",
+              shared.tail_probe_writer->dropped_samples(),
+              FLAGS_tail_probe_max_samples);
+    }
 
     for (int i = 0; i < n; i++) {
       delete arg[i].thread;
@@ -4760,7 +5400,7 @@ class Benchmark {
       options.compression_manager = mgr;
     }
 
-    if (FLAGS_simulate_hybrid_fs_file != "") {
+    if (FLAGS_simulate_hybrid_fs_file != "" && !FLAGS_simulate_xp_nvm) {
       options.last_level_temperature = Temperature::kWarm;
     }
     options.preclude_last_level_data_seconds =
@@ -4911,6 +5551,25 @@ class Benchmark {
         FLAGS_universal_reduce_file_locking;
   }
 
+  void SeedSimulatedXpFileLevels(const DBWithColumnFamilies& dbwcf) {
+    if (xp_level_listener_ == nullptr || dbwcf.db == nullptr) {
+      return;
+    }
+    std::vector<LiveFileMetaData> metadata;
+    dbwcf.db->GetLiveFilesMetaData(&metadata);
+    for (const auto& file_meta : metadata) {
+      if (file_meta.relative_filename.empty()) {
+        continue;
+      }
+      std::string file_path = file_meta.directory;
+      if (!file_path.empty() && file_path.back() != '/') {
+        file_path += "/";
+      }
+      file_path += file_meta.relative_filename;
+      RegisterSimulatedFsFileLevel(file_path, file_meta.level);
+    }
+  }
+
   void InitializeOptionsGeneral(Options* opts, ToolHooks& hooks) {
     // Be careful about what is set here to avoid accidentally overwriting
     // settings already configured by OPTIONS file. Only configure settings that
@@ -4995,6 +5654,9 @@ class Benchmark {
     }
 
     options.listeners.emplace_back(listener_);
+    if (xp_level_listener_ != nullptr) {
+      options.listeners.emplace_back(xp_level_listener_);
+    }
 
     if (options.file_checksum_gen_factory == nullptr) {
       if (FLAGS_file_checksum) {
@@ -5005,6 +5667,7 @@ class Benchmark {
 
     if (FLAGS_num_multi_db <= 1) {
       OpenDb(options, hooks, FLAGS_db, &db_);
+      SeedSimulatedXpFileLevels(db_);
     } else {
       multi_dbs_.clear();
       multi_dbs_.resize(FLAGS_num_multi_db);
@@ -5014,6 +5677,7 @@ class Benchmark {
           options.wal_dir = GetPathForMultiple(wal_dir, i);
         }
         OpenDb(options, hooks, GetPathForMultiple(FLAGS_db, i), &multi_dbs_[i]);
+        SeedSimulatedXpFileLevels(multi_dbs_[i]);
       }
       options.wal_dir = wal_dir;
     }
@@ -6886,6 +7550,9 @@ class Benchmark {
     int64_t keyrange_start;
     int64_t keyrange_access;
     int64_t keyrange_keys;
+    bool is_hot = false;
+    int64_t hot_key_start = 0;
+    int64_t hot_key_count = 0;
   };
 
   // From our observations, the prefix hotness (key-range hotness) follows
@@ -6908,6 +7575,343 @@ class Benchmark {
     int64_t keyrange_size_ = 0;
     int64_t keyrange_num_ = 0;
     std::vector<KeyrangeUnit> keyrange_set_;
+    int64_t hot_count_ = 0;
+    int64_t hot_window_start_ = 0;
+    bool shift_inited_ = false;
+    int64_t last_shift_stage_ = -1;
+    uint64_t shift_base_usecs_ = 0;
+    double hot_range_access_pct_ = 0.0;
+    double hot_key_pct_ = 0.0;
+    std::vector<double> hot_zipf_weights_;
+    std::vector<double> cold_zipf_weights_;
+
+    static int64_t PositiveMod(int64_t value, int64_t mod) {
+      if (mod <= 0) {
+        return 0;
+      }
+      int64_t x = value % mod;
+      if (x < 0) {
+        x += mod;
+      }
+      return x;
+    }
+
+    int64_t NextStartByMode(int64_t stage) const {
+      if (keyrange_num_ <= 0 || hot_count_ <= 0) {
+        return 0;
+      }
+      const int64_t base =
+          PositiveMod(FLAGS_mix_shift_base_start_range, keyrange_num_);
+      const int64_t stride =
+          (FLAGS_mix_shift_stride_ranges == 0) ? 1 : FLAGS_mix_shift_stride_ranges;
+
+      if (FLAGS_mix_shift_mode == "rolling_window") {
+        return PositiveMod(base + stage * stride, keyrange_num_);
+      }
+
+      // default: step_jump
+      int64_t jump_multiplier = FLAGS_mix_shift_jump_multiplier;
+      if (jump_multiplier <= 0) {
+        jump_multiplier = 1;
+      }
+      const int64_t jump = stride * jump_multiplier * hot_count_;
+      return PositiveMod(base + stage * jump, keyrange_num_);
+    }
+
+    void RebuildRangeStartsFromAccess() {
+      if (keyrange_set_.empty()) {
+        keyrange_rand_max_ = 1;
+        return;
+      }
+      int64_t offset = 0;
+      for (auto& unit : keyrange_set_) {
+        unit.keyrange_start = offset;
+        offset += std::max<int64_t>(0, unit.keyrange_access);
+      }
+      if (offset <= 0) {
+        keyrange_set_[0].keyrange_access = 1;
+        keyrange_set_[0].keyrange_start = 0;
+        offset = 1;
+      }
+      keyrange_rand_max_ = offset;
+    }
+
+    void ApplyShiftWindowLayout() {
+      if (keyrange_num_ <= 0 || hot_count_ <= 0 || keyrange_set_.empty()) {
+        return;
+      }
+
+      std::vector<int64_t> hot_rank_by_pos(static_cast<size_t>(keyrange_num_),
+                                           static_cast<int64_t>(-1));
+      for (int64_t i = 0; i < hot_count_; ++i) {
+        const int64_t idx = PositiveMod(hot_window_start_ + i, keyrange_num_);
+        hot_rank_by_pos[static_cast<size_t>(idx)] = i;
+      }
+
+      const int64_t cold_count = keyrange_num_ - hot_count_;
+      const double cold_range_access_pct = 1.0 - hot_range_access_pct_;
+      const int64_t scale = std::max<int64_t>(keyrange_num_, FLAGS_num);
+      int64_t cold_rank = 0;
+
+      for (int64_t i = 0; i < keyrange_num_; ++i) {
+        auto& unit = keyrange_set_[static_cast<size_t>(i)];
+        unit.is_hot = false;
+        unit.hot_key_start = 0;
+        unit.hot_key_count = 0;
+
+        double p = 0.0;
+        const int64_t hot_rank = hot_rank_by_pos[static_cast<size_t>(i)];
+        if (hot_rank >= 0) {
+          unit.is_hot = true;
+          p = hot_range_access_pct_ *
+              hot_zipf_weights_[static_cast<size_t>(hot_rank)];
+        } else if (cold_count > 0 &&
+                   cold_rank < static_cast<int64_t>(cold_zipf_weights_.size())) {
+          p = cold_range_access_pct *
+              cold_zipf_weights_[static_cast<size_t>(cold_rank++)];
+        }
+
+        int64_t share = static_cast<int64_t>(
+            std::llround(p * static_cast<double>(scale)));
+        if (share <= 0 && p > 0.0) {
+          share = 1;
+        }
+        unit.keyrange_access = share;
+
+        if (unit.is_hot) {
+          int64_t hot_keys = static_cast<int64_t>(
+              std::llround(static_cast<double>(keyrange_size_) * hot_key_pct_));
+          if (hot_keys < 1) {
+            hot_keys = 1;
+          }
+          if (hot_keys > keyrange_size_) {
+            hot_keys = keyrange_size_;
+          }
+          unit.hot_key_start = 0;
+          unit.hot_key_count = hot_keys;
+        }
+      }
+
+      RebuildRangeStartsFromAccess();
+    }
+
+    void InitializeShiftState() {
+      if (!FLAGS_mix_shift_enable || shift_inited_) {
+        return;
+      }
+      if (hot_count_ <= 0) {
+        return;
+      }
+      shift_base_usecs_ = FLAGS_env->NowMicros();
+      hot_window_start_ = NextStartByMode(0);
+      last_shift_stage_ = 0;
+      ApplyShiftWindowLayout();
+      shift_inited_ = true;
+    }
+
+    void MaybeAdvanceShiftWindow(uint64_t now_usecs) {
+      if (!FLAGS_mix_shift_enable || !shift_inited_ || hot_count_ <= 0) {
+        return;
+      }
+      if (FLAGS_mix_shift_stage_seconds <= 0) {
+        return;
+      }
+      const uint64_t stage_usecs =
+          static_cast<uint64_t>(FLAGS_mix_shift_stage_seconds) * uint64_t{1000000};
+      if (stage_usecs == 0) {
+        return;
+      }
+      uint64_t elapsed = now_usecs;
+      if (now_usecs > shift_base_usecs_) {
+        elapsed = now_usecs - shift_base_usecs_;
+      } else {
+        elapsed = 0;
+      }
+      const int64_t stage = static_cast<int64_t>(elapsed / stage_usecs);
+      if (stage <= last_shift_stage_) {
+        return;
+      }
+      hot_window_start_ = NextStartByMode(stage);
+      ApplyShiftWindowLayout();
+      last_shift_stage_ = stage;
+      if (FLAGS_mix_shift_log_stage_transitions) {
+        fprintf(stderr,
+                "mix_shift stage=%" PRId64 " mode=%s hot_window_start=%" PRId64
+                " hot_count=%" PRId64 "\n",
+                stage, FLAGS_mix_shift_mode.c_str(), hot_window_start_,
+                hot_count_);
+      }
+    }
+
+    static double Clamp01(double value) {
+      if (value < 0.0) {
+        return 0.0;
+      }
+      if (value > 1.0) {
+        return 1.0;
+      }
+      return value;
+    }
+
+    static uint64_t MixBits(uint64_t value) {
+      value += 0x9e3779b97f4a7c15ULL;
+      value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+      value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+      return value ^ (value >> 31);
+    }
+
+    static std::vector<double> BuildZipfWeights(int64_t n, double theta) {
+      std::vector<double> weights;
+      if (n <= 0) {
+        return weights;
+      }
+      weights.resize(static_cast<size_t>(n), 0.0);
+      const double clamped_theta = (theta < 0.0) ? 0.0 : theta;
+      double sum = 0.0;
+      for (int64_t i = 1; i <= n; ++i) {
+        double w = std::pow(static_cast<double>(i), -clamped_theta);
+        weights[static_cast<size_t>(i - 1)] = w;
+        sum += w;
+      }
+      if (sum <= 0.0) {
+        const double uniform = 1.0 / static_cast<double>(n);
+        for (auto& w : weights) {
+          w = uniform;
+        }
+      } else {
+        for (auto& w : weights) {
+          w /= sum;
+        }
+      }
+      return weights;
+    }
+
+    Status ApplyPaperHotSetModel() {
+      if (keyrange_num_ <= 0 || keyrange_set_.empty()) {
+        return Status::InvalidArgument("mix_hotset: empty key-range set");
+      }
+
+      int64_t hot_count = FLAGS_mix_hot_keyrange_count;
+      if (hot_count <= 0) {
+        hot_count = static_cast<int64_t>(std::ceil(
+            Clamp01(FLAGS_mix_hotset_range_pct) * keyrange_num_));
+      }
+      if (hot_count < 1) {
+        hot_count = 1;
+      }
+      if (hot_count > keyrange_num_) {
+        hot_count = keyrange_num_;
+      }
+      hot_count_ = hot_count;
+      shift_inited_ = false;
+      last_shift_stage_ = -1;
+
+      const int64_t cold_count = keyrange_num_ - hot_count;
+      const double hot_range_access_pct =
+          Clamp01(FLAGS_mix_hotset_range_access_pct);
+      const double cold_range_access_pct = 1.0 - hot_range_access_pct;
+      const double hot_key_pct = Clamp01(FLAGS_mix_hotset_key_pct);
+      const double theta = FLAGS_mix_hotset_range_zipf_theta;
+      hot_range_access_pct_ = hot_range_access_pct;
+      hot_key_pct_ = hot_key_pct;
+      hot_zipf_weights_ = BuildZipfWeights(hot_count, theta);
+      cold_zipf_weights_ = BuildZipfWeights(cold_count, theta);
+
+      std::vector<int64_t> hot_positions;
+      hot_positions.reserve(static_cast<size_t>(hot_count));
+      if (FLAGS_mix_shift_enable) {
+        hot_window_start_ =
+            PositiveMod(FLAGS_mix_shift_base_start_range, keyrange_num_);
+        for (int64_t i = 0; i < hot_count; ++i) {
+          hot_positions.push_back(
+              PositiveMod(hot_window_start_ + i, keyrange_num_));
+        }
+      } else if (FLAGS_mix_hotset_evenly_spread_ranges &&
+                 hot_count < keyrange_num_) {
+        std::vector<bool> used(static_cast<size_t>(keyrange_num_), false);
+        for (int64_t i = 0; i < hot_count; ++i) {
+          int64_t pos =
+              (i * keyrange_num_) / hot_count + (keyrange_num_ / (2 * hot_count));
+          if (pos >= keyrange_num_) {
+            pos = keyrange_num_ - 1;
+          }
+          while (used[static_cast<size_t>(pos)]) {
+            pos = (pos + 1) % keyrange_num_;
+          }
+          used[static_cast<size_t>(pos)] = true;
+          hot_positions.push_back(pos);
+        }
+      } else {
+        for (int64_t i = 0; i < hot_count; ++i) {
+          hot_positions.push_back(i);
+        }
+      }
+
+      std::vector<int64_t> hot_rank_by_pos(static_cast<size_t>(keyrange_num_),
+                                           static_cast<int64_t>(-1));
+      for (int64_t rank = 0; rank < hot_count; ++rank) {
+        hot_rank_by_pos[static_cast<size_t>(hot_positions[static_cast<size_t>(rank)])] =
+            rank;
+      }
+
+      const std::vector<double>& hot_zipf = hot_zipf_weights_;
+      const std::vector<double>& cold_zipf = cold_zipf_weights_;
+      const int64_t scale = std::max<int64_t>(keyrange_num_, FLAGS_num);
+      int64_t cold_rank = 0;
+
+      for (int64_t i = 0; i < keyrange_num_; ++i) {
+        auto& unit = keyrange_set_[static_cast<size_t>(i)];
+        unit.is_hot = false;
+        unit.hot_key_start = 0;
+        unit.hot_key_count = 0;
+
+        double p = 0.0;
+        const int64_t hot_rank = hot_rank_by_pos[static_cast<size_t>(i)];
+        if (hot_rank >= 0) {
+          unit.is_hot = true;
+          p = hot_range_access_pct * hot_zipf[static_cast<size_t>(hot_rank)];
+        } else if (cold_count > 0) {
+          p = cold_range_access_pct * cold_zipf[static_cast<size_t>(cold_rank++)];
+        }
+
+        int64_t share = static_cast<int64_t>(
+            std::llround(p * static_cast<double>(scale)));
+        if (share <= 0 && p > 0.0) {
+          share = 1;
+        }
+        unit.keyrange_access = share;
+
+        if (unit.is_hot) {
+          int64_t hot_keys = static_cast<int64_t>(
+              std::llround(static_cast<double>(keyrange_size_) * hot_key_pct));
+          if (hot_keys < 1) {
+            hot_keys = 1;
+          }
+          if (hot_keys > keyrange_size_) {
+            hot_keys = keyrange_size_;
+          }
+          unit.hot_key_start = 0;
+          unit.hot_key_count = hot_keys;
+        }
+      }
+
+      int64_t total_share = 0;
+      for (const auto& unit : keyrange_set_) {
+        total_share += unit.keyrange_access;
+      }
+      if (total_share <= 0) {
+        keyrange_set_[0].keyrange_access = 1;
+        keyrange_set_[0].is_hot = true;
+        keyrange_set_[0].hot_key_start = 0;
+        keyrange_set_[0].hot_key_count = std::max<int64_t>(1, keyrange_size_);
+      }
+
+      if (FLAGS_mix_shift_enable) {
+        InitializeShiftState();
+      }
+
+      return Status::OK();
+    }
 
     // Initiate the KeyrangeUnit vector and calculate the size of each
     // KeyrangeUnit.
@@ -6916,12 +7920,17 @@ class Benchmark {
                                    double prefix_d) {
       int64_t amplify = 0;
       int64_t keyrange_start = 0;
+      keyrange_set_.clear();
       if (FLAGS_keyrange_num <= 0) {
         keyrange_num_ = 1;
       } else {
         keyrange_num_ = FLAGS_keyrange_num;
       }
       keyrange_size_ = total_keys / keyrange_num_;
+      if (keyrange_size_ <= 0) {
+        keyrange_size_ = 1;
+      }
+      keyrange_set_.reserve(static_cast<size_t>(keyrange_num_));
 
       // Calculate the key-range shares size based on the input parameters
       for (int64_t pfx = keyrange_num_; pfx >= 1; pfx--) {
@@ -6974,12 +7983,66 @@ class Benchmark {
         std::swap(keyrange_set_[i], keyrange_set_[pos]);
       }
 
-      // Step 5. Recalculate the prefix start postion after shuffling
-      int64_t offset = 0;
-      for (auto& p_unit : keyrange_set_) {
-        p_unit.keyrange_start = offset;
-        offset += p_unit.keyrange_access;
+      // Optional sparse-hot mode: keep only a small number of hot key ranges
+      // and spread them apart in key space to reduce SST/data-block overlap.
+      if (!FLAGS_mix_hotset_enable && FLAGS_mix_hot_keyrange_count > 0 &&
+          FLAGS_mix_hot_keyrange_count < keyrange_num_) {
+        const int64_t hot_count = FLAGS_mix_hot_keyrange_count;
+        std::vector<int64_t> sorted_idx;
+        sorted_idx.reserve(static_cast<size_t>(keyrange_num_));
+        for (int64_t i = 0; i < keyrange_num_; ++i) {
+          sorted_idx.push_back(i);
+        }
+        std::sort(sorted_idx.begin(), sorted_idx.end(),
+                  [&](int64_t lhs, int64_t rhs) {
+                    return keyrange_set_[lhs].keyrange_access >
+                           keyrange_set_[rhs].keyrange_access;
+                  });
+
+        std::vector<int64_t> hot_access;
+        hot_access.reserve(static_cast<size_t>(hot_count));
+        for (int64_t i = 0; i < hot_count; ++i) {
+          hot_access.push_back(keyrange_set_[sorted_idx[i]].keyrange_access);
+        }
+
+        // Shuffle hot shares, then place them with even spacing.
+        Random64 rand_hot(static_cast<uint64_t>(keyrange_rand_max_) ^
+                          static_cast<uint64_t>(hot_count * 0x9e3779b1ULL));
+        for (int64_t i = hot_count - 1; i > 0; --i) {
+          int64_t j = static_cast<int64_t>(
+              rand_hot.Next() % static_cast<uint64_t>(i + 1));
+          std::swap(hot_access[static_cast<size_t>(i)],
+                    hot_access[static_cast<size_t>(j)]);
+        }
+
+        for (auto& p_unit : keyrange_set_) {
+          p_unit.keyrange_access = 0;
+        }
+        std::vector<bool> used(static_cast<size_t>(keyrange_num_), false);
+        for (int64_t i = 0; i < hot_count; ++i) {
+          int64_t pos =
+              (i * keyrange_num_) / hot_count + (keyrange_num_ / (2 * hot_count));
+          if (pos >= keyrange_num_) {
+            pos = keyrange_num_ - 1;
+          }
+          while (used[static_cast<size_t>(pos)]) {
+            pos = (pos + 1) % keyrange_num_;
+          }
+          used[static_cast<size_t>(pos)] = true;
+          keyrange_set_[static_cast<size_t>(pos)].keyrange_access =
+              std::max<int64_t>(1, hot_access[static_cast<size_t>(i)]);
+        }
       }
+
+      if (FLAGS_mix_hotset_enable) {
+        Status hotset_s = ApplyPaperHotSetModel();
+        if (!hotset_s.ok()) {
+          return hotset_s;
+        }
+      }
+
+      // Step 5. Recalculate the prefix start position after shaping.
+      RebuildRangeStartsFromAccess();
 
       return Status::OK();
     }
@@ -7001,6 +8064,51 @@ class Benchmark {
         }
       }
       int64_t keyrange_id = start;
+
+      if (FLAGS_mix_shift_enable) {
+        MaybeAdvanceShiftWindow(FLAGS_env->NowMicros());
+      }
+
+      if (FLAGS_mix_hotset_enable) {
+        const auto& unit = keyrange_set_[static_cast<size_t>(keyrange_id)];
+        const double hot_key_access_pct =
+            Clamp01(FLAGS_mix_hotset_key_access_pct);
+        uint64_t rand_a =
+            MixBits(static_cast<uint64_t>(ini_rand) ^
+                    (static_cast<uint64_t>(keyrange_id) * 0x9e3779b97f4a7c15ULL));
+        uint64_t rand_b = MixBits(rand_a + 0x94d049bb133111ebULL);
+
+        int64_t key_offset = 0;
+        if (unit.is_hot && unit.hot_key_count > 0) {
+          const uint64_t sample = rand_a % 1000000ULL;
+          const uint64_t threshold = static_cast<uint64_t>(std::llround(
+              hot_key_access_pct * 1000000.0));
+          const bool select_hot_window =
+              (sample < threshold) || unit.hot_key_count >= keyrange_size_;
+          if (select_hot_window) {
+            key_offset =
+                unit.hot_key_start +
+                static_cast<int64_t>(rand_b % static_cast<uint64_t>(unit.hot_key_count));
+          } else {
+            const int64_t cold_keys = keyrange_size_ - unit.hot_key_count;
+            if (cold_keys <= 0) {
+              key_offset = static_cast<int64_t>(
+                  rand_b % static_cast<uint64_t>(keyrange_size_));
+            } else {
+              int64_t pos =
+                  static_cast<int64_t>(rand_b % static_cast<uint64_t>(cold_keys));
+              if (pos >= unit.hot_key_start) {
+                pos += unit.hot_key_count;
+              }
+              key_offset = pos;
+            }
+          }
+        } else {
+          key_offset =
+              static_cast<int64_t>(rand_b % static_cast<uint64_t>(keyrange_size_));
+        }
+        return keyrange_size_ * keyrange_id + key_offset;
+      }
 
       // Select one key in the key-range and compose the keyID
       int64_t key_offset = 0, key_seed;
@@ -7069,9 +8177,32 @@ class Benchmark {
     if (FLAGS_keyrange_dist_a != 0.0 || FLAGS_keyrange_dist_b != 0.0 ||
         FLAGS_keyrange_dist_c != 0.0 || FLAGS_keyrange_dist_d != 0.0) {
       use_prefix_modeling = true;
-      gen_exp.InitiateExpDistribution(
+      s = gen_exp.InitiateExpDistribution(
           FLAGS_num, FLAGS_keyrange_dist_a, FLAGS_keyrange_dist_b,
           FLAGS_keyrange_dist_c, FLAGS_keyrange_dist_d);
+      if (!s.ok()) {
+        fprintf(stderr, "mixgraph keyrange init error: %s\n",
+                s.ToString().c_str());
+        ErrorExit();
+      }
+    } else if (FLAGS_mix_hotset_enable) {
+      fprintf(stderr,
+              "mix_hotset_enable requires keyrange_dist_* to enable prefix "
+              "modeling\n");
+      ErrorExit();
+    }
+    if (FLAGS_mix_shift_enable && !FLAGS_mix_hotset_enable) {
+      fprintf(stderr,
+              "mix_shift_enable requires mix_hotset_enable=1 in mixgraph\n");
+      ErrorExit();
+    }
+    if (FLAGS_mix_shift_enable && FLAGS_mix_shift_mode != "step_jump" &&
+        FLAGS_mix_shift_mode != "rolling_window") {
+      fprintf(stderr,
+              "unsupported mix_shift_mode=%s, expected step_jump or "
+              "rolling_window\n",
+              FLAGS_mix_shift_mode.c_str());
+      ErrorExit();
     }
     if (FLAGS_key_dist_a == 0 || FLAGS_key_dist_b == 0) {
       use_random_modeling = true;
@@ -7085,12 +8216,17 @@ class Benchmark {
       rand_v = ini_rand % FLAGS_num;
       double u = static_cast<double>(rand_v) / FLAGS_num;
 
-      // Generate the keyID based on the key hotness and prefix hotness
-      if (use_random_modeling) {
+      // Generate key ID. If prefix modeling is enabled, keep it active even
+      // when key_dist is zero (uniform key selection inside each hot range).
+      if (use_prefix_modeling) {
+        if (use_random_modeling) {
+          key_rand = gen_exp.DistGetKeyID(ini_rand, 0.0, 0.0);
+        } else {
+          key_rand = gen_exp.DistGetKeyID(ini_rand, FLAGS_key_dist_a,
+                                          FLAGS_key_dist_b);
+        }
+      } else if (use_random_modeling) {
         key_rand = ini_rand;
-      } else if (use_prefix_modeling) {
-        key_rand =
-            gen_exp.DistGetKeyID(ini_rand, FLAGS_key_dist_a, FLAGS_key_dist_b);
       } else {
         key_seed = PowerCdfInversion(u, FLAGS_key_dist_a, FLAGS_key_dist_b);
         Random64 rand(key_seed);
@@ -9154,15 +10290,127 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
       fprintf(stderr, "Failed creating env: %s\n", s.ToString().c_str());
       db_bench_exit(1);
     }
-  } else if (FLAGS_simulate_hdd || FLAGS_simulate_hybrid_fs_file != "") {
+  } else if (FLAGS_simulate_hdd || FLAGS_simulate_hybrid_fs_file != "" ||
+             FLAGS_simulate_xp_nvm || FLAGS_simulate_dimm_nvm) {
     //**TODO: Make the simulate fs something that can be loaded
     // from the ObjectRegistry...
+    std::unordered_set<int> xp_target_levels;
+    if (FLAGS_simulate_xp_nvm) {
+      if (FLAGS_simulate_xp_line_bytes == 0 ||
+          FLAGS_simulate_xp_buffer_bytes == 0 ||
+          FLAGS_simulate_xp_latency_ns == 0 ||
+          FLAGS_simulate_xp_rpq_depth == 0 ||
+          FLAGS_simulate_xp_wpq_depth == 0) {
+        fprintf(stderr,
+                "Error: --simulate_xp_line_bytes, --simulate_xp_buffer_bytes, "
+                "--simulate_xp_latency_ns, --simulate_xp_rpq_depth, and "
+                "--simulate_xp_wpq_depth must all be > 0\n");
+        db_bench_exit(1);
+      }
+    }
+    if (FLAGS_simulate_dimm_nvm) {
+      if (FLAGS_simulate_xp_line_bytes == 0 ||
+          FLAGS_simulate_xp_rpq_depth == 0 || FLAGS_simulate_xp_wpq_depth == 0) {
+        fprintf(stderr,
+                "Error: --simulate_xp_line_bytes, --simulate_xp_rpq_depth, and "
+                "--simulate_xp_wpq_depth must all be > 0 for "
+                "--simulate_dimm_nvm\n");
+        db_bench_exit(1);
+      }
+      if (!(FLAGS_simulate_dimm_seq_read_bw_gbps > 0.0) ||
+          !(FLAGS_simulate_dimm_seq_write_bw_gbps > 0.0)) {
+        fprintf(stderr,
+                "Error: --simulate_dimm_seq_read_bw_gbps and "
+                "--simulate_dimm_seq_write_bw_gbps must be > 0\n");
+        db_bench_exit(1);
+      }
+      if (!(FLAGS_simulate_dimm_rand_bw_scale >= 0.0) ||
+          !(FLAGS_simulate_dimm_rand_bw_scale <= 1.0)) {
+        fprintf(stderr,
+                "Error: --simulate_dimm_rand_bw_scale must be within [0,1]\n");
+        db_bench_exit(1);
+      }
+      if (!(FLAGS_simulate_dimm_sub_line_random_media_amp >= 1.0)) {
+        fprintf(stderr,
+                "Error: --simulate_dimm_sub_line_random_media_amp must be >= "
+                "1\n");
+        db_bench_exit(1);
+      }
+    }
+    if ((FLAGS_simulate_xp_nvm || FLAGS_simulate_dimm_nvm) &&
+        !FLAGS_simulate_xp_levels.empty()) {
+      const std::vector<std::string> tokens =
+          ROCKSDB_NAMESPACE::StringSplit(FLAGS_simulate_xp_levels, ',');
+      for (const auto& token_raw : tokens) {
+        std::string token = token_raw;
+        size_t start = 0;
+        while (start < token.size() &&
+               std::isspace(static_cast<unsigned char>(token[start]))) {
+          ++start;
+        }
+        size_t end = token.size();
+        while (end > start &&
+               std::isspace(static_cast<unsigned char>(token[end - 1]))) {
+          --end;
+        }
+        token = token.substr(start, end - start);
+        if (token.empty()) {
+          continue;
+        }
+        if (token[0] == 'l' || token[0] == 'L') {
+          token = token.substr(1);
+        }
+        try {
+          const int level = std::stoi(token);
+          if (level < 0) {
+            throw std::invalid_argument("negative level");
+          }
+          xp_target_levels.insert(level);
+        } catch (...) {
+          fprintf(stderr,
+                  "Error: invalid --simulate_xp_levels token '%s' in '%s'\n",
+                  token_raw.c_str(), FLAGS_simulate_xp_levels.c_str());
+          db_bench_exit(1);
+        }
+      }
+    }
+    SimulatedStorageModelOptions model_options;
+    model_options.use_xp_model = FLAGS_simulate_xp_nvm;
+    model_options.use_dimm_model = FLAGS_simulate_dimm_nvm;
+    model_options.xp_line_bytes = FLAGS_simulate_xp_line_bytes;
+    model_options.xp_buffer_bytes = FLAGS_simulate_xp_buffer_bytes;
+    model_options.xp_latency_ns = FLAGS_simulate_xp_latency_ns;
+    model_options.xp_rpq_depth = FLAGS_simulate_xp_rpq_depth;
+    model_options.xp_wpq_depth = FLAGS_simulate_xp_wpq_depth;
+    model_options.xp_wpq_submit_ns = FLAGS_simulate_xp_wpq_submit_ns;
+    model_options.xp_prefetch_hit_ns = FLAGS_simulate_xp_prefetch_hit_ns;
+    model_options.dram_read_seq_ns = FLAGS_simulate_xp_dram_seq_read_ns;
+    model_options.dram_read_rand_ns = FLAGS_simulate_xp_dram_rand_read_ns;
+    model_options.xp_enable_prefetch = FLAGS_simulate_xp_enable_prefetch;
+    model_options.xp_share_buffer_between_rw =
+        FLAGS_simulate_xp_share_buffer_between_rw;
+    model_options.xp_redirect_to_tmpfs = FLAGS_simulate_xp_redirect_to_tmpfs;
+    model_options.xp_tmpfs_root = FLAGS_simulate_xp_tmpfs_root;
+    model_options.path_prefix = FLAGS_simulate_xp_path_prefix;
+    model_options.target_levels = std::move(xp_target_levels);
+    model_options.stats_file = FLAGS_simulate_xp_stats_file;
+    model_options.dimm_fixed_read_overhead_ns =
+        FLAGS_simulate_dimm_fixed_read_overhead_ns;
+    model_options.dimm_fixed_write_overhead_ns =
+        FLAGS_simulate_dimm_fixed_write_overhead_ns;
+    model_options.dimm_seq_read_bw_gbps = FLAGS_simulate_dimm_seq_read_bw_gbps;
+    model_options.dimm_seq_write_bw_gbps = FLAGS_simulate_dimm_seq_write_bw_gbps;
+    model_options.dimm_rand_bw_scale = FLAGS_simulate_dimm_rand_bw_scale;
+    model_options.dimm_sub_line_random_media_amp =
+        FLAGS_simulate_dimm_sub_line_random_media_amp;
     static std::shared_ptr<ROCKSDB_NAMESPACE::Env> composite_env =
         NewCompositeEnv(std::make_shared<SimulatedHybridFileSystem>(
             FileSystem::Default(), FLAGS_simulate_hybrid_fs_file,
             /*throughput_multiplier=*/
             int{FLAGS_simulate_hybrid_hdd_multipliers},
-            /*is_full_fs_warm=*/FLAGS_simulate_hdd));
+            /*is_full_fs_warm=*/FLAGS_simulate_hdd || FLAGS_simulate_xp_nvm ||
+                FLAGS_simulate_dimm_nvm,
+            model_options));
     FLAGS_env = composite_env.get();
   }
 

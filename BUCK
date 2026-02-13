@@ -414,7 +414,7 @@ cpp_library_wrapper(name="rocksdb_tools_lib", srcs=[
         "test_util/testutil.cc",
         "tools/block_cache_analyzer/block_cache_trace_analyzer.cc",
         "tools/db_bench_tool.cc",
-        "tools/simulated_hybrid_file_system.cc",
+        "tools/nvm_fs/simulated_hybrid_file_system.cc",
         "tools/tool_hooks.cc",
         "tools/trace_analyzer_tool.cc",
     ], deps=[":rocksdb_lib"], headers=[], link_whole=False, extra_test_libs=False)
