@@ -30,6 +30,10 @@ rocksdb.pc
 CMakeCache.txt
 CMakeFiles/
 build/
+build_*/
+build_clangd/
+build_nvm/
+build_test_debug/
 
 ldb
 manifest_dump
@@ -102,3 +106,13 @@ cmake-build-*
 third-party/folly/
 .cache
 *.sublime-*
+
+# Local experiments (generated outputs; keep specs tracked)
+experiment/202*
+experiment/*.run.log
+
+# Local tooling artifacts
+.codex_write_probe
+tools/__pycache__/
+**/__pycache__/
+tools/nvm_fs/.*.json
