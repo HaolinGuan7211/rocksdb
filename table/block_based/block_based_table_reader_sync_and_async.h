@@ -327,7 +327,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
       iiter_unique_ptr.reset(iiter);
     }
 
-    uint64_t prev_offset = std::numeric_limits<uint64_t>::max();
+	    uint64_t prev_offset = std::numeric_limits<uint64_t>::max();
 	    autovector<BlockHandle, MultiGetContext::MAX_BATCH_SIZE> block_handles;
 	    // NOTE: `block_handles` is mutated as part of MultiGet execution:
 	    // - Set to NullBlockHandle() for keys that reuse a prior key's data block
