@@ -24,6 +24,7 @@
 #include "rocksdb/table.h"
 #include "table/block_based/block_prefix_index.h"
 #include "table/block_based/data_block_hash_index.h"
+#include "table/block_based/data_block_skiplist_index.h"
 #include "table/format.h"
 #include "table/internal_iterator.h"
 #include "test_util/sync_point.h"
@@ -286,6 +287,7 @@ class Block {
   uint32_t block_restart_interval_{0};
   uint8_t protection_bytes_per_key_{0};
   DataBlockHashIndex data_block_hash_index_;
+  DataBlockSkipListIndex data_block_skiplist_index_;
 };
 
 // A `BlockIter` iterates over the entries in a `Block`'s data buffer. The
@@ -667,6 +669,15 @@ class BlockIter : public InternalIteratorBase<TValue> {
   inline bool BinarySeek(const Slice& target, uint32_t* index,
                          bool* is_index_key_result);
 
+  // Like BinarySeek(), but restricts the binary search to restart indices in
+  // [left_bound, right_bound]. It preserves the same post-conditions needed by
+  // FindKeyAfterBinarySeek(), i.e. the restart key at `*index + 1` is strictly
+  // greater than `target` or does not exist.
+  template <typename DecodeKeyFunc>
+  inline bool BinarySeekInRange(const Slice& target, uint32_t left_bound,
+                                uint32_t right_bound, uint32_t* index,
+                                bool* is_index_key_result);
+
   // Find the first key in restart interval `index` that is >= `target`.
   // If there is no such key, iterator is positioned at the first key in
   // restart interval `index + 1`.
@@ -691,6 +702,7 @@ class DataBlockIter final : public BlockIter<Slice> {
                   bool block_contents_pinned,
                   bool user_defined_timestamps_persisted,
                   DataBlockHashIndex* data_block_hash_index,
+                  DataBlockSkipListIndex* data_block_skiplist_index,
                   uint8_t protection_bytes_per_key, const char* kv_checksum,
                   uint32_t block_restart_interval) {
     InitializeBase(raw_ucmp, data, restarts, num_restarts, global_seqno,
@@ -701,6 +713,7 @@ class DataBlockIter final : public BlockIter<Slice> {
     read_amp_bitmap_ = read_amp_bitmap;
     last_bitmap_offset_ = current_ + 1;
     data_block_hash_index_ = data_block_hash_index;
+    data_block_skiplist_index_ = data_block_skiplist_index;
   }
 
   Slice value() const override {
@@ -777,6 +790,7 @@ class DataBlockIter final : public BlockIter<Slice> {
   int32_t prev_entries_idx_ = -1;
 
   DataBlockHashIndex* data_block_hash_index_;
+  DataBlockSkipListIndex* data_block_skiplist_index_{nullptr};
 
   bool SeekForGetImpl(const Slice& target);
 };

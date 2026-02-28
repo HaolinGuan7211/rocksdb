@@ -190,7 +190,13 @@ static std::unordered_map<std::string,
         {"kDataBlockBinarySearch",
          BlockBasedTableOptions::DataBlockIndexType::kDataBlockBinarySearch},
         {"kDataBlockBinaryAndHash",
-         BlockBasedTableOptions::DataBlockIndexType::kDataBlockBinaryAndHash}};
+         BlockBasedTableOptions::DataBlockIndexType::kDataBlockBinaryAndHash},
+        {"kDataBlockBinaryAndSkipList",
+         BlockBasedTableOptions::DataBlockIndexType::
+             kDataBlockBinaryAndSkipList},
+        {"kDataBlockBinaryAndHashAndSkipList",
+         BlockBasedTableOptions::DataBlockIndexType::
+             kDataBlockBinaryAndHashAndSkipList}};
 
 static std::unordered_map<std::string,
                           BlockBasedTableOptions::IndexShorteningMode>
@@ -716,8 +722,10 @@ Status BlockBasedTableFactory::ValidateOptions(
     return Status::InvalidArgument(
         "Super block alignment space overhead is too high");
   }
-  if (table_options_.data_block_index_type ==
-          BlockBasedTableOptions::kDataBlockBinaryAndHash &&
+  if ((table_options_.data_block_index_type ==
+           BlockBasedTableOptions::kDataBlockBinaryAndHash ||
+       table_options_.data_block_index_type ==
+           BlockBasedTableOptions::kDataBlockBinaryAndHashAndSkipList) &&
       table_options_.data_block_hash_table_util_ratio <= 0) {
     return Status::InvalidArgument(
         "data_block_hash_table_util_ratio should be greater than 0 when "

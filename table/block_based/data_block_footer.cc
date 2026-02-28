@@ -13,13 +13,23 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-const int kDataBlockIndexTypeBitShift = 31;
+// Data block footer packs:
+// - lower bits: num_restarts
+// - upper bits: data-block index type flags
+//
+// Historically we used only the MSB (bit 31) as "has hash index" flag.
+// We extend this to also use bit 30 as "has skiplist-ish index" flag while
+// preserving backward compatibility with existing SST files.
+const int kDataBlockHashIndexTypeBitShift = 31;
+const int kDataBlockSkipListIndexTypeBitShift = 30;
 
-// 0x7FFFFFFF
-const uint32_t kMaxNumRestarts = (1u << kDataBlockIndexTypeBitShift) - 1u;
+// 0x3FFFFFFF
+const uint32_t kMaxNumRestarts =
+    (1u << kDataBlockSkipListIndexTypeBitShift) - 1u;
 
-// 0x7FFFFFFF
-const uint32_t kNumRestartsMask = (1u << kDataBlockIndexTypeBitShift) - 1u;
+// 0x3FFFFFFF
+const uint32_t kNumRestartsMask =
+    (1u << kDataBlockSkipListIndexTypeBitShift) - 1u;
 
 uint32_t PackIndexTypeAndNumRestarts(
     BlockBasedTableOptions::DataBlockIndexType index_type,
@@ -29,10 +39,21 @@ uint32_t PackIndexTypeAndNumRestarts(
   }
 
   uint32_t block_footer = num_restarts;
-  if (index_type == BlockBasedTableOptions::kDataBlockBinaryAndHash) {
-    block_footer |= 1u << kDataBlockIndexTypeBitShift;
-  } else if (index_type != BlockBasedTableOptions::kDataBlockBinarySearch) {
-    assert(0);
+  switch (index_type) {
+    case BlockBasedTableOptions::kDataBlockBinarySearch:
+      break;
+    case BlockBasedTableOptions::kDataBlockBinaryAndHash:
+      block_footer |= 1u << kDataBlockHashIndexTypeBitShift;
+      break;
+    case BlockBasedTableOptions::kDataBlockBinaryAndSkipList:
+      block_footer |= 1u << kDataBlockSkipListIndexTypeBitShift;
+      break;
+    case BlockBasedTableOptions::kDataBlockBinaryAndHashAndSkipList:
+      block_footer |= 1u << kDataBlockHashIndexTypeBitShift;
+      block_footer |= 1u << kDataBlockSkipListIndexTypeBitShift;
+      break;
+    default:
+      assert(0);
   }
 
   return block_footer;
@@ -43,8 +64,17 @@ void UnPackIndexTypeAndNumRestarts(
     BlockBasedTableOptions::DataBlockIndexType* index_type,
     uint32_t* num_restarts) {
   if (index_type) {
-    if (block_footer & 1u << kDataBlockIndexTypeBitShift) {
+    const bool has_hash =
+        (block_footer & (1u << kDataBlockHashIndexTypeBitShift)) != 0;
+    const bool has_skiplist =
+        (block_footer & (1u << kDataBlockSkipListIndexTypeBitShift)) != 0;
+    if (has_hash && has_skiplist) {
+      *index_type =
+          BlockBasedTableOptions::kDataBlockBinaryAndHashAndSkipList;
+    } else if (has_hash) {
       *index_type = BlockBasedTableOptions::kDataBlockBinaryAndHash;
+    } else if (has_skiplist) {
+      *index_type = BlockBasedTableOptions::kDataBlockBinaryAndSkipList;
     } else {
       *index_type = BlockBasedTableOptions::kDataBlockBinarySearch;
     }

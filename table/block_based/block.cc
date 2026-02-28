@@ -12,6 +12,7 @@
 #include "table/block_based/block.h"
 
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -307,7 +308,49 @@ void DataBlockIter::SeekImpl(const Slice& target) {
   }
   uint32_t index = 0;
   bool skip_linear_scan = false;
-  bool ok = BinarySeek<DecodeKey>(seek_key, &index, &skip_linear_scan);
+  bool ok = false;
+  if (data_block_skiplist_index_ && data_block_skiplist_index_->Valid() &&
+      data_block_skiplist_index_->NumEntries() > 1) {
+    // Use the skiplist-ish index to narrow the restart search range.
+    // Find the last skip entry whose key <= target.
+    int64_t left = -1;
+    int64_t right =
+        static_cast<int64_t>(data_block_skiplist_index_->NumEntries() - 1);
+    while (left != right) {
+      int64_t mid = left + (right - left + 1) / 2;
+      Slice mid_key =
+          data_block_skiplist_index_->Key(static_cast<uint32_t>(mid));
+      int cmp = icmp_->Compare(mid_key, seek_key);
+      if (cmp <= 0) {
+        left = mid;
+      } else {
+        right = mid - 1;
+      }
+    }
+
+    if (left < 0) {
+      // All keys in the block are strictly greater than target.
+      skip_linear_scan = true;
+      index = 0;
+      ok = true;
+    } else {
+      const uint32_t left_restart =
+          data_block_skiplist_index_->RestartIndex(static_cast<uint32_t>(left));
+      uint32_t right_restart = num_restarts_ - 1;
+      if (static_cast<uint64_t>(left + 1) <
+          data_block_skiplist_index_->NumEntries()) {
+        const uint32_t next_restart = data_block_skiplist_index_->RestartIndex(
+            static_cast<uint32_t>(left + 1));
+        if (next_restart > 0) {
+          right_restart = next_restart - 1;
+        }
+      }
+      ok = BinarySeekInRange<DecodeKey>(seek_key, left_restart, right_restart,
+                                        &index, &skip_linear_scan);
+    }
+  } else {
+    ok = BinarySeek<DecodeKey>(seek_key, &index, &skip_linear_scan);
+  }
 
   if (!ok) {
     return;
@@ -885,6 +928,60 @@ bool BlockIter<TValue>::BinarySeek(const Slice& target, uint32_t* index,
   return true;
 }
 
+template <class TValue>
+template <typename DecodeKeyFunc>
+bool BlockIter<TValue>::BinarySeekInRange(const Slice& target,
+                                          uint32_t left_bound,
+                                          uint32_t right_bound, uint32_t* index,
+                                          bool* skip_linear_scan) {
+  if (restarts_ == 0) {
+    return false;
+  }
+  if (left_bound > right_bound || right_bound >= num_restarts_) {
+    CorruptionError();
+    return false;
+  }
+
+  *skip_linear_scan = false;
+
+  // Similar invariants to BinarySeek(), but constrained:
+  // - Restart key at index `left` is <= target (sentinel `left_bound - 1`)
+  // - Restart keys after `right` are > target (within [left_bound, right_bound])
+  int64_t left = static_cast<int64_t>(left_bound) - 1;
+  int64_t right = static_cast<int64_t>(right_bound);
+  while (left != right) {
+    int64_t mid = left + (right - left + 1) / 2;
+    uint32_t region_offset = GetRestartPoint(static_cast<uint32_t>(mid));
+    uint32_t shared, non_shared;
+    const char* key_ptr = DecodeKeyFunc()(
+        data_ + region_offset, data_ + restarts_, &shared, &non_shared);
+    if (key_ptr == nullptr || (shared != 0)) {
+      CorruptionError();
+      return false;
+    }
+    Slice mid_key(key_ptr, non_shared);
+    UpdateRawKeyAndMaybePadMinTimestamp(mid_key);
+    int cmp = CompareCurrentKey(target);
+    if (cmp < 0) {
+      left = mid;
+    } else if (cmp > 0) {
+      right = mid - 1;
+    } else {
+      *skip_linear_scan = true;
+      left = right = mid;
+    }
+  }
+
+  if (left < static_cast<int64_t>(left_bound)) {
+    // All restart keys in the range are strictly greater than target.
+    *skip_linear_scan = true;
+    *index = left_bound;
+  } else {
+    *index = static_cast<uint32_t>(left);
+  }
+  return true;
+}
+
 // Compare target key and the block key of the block of `block_index`.
 // Return -1 if error.
 int IndexBlockIter::CompareBlockKey(uint32_t block_index, const Slice& target) {
@@ -1078,25 +1175,85 @@ Block::Block(BlockContents&& contents, size_t read_amp_bytes_per_bit,
         }
         break;
       case BlockBasedTableOptions::kDataBlockBinaryAndHash:
+      case BlockBasedTableOptions::kDataBlockBinaryAndSkipList:
+      case BlockBasedTableOptions::kDataBlockBinaryAndHashAndSkipList:
         if (size < sizeof(uint32_t) /* block footer */ +
                        sizeof(uint16_t) /* NUM_BUCK */) {
-          size = 0;
-          break;
+          // For skiplist-only blocks, NUM_BUCK is not present. We fall through
+          // and validate more precisely below.
         }
 
-        uint16_t map_offset;
-        data_block_hash_index_.Initialize(
-            contents_.data.data(),
-            /* chop off NUM_RESTARTS */
-            static_cast<uint16_t>(size - sizeof(uint32_t)), &map_offset);
+        {
+          const uint32_t block_footer =
+              DecodeFixed32(contents_.data.data() + size - sizeof(uint32_t));
+          BlockBasedTableOptions::DataBlockIndexType index_type;
+          uint32_t num_restarts = 0;
+          UnPackIndexTypeAndNumRestarts(block_footer, &index_type,
+                                        &num_restarts);
+          (void)index_type;
+          if (num_restarts != num_restarts_) {
+            size = 0;
+            break;
+          }
 
-        restart_offset_ = map_offset - num_restarts_ * sizeof(uint32_t);
+          uint32_t cursor = static_cast<uint32_t>(size - sizeof(uint32_t));
 
-        if (restart_offset_ > map_offset) {
-          // map_offset is too small for NumRestarts() and
-          // therefore restart_offset_ wrapped around.
-          size = 0;
-          break;
+          const bool has_hash =
+              (IndexType() == BlockBasedTableOptions::kDataBlockBinaryAndHash ||
+               IndexType() ==
+                   BlockBasedTableOptions::kDataBlockBinaryAndHashAndSkipList);
+          const bool has_skiplist = (IndexType() ==
+                                        BlockBasedTableOptions::
+                                            kDataBlockBinaryAndSkipList ||
+                                    IndexType() ==
+                                        BlockBasedTableOptions::
+                                            kDataBlockBinaryAndHashAndSkipList);
+
+          if (has_hash) {
+            if (cursor < sizeof(uint16_t) /* NUM_BUCK */ ||
+                cursor > std::numeric_limits<uint16_t>::max()) {
+              size = 0;
+              break;
+            }
+            uint16_t map_offset_u16 = 0;
+            data_block_hash_index_.Initialize(contents_.data.data(),
+                                              static_cast<uint16_t>(cursor),
+                                              &map_offset_u16);
+            cursor = map_offset_u16;
+          }
+
+          if (has_skiplist) {
+            if (cursor < sizeof(uint16_t) /* SKIPLIST_SIZE */) {
+              size = 0;
+              break;
+            }
+            const uint16_t skiplist_size =
+                DecodeFixed16(contents_.data.data() + cursor -
+                              sizeof(uint16_t));
+            if (skiplist_size == 0) {
+              size = 0;
+              break;
+            }
+            const uint32_t skiplist_offset =
+                cursor - sizeof(uint16_t) - skiplist_size;
+            if (skiplist_offset > cursor) {
+              size = 0;
+              break;
+            }
+            data_block_skiplist_index_.Initialize(contents_.data.data() +
+                                                      skiplist_offset,
+                                                  skiplist_size);
+            cursor = skiplist_offset;
+          }
+
+          restart_offset_ = cursor - num_restarts_ * sizeof(uint32_t);
+
+          if (restart_offset_ > cursor) {
+            // cursor is too small for NumRestarts() and therefore
+            // restart_offset_ wrapped around.
+            size = 0;
+            break;
+          }
         }
         break;
       default:
@@ -1276,6 +1433,8 @@ DataBlockIter* Block::NewDataIterator(const Comparator* raw_ucmp,
         read_amp_bitmap_.get(), block_contents_pinned,
         user_defined_timestamps_persisted,
         data_block_hash_index_.Valid() ? &data_block_hash_index_ : nullptr,
+        data_block_skiplist_index_.Valid() ? &data_block_skiplist_index_
+                                           : nullptr,
         protection_bytes_per_key_, kv_checksum_, block_restart_interval_);
     if (read_amp_bitmap_) {
       if (read_amp_bitmap_->GetStatistics() != stats) {

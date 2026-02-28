@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <limits>
 
 #include "db/dbformat.h"
 #include "rocksdb/comparator.h"
@@ -67,6 +68,16 @@ BlockBuilder::BlockBuilder(
     case BlockBasedTableOptions::kDataBlockBinaryAndHash:
       data_block_hash_index_builder_.Initialize(
           data_block_hash_table_util_ratio);
+      break;
+    case BlockBasedTableOptions::kDataBlockBinaryAndSkipList:
+      // Default stride: sample one restart key every 8 restart intervals.
+      // (Small enough to be effective but still compact.)
+      data_block_skiplist_index_builder_.Initialize(/*stride_restarts=*/8);
+      break;
+    case BlockBasedTableOptions::kDataBlockBinaryAndHashAndSkipList:
+      data_block_hash_index_builder_.Initialize(
+          data_block_hash_table_util_ratio);
+      data_block_skiplist_index_builder_.Initialize(/*stride_restarts=*/8);
       break;
     default:
       assert(0);
@@ -134,12 +145,46 @@ Slice BlockBuilder::Finish() {
   }
 
   uint32_t num_restarts = static_cast<uint32_t>(restarts_.size());
+
+  bool wrote_skiplist = false;
+  if (data_block_skiplist_index_builder_.Enabled()) {
+    std::string skip_blob;
+    if (data_block_skiplist_index_builder_.Build(
+            buffer_, restarts_, use_value_delta_encoding_, &skip_blob) &&
+        !skip_blob.empty()) {
+      // Keep the experimental index simple by restricting it to blocks that
+      // fit in the same size bounds as DataBlockHashIndex (<= 64KiB).
+      const size_t projected =
+          buffer_.size() + skip_blob.size() + sizeof(uint16_t) +
+          sizeof(uint32_t) /* footer */;
+      if (projected <= kMaxBlockSizeSupportedByHashIndex &&
+          skip_blob.size() <= std::numeric_limits<uint16_t>::max()) {
+        buffer_.append(skip_blob);
+        PutFixed16(&buffer_, static_cast<uint16_t>(skip_blob.size()));
+        wrote_skiplist = true;
+      }
+    }
+  }
+
+  bool wrote_hash = false;
+  if (data_block_hash_index_builder_.Valid()) {
+    const size_t projected =
+        buffer_.size() + data_block_hash_index_builder_.EstimateSize() +
+        sizeof(uint32_t) /* footer */;
+    if (projected <= kMaxBlockSizeSupportedByHashIndex) {
+      data_block_hash_index_builder_.Finish(buffer_);
+      wrote_hash = true;
+    }
+  }
+
   BlockBasedTableOptions::DataBlockIndexType index_type =
       BlockBasedTableOptions::kDataBlockBinarySearch;
-  if (data_block_hash_index_builder_.Valid() &&
-      CurrentSizeEstimate() <= kMaxBlockSizeSupportedByHashIndex) {
-    data_block_hash_index_builder_.Finish(buffer_);
+  if (wrote_hash && wrote_skiplist) {
+    index_type = BlockBasedTableOptions::kDataBlockBinaryAndHashAndSkipList;
+  } else if (wrote_hash) {
     index_type = BlockBasedTableOptions::kDataBlockBinaryAndHash;
+  } else if (wrote_skiplist) {
+    index_type = BlockBasedTableOptions::kDataBlockBinaryAndSkipList;
   }
 
   // footer is a packed format of data_block_index_type and num_restarts

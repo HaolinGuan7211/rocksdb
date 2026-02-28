@@ -267,6 +267,11 @@ struct BlockBasedTableOptions {
   enum DataBlockIndexType : char {
     kDataBlockBinarySearch = 0,   // traditional block type
     kDataBlockBinaryAndHash = 1,  // additional hash index
+    // Experimental: append a light-weight skiplist-ish index after restart
+    // array, to reduce restart-key decoding/comparisons for large data blocks.
+    kDataBlockBinaryAndSkipList = 2,
+    // Experimental: include both hash index and skiplist-ish index.
+    kDataBlockBinaryAndHashAndSkipList = 3,
   };
 
   DataBlockIndexType data_block_index_type = kDataBlockBinarySearch;
@@ -626,6 +631,17 @@ struct BlockBasedTableOptions {
   // size allowed for super block alignment is 2MB / 128 = 16KB.
   // Note that, when it is set to 0, super block alignment is disabled.
   size_t super_block_alignment_space_overhead_ratio = 128;
+
+  // When enabled, and super_block_alignment_size is set, RocksDB may coalesce
+  // multiple data block reads that fall into the same aligned "super block"
+  // into a single underlying file read per thread (best-effort).
+  //
+  // Intended for experiments where per-IO fixed overhead dominates and we
+  // want to reduce IO count for short range scans / seek+next patterns when
+  // block cache is disabled (or ineffective) and direct IO is enabled.
+  //
+  // NOTE: This is a best-effort optimization and primarily targets data blocks.
+  bool enable_super_block_read_coalescing = false;
 
   // This enum allows trading off increased index size for improved iterator
   // seek performance in some situations, particularly when block cache is
