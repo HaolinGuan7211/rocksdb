@@ -627,6 +627,15 @@ struct BlockBasedTableOptions {
   // Note that, when it is set to 0, super block alignment is disabled.
   size_t super_block_alignment_space_overhead_ratio = 128;
 
+  // Experimental: if true and super_block_alignment_size is configured, try to
+  // coalesce multiple data block reads that fall into the same aligned super
+  // block into fewer underlying file reads (best-effort).
+  //
+  // Intended for cache=0 + direct IO style experiments (e.g. simulated NVM /
+  // PMEM access) where reducing underlying read calls can noticeably affect
+  // tail latency.
+  bool enable_super_block_read_coalescing = false;
+
   // This enum allows trading off increased index size for improved iterator
   // seek performance in some situations, particularly when block cache is
   // disabled (ReadOptions::fill_cache = false) and direct IO is
