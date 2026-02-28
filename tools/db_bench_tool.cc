@@ -745,6 +745,37 @@ DEFINE_uint64(super_block_alignment_space_overhead_ratio,
                   .super_block_alignment_space_overhead_ratio,
               "Configure space overhead for super block alignment");
 
+DEFINE_bool(enable_super_block_read_coalescing,
+            ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                .enable_super_block_read_coalescing,
+            "If true and super_block_alignment_size is set, coalesce data block "
+            "reads that fall into the same aligned super block into fewer "
+            "underlying file reads (best-effort). Intended for cache=0 + "
+            "direct IO experiments.");
+
+DEFINE_bool(experimental_kvsep_bptree_enable,
+            ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                .experimental_kvsep_bptree_enable,
+            "Experimental: enable KV-separation + B+Tree SST format. Requires "
+            "rebuilding SSTs (clear DB + re-fill) to take effect.");
+
+DEFINE_uint64(experimental_kvsep_bptree_leaf_block_bytes,
+              ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                  .experimental_kvsep_bptree_leaf_block_bytes,
+              "Experimental: target leaf block bytes for KV-sep B+Tree (keys + "
+              "value pointers).");
+
+DEFINE_uint64(experimental_kvsep_bptree_value_block_bytes,
+              ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                  .experimental_kvsep_bptree_value_block_bytes,
+              "Experimental: target value block bytes for KV-sep B+Tree "
+              "(values only).");
+
+DEFINE_uint32(experimental_kvsep_bptree_fanout,
+              ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                  .experimental_kvsep_bptree_fanout,
+              "Experimental: B+Tree internal node fanout for KV-sep SST.");
+
 DEFINE_int64(prepopulate_block_cache, 0,
              "Pre-populate hot/warm blocks in block cache. 0 to disable and 1 "
              "to insert during flush");
@@ -5239,6 +5270,21 @@ class Benchmark {
       block_based_options.enable_index_compression =
           FLAGS_enable_index_compression;
       block_based_options.block_align = FLAGS_block_align;
+      block_based_options.super_block_alignment_size =
+          FLAGS_super_block_alignment_size;
+      block_based_options.super_block_alignment_space_overhead_ratio =
+          FLAGS_super_block_alignment_space_overhead_ratio;
+      block_based_options.enable_super_block_read_coalescing =
+          FLAGS_enable_super_block_read_coalescing;
+
+      block_based_options.experimental_kvsep_bptree_enable =
+          FLAGS_experimental_kvsep_bptree_enable;
+      block_based_options.experimental_kvsep_bptree_leaf_block_bytes =
+          FLAGS_experimental_kvsep_bptree_leaf_block_bytes;
+      block_based_options.experimental_kvsep_bptree_value_block_bytes =
+          FLAGS_experimental_kvsep_bptree_value_block_bytes;
+      block_based_options.experimental_kvsep_bptree_fanout =
+          FLAGS_experimental_kvsep_bptree_fanout;
       block_based_options.whole_key_filtering = FLAGS_whole_key_filtering;
       block_based_options.max_auto_readahead_size =
           FLAGS_max_auto_readahead_size;
