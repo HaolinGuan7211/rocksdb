@@ -537,6 +537,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
     DataBlockIter next_biter;
     size_t idx_in_batch = 0;
     SharedCleanablePtr shared_cleanable;
+    BlockHandle prev_data_block_handle = BlockHandle::NullBlockHandle();
     for (auto miter = sst_file_range.begin(); miter != sst_file_range.end();
          ++miter) {
       Status s;
@@ -547,6 +548,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
       bool first_block = true;
       do {
         DataBlockIter* biter = nullptr;
+        BlockHandle cur_data_block_handle = BlockHandle::NullBlockHandle();
         uint64_t referenced_data_size = 0;
         Block_kData* parsed_block_value = nullptr;
         bool reusing_prev_block;
@@ -565,11 +567,14 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
                 read_options, results[idx_in_batch].As<Block>(), &first_biter,
                 statuses[idx_in_batch]);
             reusing_prev_block = false;
+            cur_data_block_handle = block_handles[idx_in_batch];
+            prev_data_block_handle = cur_data_block_handle;
           } else {
             // If handle is null and result is empty, then the status is never
             // set, which should be the initial value: ok().
             assert(statuses[idx_in_batch].ok());
             reusing_prev_block = true;
+            cur_data_block_handle = prev_data_block_handle;
           }
           biter = &first_biter;
           later_reused =
@@ -596,6 +601,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
               /*async_read = */ false, tmp_s,
               /* use_block_cache_for_lookup = */ true);
           biter = &next_biter;
+          cur_data_block_handle = iiter->value().handle;
           reusing_prev_block = false;
           later_reused = false;
         }
@@ -655,6 +661,14 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
           value_pinner = nullptr;
         }
 
+        BlockHandle kvsep_value_block_handle;
+        const bool kvsep_enabled = rep_->experimental_kvsep_bptree_enabled;
+        const bool kvsep_have_value_handle =
+            kvsep_enabled && KVSepBptreeLookupValueHandle(cur_data_block_handle,
+                                                         &kvsep_value_block_handle);
+        CachableEntry<Block_kKVSepValue> kvsep_value_block;
+        bool kvsep_value_block_loaded = false;
+
         bool may_exist = biter->SeekForGet(key);
         if (!may_exist) {
           // HashSeek cannot find the key this block and the the iter is not
@@ -673,10 +687,53 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
             s = pik_status;
             break;
           }
+          Slice value_to_save = biter->value();
+          if (kvsep_enabled) {
+            if (UNLIKELY(!kvsep_have_value_handle)) {
+              s = Status::Corruption("kvsep enabled but missing value map entry");
+              break;
+            }
+            uint32_t value_off = 0;
+            uint32_t value_len = 0;
+            Status decode_status = KVSepBptreeDecodePointer(value_to_save,
+                                                           &value_off, &value_len);
+            if (UNLIKELY(!decode_status.ok())) {
+              s = decode_status;
+              break;
+            }
+            if (value_len == 0) {
+              value_to_save = Slice();
+            } else {
+              if (!kvsep_value_block_loaded) {
+                Status vb_status = KVSepBptreeGetValueBlock(
+                    read_options, kvsep_value_block_handle, &kvsep_value_block,
+                    lookup_data_block_context);
+                if (UNLIKELY(!vb_status.ok())) {
+                  s = vb_status;
+                  break;
+                }
+                kvsep_value_block_loaded = true;
+              }
+              if (UNLIKELY(kvsep_value_block.GetValue() == nullptr)) {
+                s = Status::Corruption("kvsep missing value block");
+                break;
+              }
+              const Slice value_block_contents =
+                  kvsep_value_block.GetValue()->ContentSlice();
+              if (UNLIKELY(static_cast<size_t>(value_off) +
+                               static_cast<size_t>(value_len) >
+                           value_block_contents.size())) {
+                s = Status::Corruption("kvsep pointer out of range");
+                break;
+              }
+              value_to_save = Slice(value_block_contents.data() + value_off,
+                                    value_len);
+            }
+          }
           Status read_status;
           bool ret = get_context->SaveValue(
-              parsed_key, biter->value(), &matched, &read_status,
-              value_pinner ? value_pinner : nullptr);
+              parsed_key, value_to_save, &matched, &read_status,
+              (kvsep_enabled || !value_pinner) ? nullptr : value_pinner);
           if (!read_status.ok()) {
             s = read_status;
             break;
@@ -685,7 +742,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
             if (get_context->State() == GetContext::GetState::kFound) {
               does_referenced_key_exist = true;
               referenced_data_size =
-                  biter->key().size() + biter->value().size();
+                  biter->key().size() + value_to_save.size();
             }
             done = true;
             break;

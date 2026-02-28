@@ -32,18 +32,16 @@
 
 本分支计划实现的“KV-SEP + B+Tree SST”结构：
 
-- **Value Data Blocks（值块）**：只存 value（不存 key），按 block 切分与压缩/校验；支持按“块内 offset”取回 value（避免再做 key compare）。
-- **Leaf Blocks（叶子块）**：存储有序的 **key + value pointer**。value pointer 至少包含：
-  - value block handle（offset/size）
-  - value 在 block 内的 offset（以及必要时 value 长度）
+- **Value Blocks（值块）**：只存 value bytes（不存 key），按 block 切分与压缩/校验；支持按“块内 offset + length”O(1) slice 取回 value。
+- **Leaf/Data Blocks（叶子块）**：复用 RocksDB 的 data block（BlockBuilder / DataBlockIter），但其 value 不再是原始 value，而是 `ValuePtr=(value_off,value_len)`（varint32,varint32）。
 - **Internal Index Blocks（内部索引块）**：存储 separator key + child block handle，形成 B+Tree。
-- **Root/Meta**：root handle 写入 meta 或 properties，打开 SST 时快速定位。
+- **ValueMap Meta Block**：新增一个 meta block，存储 `data_block_handle.offset -> value_block_handle(offset,size)` 的映射。读路径通过它把“当前 data block”关联到“当前 value block”。
 
 这样：
 
 - “key + index block 放在一起” → key 全部在 leaf/internal blocks 中
 - “value 单独构成 data block” → value blocks 只存 value payload
-- “index block 存储 key + data block offset” → leaf 里存 key + value block offset（以及块内 offset）
+- “index block 存储 key + data block offset” → 仍使用原版 index（key → data_block_handle），只是 data block 内容变成 `key + ValuePtr`；value block handle 通过 meta map 获取
 
 ---
 
@@ -53,9 +51,7 @@
 
 - 默认不开启 KV-SEP/B+Tree：完全使用 RocksDB 原版 SST 格式与读写路径。
 - 开启后：写出的 SST 在 table properties 里记录：
-  - `rocksdb.experimental.kvsep = 1`
-  - `rocksdb.experimental.kvsep.format_version = 1`
-  - `rocksdb.experimental.kvsep.bptree.root_handle = <encoded>`
+  - `rocksdb.experimental.kvsep_bptree = 1`
   - （可选）统计信息：leaf 数、value block 数、平均 key/value bytes 等
 
 读路径：
@@ -67,32 +63,23 @@
 
 - 关闭开关并重新 fill DB（清库）即可回到原版 SST。
 
-### 3.2 Value Data Block（只存 value）
+### 3.2 Value Block（只存 value bytes）
 
-为了让 value 取回可以 O(1) 定位，值块建议采用“顺序 values + offsets 数组”的结构：
+本分支第一版实现采用更简单/更“工程可落地”的格式：
 
-```
-VALUE_BLOCK :=
-  [ VALUE_BYTES ... ]
-  [ OFFSETS(uint32_t) ... ]   // 每条 value 的起始 offset（相对 block 起点）
-  [ NUM_VALUES(uint32_t) ]
-  [ FOOTER(uint32_t) ]        // magic/flags（用于快速校验/识别）
-```
+- value block 的 uncompressed 内容就是 `VALUE_BYTES` 的直接拼接（无 offsets 数组）。
+- leaf/data block 的 `ValuePtr` 显式存储 `(value_off, value_len)`，因此读取时无需 offsets 数组也能 O(1) slice。
+- value block 作为一种新的 `BlockType::kKVSepValue` 写入 SST，并复用原有的 block checksum +（可选）压缩。
 
-写入时：append value bytes，并记录 offset；block 满则 flush。
+### 3.3 Leaf/Data Block（key + value pointer）
 
-读取时：读到整个块后，通过 offsets + value length 推导出 slice（value_length 可以由 offsets[i+1]-offsets[i] 得到，最后一个通过 block_end 推导）。
-
-### 3.3 Leaf Block（key + value pointer）
-
-Leaf block 可以复用 RocksDB 的 BlockBuilder（prefix-compress + restarts），存储：
+Leaf/data block 复用 RocksDB 的 BlockBuilder（prefix-compress + restarts），存储：
 
 - key: user key（或 internal key，取决于 iterator 语义）
 - value: `ValuePtr` 编码
 
 `ValuePtr` 编码建议：
 
-- `ValueBlockHandle`（RocksDB BlockHandle 的 varint 编码：offset + size）
 - `value_offset_in_block`（fixed32 或 varint32）
 - `value_length`（varint32，若能从 offsets 推导也可省略）
 
@@ -107,24 +94,20 @@ Leaf block 可以复用 RocksDB 的 BlockBuilder（prefix-compress + restarts）
 
 ## 4. 读写路径（实现范围）
 
-### 4.1 写路径（TableBuilder）
+### 4.1 写路径（TableBuilder / 当前实现）
 
-新增一套 experimental builder：
+当前实现直接复用 `BlockBasedTableBuilder`，在 `experimental_kvsep_bptree_enable=1` 时改变 data block 的 value 内容与写出顺序：
 
-- `KVSepValueBlockBuilder`：构建 value blocks（只存 value）
-- `KVSepLeafBuilder`：构建 leaf blocks（key + value ptr）
-- `KVSepBptreeBuilder`：把 leaf blocks 组织成 B+Tree（多层 internal blocks）
-
-写 SST 流程：
-
-1) 每条 KV：
-   - value 写入当前 value block buffer，得到 `(current_value_block_handle_placeholder, in_block_offset)`
-   - key + value_ptr 写入 leaf builder
-2) value block 满 → flush value block，获得真实 block handle
-3) leaf block 满（或达到 leaf target）→ flush leaf，记录 leaf handle + leaf first key
-4) Finish：
-   - 根据 leaf 列表构建上层 internal blocks，直到 root
-   - root handle 写入 properties/meta
+1) `Add(key,value)` 时：
+   - 把 `value` append 到当前 value block buffer
+   - 生成 `ValuePtr=(off,len)` 并作为“data block value”写入 data block
+2) flush data block 时：
+   - 先写 value block（`BlockType::kKVSepValue`）
+   - 再写 data block（`BlockType::kData`，其 value 为 ValuePtr）
+   - 记录 `data_block_offset -> value_block_handle` 到内存 vector
+3) `Finish()` 时：
+   - 把这份映射写入一个 meta block：`rocksdb.experimental.kvsep_bptree.value_map`
+   - properties 里记录开关与统计字段，便于 open 时识别与排错
 
 ### 4.2 读路径（TableReader + Iterator）
 
@@ -144,13 +127,8 @@ Leaf block 可以复用 RocksDB 的 BlockBuilder（prefix-compress + restarts）
 
 关于 value block 的 IO 与 cache：
 
-第一阶段（POC）建议：
-
-- cache=0：直接读 value block 并 slice（避免引入复杂的 cache entry 类型）
-
-第二阶段（加强）再做：
-
-- 把 value blocks 作为 block cache 的独立 role，支持 cache=500MB 的公平对比
+- value block 作为 `BlockType::kKVSepValue` 参与 block cache（条目类型为 `Block_kKVSepValue`，内部是 raw `BlockContents`）。
+- 因此 cache=0/cache=500MB 都能公平对比（`ReadOptions::fill_cache` 仍生效）。
 
 ---
 
@@ -158,11 +136,10 @@ Leaf block 可以复用 RocksDB 的 BlockBuilder（prefix-compress + restarts）
 
 新增 db_bench flags（建议）：
 
-- `--experimental_kvsep_enable=1`
-- `--experimental_kvsep_bptree_fanout=<N>`（例如 64/128）
-- `--experimental_kvsep_leaf_block_bytes=<bytes>`（例如 16KB/32KB）
-- `--experimental_kvsep_value_block_bytes=<bytes>`（例如 16KB/32KB）
-- `--experimental_kvsep_store_value_len=0/1`
+- `--experimental_kvsep_bptree_enable=1`
+- `--experimental_kvsep_bptree_fanout=<N>`（例如 64/128；当前未参与写入路径）
+- `--experimental_kvsep_bptree_leaf_block_bytes=<bytes>`（例如 16KB/32KB）
+- `--experimental_kvsep_bptree_value_block_bytes=<bytes>`（例如 16KB/32KB）
 
 并确保：
 
@@ -192,12 +169,12 @@ Leaf block 可以复用 RocksDB 的 BlockBuilder（prefix-compress + restarts）
 目标：只对比“原版 SST vs KV-SEP+B+Tree SST”，先在 cache=0 场景把链路跑通并观察 IO 放大趋势。
 
 - Case A（baseline）：原版 block-based table
-- Case B（kvsep+bptree）：开启 `experimental_kvsep_enable=1`
+- Case B（kvsep+bptree）：开启 `experimental_kvsep_bptree_enable=1`
 
 分别跑：
 
 - cache=0
-- cache=500MB（第二轮，在实现 value cache 支持后跑）
+- cache=500MB
 
 ### 6.4 指标
 
@@ -258,4 +235,3 @@ Leaf block 可以复用 RocksDB 的 BlockBuilder（prefix-compress + restarts）
    - 仅支持 mixgraph 需要的 Seek/Next/MultiGet
 2) 再补 value blocks 的 cache 支持（cache=500MB 公平对比）
 3) 再扩展 B+Tree 深度、fanout tuning、leaf/value block size sweep
-

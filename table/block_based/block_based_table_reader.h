@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
@@ -27,6 +28,7 @@
 #include "table/block_based/cachable_entry.h"
 #include "table/block_based/filter_block.h"
 #include "table/block_based/uncompression_dict_reader.h"
+#include "table/block_based/kvsep_bptree_format.h"
 #include "table/format.h"
 #include "table/persistent_cache_options.h"
 #include "table/table_properties_internal.h"
@@ -344,6 +346,7 @@ class BlockBasedTable : public TableReader {
   friend class PartitionIndexReader;
 
   friend class UncompressionDictReader;
+  friend class BlockBasedTableIterator;
 
  protected:
   Rep* rep_;
@@ -357,6 +360,16 @@ class BlockBasedTable : public TableReader {
   friend class MockedBlockBasedTable;
   friend class BlockBasedTableReaderTestVerifyChecksum_ChecksumMismatch_Test;
   BlockCacheTracer* const block_cache_tracer_;
+
+  bool KVSepBptreeLookupValueHandle(const BlockHandle& data_block_handle,
+                                    BlockHandle* value_block_handle) const;
+  Status KVSepBptreeGetValueBlock(const ReadOptions& ro,
+                                  const BlockHandle& value_block_handle,
+                                  CachableEntry<Block_kKVSepValue>* value_block,
+                                  BlockCacheLookupContext* lookup_context) const;
+  static Status KVSepBptreeDecodePointer(const Slice& ptr,
+                                        uint32_t* value_off,
+                                        uint32_t* value_len);
 
   void UpdateCacheHitMetrics(BlockType block_type, GetContext* get_context,
                              size_t usage) const;
@@ -647,6 +660,9 @@ struct BlockBasedTable::Rep {
   std::shared_ptr<const TableProperties> table_properties;
   SeqnoToTimeMapping seqno_to_time_mapping;
   BlockHandle index_handle;
+  bool experimental_kvsep_bptree_enabled = false;
+  uint32_t kvsep_value_block_bytes_hint = 0;
+  std::vector<KVSepBptreeValueMapEntry> kvsep_value_map_entries;
   BlockBasedTableOptions::IndexType index_type;
   bool whole_key_filtering;
   bool prefix_filtering;

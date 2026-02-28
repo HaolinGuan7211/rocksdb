@@ -52,6 +52,11 @@ void BlockCreateContext::Create(
   parsed_out->reset(new Block_kUserDefinedIndex(std::move(block)));
 }
 
+void BlockCreateContext::Create(std::unique_ptr<Block_kKVSepValue>* parsed_out,
+                                BlockContents&& block) {
+  parsed_out->reset(new Block_kKVSepValue(std::move(block)));
+}
+
 void BlockCreateContext::Create(
     std::unique_ptr<ParsedFullFilterBlock>* parsed_out, BlockContents&& block) {
   parsed_out->reset(new ParsedFullFilterBlock(
@@ -81,6 +86,8 @@ const std::array<const Cache::CacheItemHelper*,
         nullptr,  // kHashIndexMetadata
         nullptr,  // kMetaIndex (not yet stored in block cache)
         BlockCacheInterface<Block_kIndex>::GetFullHelper(),
+        BlockCacheInterface<Block_kUserDefinedIndex>::GetFullHelper(),
+        BlockCacheInterface<Block_kKVSepValue>::GetFullHelper(),
         nullptr,  // kInvalid
     }};
 
@@ -98,6 +105,8 @@ const std::array<const Cache::CacheItemHelper*,
         nullptr,  // kHashIndexMetadata
         nullptr,  // kMetaIndex (not yet stored in block cache)
         BlockCacheInterface<Block_kIndex>::GetBasicHelper(),
+        BlockCacheInterface<Block_kUserDefinedIndex>::GetBasicHelper(),
+        BlockCacheInterface<Block_kKVSepValue>::GetBasicHelper(),
         nullptr,  // kInvalid
     }};
 }  // namespace

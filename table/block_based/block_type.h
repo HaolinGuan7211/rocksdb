@@ -28,6 +28,8 @@ enum class BlockType : uint8_t {
   kMetaIndex,
   kIndex,
   kUserDefinedIndex,
+  // Experimental: value-only blocks for KV-separation experiments.
+  kKVSepValue,
   // Note: keep kInvalid the last value when adding new enum values.
   kInvalid
 };
