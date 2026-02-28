@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -1601,6 +1602,32 @@ DEFINE_bool(simulate_xp_use_dimm_device_model, false,
             "accounting, instead of purely scaling device service time by "
             "service units * simulate_xp_latency_ns.");
 
+DEFINE_bool(simulate_xp_monitor_enable, false,
+            "Enable simulated (XP/DIMM) filesystem latency monitor. When "
+            "enabled, the simulated filesystem wrapper will emit time-series "
+            "CSV rows for per-window max latency and tmpfs-vs-base traffic.");
+DEFINE_uint64(simulate_xp_monitor_window_us, 1000000,
+              "Time window size in microseconds for simulated filesystem "
+              "latency monitor (e.g., 1000000 for 1s).");
+DEFINE_uint64(simulate_xp_monitor_stage_seconds, 0,
+              "Optional stage window size in seconds for simulated filesystem "
+              "latency monitor. 0 disables stage aggregation output.");
+DEFINE_bool(simulate_xp_monitor_max_read, true,
+            "If true, track per-window max latency for Read/MultiRead ops in "
+            "the simulated filesystem monitor.");
+DEFINE_bool(simulate_xp_monitor_max_open, true,
+            "If true, track per-window max latency for New*File/Reopen/Reuse "
+            "ops in the simulated filesystem monitor.");
+DEFINE_bool(simulate_xp_monitor_max_prefetch, true,
+            "If true, track per-window max latency for Prefetch ops in the "
+            "simulated filesystem monitor.");
+DEFINE_string(simulate_xp_monitor_window_csv, "",
+              "If non-empty, write simulated filesystem per-window monitor "
+              "CSV to this path.");
+DEFINE_string(simulate_xp_monitor_stage_csv, "",
+              "If non-empty and --simulate_xp_monitor_stage_seconds>0, write "
+              "simulated filesystem per-stage monitor CSV to this path.");
+
 DEFINE_uint64(simulate_dimm_fixed_read_overhead_ns, 1080,
               "Single-DIMM NVM: fixed host-side read overhead in ns.");
 DEFINE_uint64(simulate_dimm_fixed_write_overhead_ns, 0,
@@ -1850,6 +1877,55 @@ DEFINE_int64(
 DEFINE_bool(
     mix_shift_log_stage_transitions, false,
     "If true, log mixgraph hot-range stage transitions to stderr.");
+
+DEFINE_bool(mix_burst_enable, false,
+            "Enable periodic cold scan bursts during mixgraph. When enabled, "
+            "a thread will occasionally issue a seek+scan that targets cold "
+            "key ranges (when hotset/shift is enabled) to simulate bursty "
+            "scan traffic and transient cache misses.");
+
+DEFINE_int64(mix_burst_interval_ops, 0,
+             "Trigger one burst scan every N mixgraph operations per thread. "
+             "0 disables burst injection.");
+
+DEFINE_int32(mix_burst_scan_nexts, 0,
+             "Number of iterator entries to read during each burst scan "
+             "(including the first entry after Seek). 0 disables bursts.");
+
+DEFINE_bool(
+    mix_burst_cold_ranges_only, true,
+    "If true and mix_hotset_enable=1, burst scans will preferentially target "
+    "cold key ranges (i.e., outside the current hot window).");
+
+DEFINE_bool(mix_burst_log, false,
+            "If true, log mixgraph burst-scan events to stderr.");
+
+DEFINE_bool(
+    mix_monitor_enable, false,
+    "Enable mixgraph monitoring outputs (cache tickers/properties, "
+    "shift stage, burst/probe counters) as time-series CSV and stage-summary "
+    "CSV.");
+DEFINE_int64(mix_monitor_window_us, 1000000,
+             "Mixgraph monitor sampling interval in microseconds.");
+DEFINE_string(mix_monitor_cache_csv, "",
+              "If non-empty and --mix_monitor_enable=1, write per-window "
+              "mixgraph cache/monitor time series to this CSV path.");
+DEFINE_string(mix_monitor_stage_csv, "",
+              "If non-empty and --mix_monitor_enable=1, write per-stage "
+              "mixgraph aggregated cache/monitor stats to this CSV path.");
+DEFINE_string(mix_monitor_events_csv, "",
+              "If non-empty and --mix_monitor_enable=1, append mixgraph "
+              "events (shift stage transitions, burst triggers) to this CSV.");
+
+DEFINE_bool(mix_probe_enable, false,
+            "Enable hotset probe traffic in mixgraph. Probe ops use "
+            "ReadTier::kBlockCacheTier to check data block cache residency "
+            "without triggering storage IO.");
+DEFINE_int64(mix_probe_interval_ops, 0,
+             "Trigger one hotset probe batch every N mixgraph operations per "
+             "thread. 0 disables probes.");
+DEFINE_int32(mix_probe_reads, 0,
+             "Number of probe Get() calls per probe batch. 0 disables probes.");
 DEFINE_double(key_dist_a, 0.0,
               "The parameter 'a' of key access distribution model f(x)=a*x^b");
 DEFINE_double(key_dist_b, 0.0,
@@ -1882,6 +1958,10 @@ DEFINE_double(mix_put_ratio, 0.0,
               "The ratio of Put queries of mix_graph workload");
 DEFINE_double(mix_seek_ratio, 0.0,
               "The ratio of Seek queries of mix_graph workload");
+DEFINE_double(mix_multiget_ratio, 0.0,
+              "The ratio of MultiGet queries of mix_graph workload");
+DEFINE_int32(mix_multiget_batch, 16,
+             "Number of keys per MultiGet when mix_multiget_ratio > 0.");
 DEFINE_int64(mix_max_scan_len, 10000, "The max scan length of Iterator");
 DEFINE_int64(mix_max_value_size, 1024, "The max value size of this workload");
 DEFINE_double(
@@ -2069,6 +2149,11 @@ DEFINE_bool(report_file_operations, false,
             "if report number of file operations");
 DEFINE_bool(report_open_timing, false, "if report open timing");
 DEFINE_int32(readahead_size, 0, "Iterator readahead size");
+
+DEFINE_int32(mix_seek_readahead_size, 0,
+             "If > 0, overrides ReadOptions.readahead_size only for the "
+             "mixgraph Seek iterator (query_type=Seek), to reduce data block "
+             "read count in seek+next patterns when block cache is disabled.");
 
 DEFINE_bool(read_with_latest_user_timestamp, true,
             "If true, always use the current latest timestamp for read. If "
@@ -2875,6 +2960,361 @@ class TailProbeWriter {
   bool enabled_ = false;
 };
 
+struct MixGraphMonitorShared {
+  std::atomic<int64_t> shift_stage{0};
+  std::atomic<uint64_t> burst_scans{0};
+  std::atomic<uint64_t> burst_entries{0};
+  std::atomic<uint64_t> probe_ops{0};
+  std::atomic<uint64_t> probe_hit{0};
+  std::atomic<uint64_t> probe_incomplete{0};
+  std::atomic<uint64_t> probe_notfound{0};
+  std::atomic<uint64_t> probe_error{0};
+};
+
+class MixGraphEventWriter {
+ public:
+  explicit MixGraphEventWriter(std::string path)
+      : output_path_(std::move(path)), file_(nullptr) {
+    if (output_path_.empty()) {
+      return;
+    }
+    bool has_data = false;
+    {
+      std::ifstream in(output_path_);
+      has_data = in.good() && in.peek() != std::ifstream::traits_type::eof();
+    }
+    file_ = std::fopen(output_path_.c_str(), "a");
+    if (file_ == nullptr) {
+      fprintf(stderr, "mixgraph event log disabled: cannot open %s\n",
+              output_path_.c_str());
+      return;
+    }
+    enabled_ = true;
+    if (!has_data) {
+      WriteHeader();
+    }
+  }
+
+  ~MixGraphEventWriter() {
+    if (file_ != nullptr) {
+      std::fflush(file_);
+      std::fclose(file_);
+      file_ = nullptr;
+    }
+  }
+
+  bool Enabled() const { return enabled_ && file_ != nullptr; }
+
+  void LogEvent(uint64_t wall_time_us, const std::string& event, int thread_id,
+                int64_t stage, int64_t range_id, int64_t key_id,
+                uint64_t value_a, uint64_t value_b) {
+    if (!Enabled()) {
+      return;
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    std::string row;
+    row.reserve(256);
+    row.append(std::to_string(wall_time_us));
+    row.push_back(',');
+    row.append(SanitizeCsvField(event));
+    row.push_back(',');
+    row.append(std::to_string(thread_id));
+    row.push_back(',');
+    row.append(std::to_string(stage));
+    row.push_back(',');
+    row.append(std::to_string(range_id));
+    row.push_back(',');
+    row.append(std::to_string(key_id));
+    row.push_back(',');
+    row.append(std::to_string(value_a));
+    row.push_back(',');
+    row.append(std::to_string(value_b));
+    row.push_back('\n');
+    std::fwrite(row.data(), 1, row.size(), file_);
+    std::fflush(file_);
+  }
+
+ private:
+  void WriteHeader() {
+    static const char* header =
+        "wall_time_us,event,thread_id,shift_stage,range_id,key_id,value_a,value_b\n";
+    std::fputs(header, file_);
+    std::fflush(file_);
+  }
+
+  std::string output_path_;
+  std::FILE* file_;
+  std::mutex mu_;
+  bool enabled_ = false;
+};
+
+class MixGraphCacheSampler {
+ public:
+  MixGraphCacheSampler(DB* db, std::shared_ptr<Statistics> stats,
+                       std::shared_ptr<MixGraphMonitorShared> shared,
+                       std::string window_csv, std::string stage_csv,
+                       int64_t window_us)
+      : db_(db),
+        stats_(std::move(stats)),
+        shared_(std::move(shared)),
+        window_csv_(std::move(window_csv)),
+        stage_csv_(std::move(stage_csv)),
+        window_us_(window_us > 0 ? static_cast<uint64_t>(window_us) : 1000000) {
+    enabled_ = (db_ != nullptr) && (stats_ != nullptr) &&
+               (!window_csv_.empty() || !stage_csv_.empty());
+  }
+
+  ~MixGraphCacheSampler() { Stop(); }
+
+  bool Enabled() const { return enabled_; }
+
+  void Start(uint64_t start_us) {
+    if (!enabled_) {
+      return;
+    }
+    start_us_ = start_us;
+    OpenOutputs();
+    stop_.store(false);
+    stage_initialized_ = true;
+    last_stage_id_ = CurrentStage();
+    stage_start_us_ = start_us_;
+    last_snapshot_ = CaptureSnapshot();
+    stage_prev_snapshot_ = last_snapshot_;
+    thread_ = std::thread([this]() { ThreadBody(); });
+  }
+
+  void Stop() {
+    if (!enabled_) {
+      return;
+    }
+    stop_.store(true);
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+    FlushWindow(/*force=*/true);
+    FlushStage(/*force=*/true);
+    if (window_out_.is_open()) {
+      window_out_.flush();
+      window_out_.close();
+    }
+    if (stage_out_.is_open()) {
+      stage_out_.flush();
+      stage_out_.close();
+    }
+    enabled_ = false;
+  }
+
+ private:
+  struct Snapshot {
+    uint64_t block_cache_hit = 0;
+    uint64_t block_cache_miss = 0;
+    uint64_t data_hit = 0;
+    uint64_t data_miss = 0;
+    uint64_t data_bytes_insert = 0;
+    uint64_t bytes_read = 0;
+    uint64_t bytes_write = 0;
+    uint64_t add_failures = 0;
+    uint64_t probe_ops = 0;
+    uint64_t probe_hit = 0;
+    uint64_t probe_incomplete = 0;
+    uint64_t probe_notfound = 0;
+    uint64_t probe_error = 0;
+    uint64_t burst_scans = 0;
+    uint64_t burst_entries = 0;
+  };
+
+  Snapshot CaptureSnapshot() const {
+    Snapshot s;
+    s.block_cache_hit = stats_->getTickerCount(BLOCK_CACHE_HIT);
+    s.block_cache_miss = stats_->getTickerCount(BLOCK_CACHE_MISS);
+    s.data_hit = stats_->getTickerCount(BLOCK_CACHE_DATA_HIT);
+    s.data_miss = stats_->getTickerCount(BLOCK_CACHE_DATA_MISS);
+    s.data_bytes_insert = stats_->getTickerCount(BLOCK_CACHE_DATA_BYTES_INSERT);
+    s.bytes_read = stats_->getTickerCount(BLOCK_CACHE_BYTES_READ);
+    s.bytes_write = stats_->getTickerCount(BLOCK_CACHE_BYTES_WRITE);
+    s.add_failures = stats_->getTickerCount(BLOCK_CACHE_ADD_FAILURES);
+    if (shared_) {
+      s.probe_ops = shared_->probe_ops.load();
+      s.probe_hit = shared_->probe_hit.load();
+      s.probe_incomplete = shared_->probe_incomplete.load();
+      s.probe_notfound = shared_->probe_notfound.load();
+      s.probe_error = shared_->probe_error.load();
+      s.burst_scans = shared_->burst_scans.load();
+      s.burst_entries = shared_->burst_entries.load();
+    }
+    return s;
+  }
+
+  static Snapshot Delta(const Snapshot& a, const Snapshot& b) {
+    Snapshot d;
+    d.block_cache_hit = b.block_cache_hit - a.block_cache_hit;
+    d.block_cache_miss = b.block_cache_miss - a.block_cache_miss;
+    d.data_hit = b.data_hit - a.data_hit;
+    d.data_miss = b.data_miss - a.data_miss;
+    d.data_bytes_insert = b.data_bytes_insert - a.data_bytes_insert;
+    d.bytes_read = b.bytes_read - a.bytes_read;
+    d.bytes_write = b.bytes_write - a.bytes_write;
+    d.add_failures = b.add_failures - a.add_failures;
+    d.probe_ops = b.probe_ops - a.probe_ops;
+    d.probe_hit = b.probe_hit - a.probe_hit;
+    d.probe_incomplete = b.probe_incomplete - a.probe_incomplete;
+    d.probe_notfound = b.probe_notfound - a.probe_notfound;
+    d.probe_error = b.probe_error - a.probe_error;
+    d.burst_scans = b.burst_scans - a.burst_scans;
+    d.burst_entries = b.burst_entries - a.burst_entries;
+    return d;
+  }
+
+  void OpenOutputs() {
+    if (!window_csv_.empty()) {
+      window_out_.open(window_csv_, std::ofstream::out | std::ofstream::trunc);
+      if (window_out_.good()) {
+        window_out_
+            << "wall_time_us,elapsed_us,window_id,shift_stage,"
+               "block_cache_hit,block_cache_miss,data_hit,data_miss,"
+               "data_bytes_insert,bytes_read,bytes_write,add_failures,"
+               "block_cache_usage,block_cache_pinned_usage,block_cache_capacity,"
+               "burst_scans,burst_entries,probe_ops,probe_hit,probe_incomplete,"
+               "probe_notfound,probe_error\n";
+      }
+    }
+    if (!stage_csv_.empty()) {
+      stage_out_.open(stage_csv_, std::ofstream::out | std::ofstream::trunc);
+      if (stage_out_.good()) {
+        stage_out_
+            << "stage_id,stage_start_us,stage_end_us,"
+               "block_cache_hit,block_cache_miss,data_hit,data_miss,"
+               "data_bytes_insert,bytes_read,bytes_write,add_failures,"
+               "burst_scans,burst_entries,probe_ops,probe_hit,probe_incomplete,"
+               "probe_notfound,probe_error\n";
+      }
+    }
+  }
+
+  bool GetIntProp(const std::string& name, uint64_t* out) const {
+    if (db_ == nullptr || out == nullptr) {
+      return false;
+    }
+    uint64_t v = 0;
+    if (!db_->GetIntProperty(name, &v)) {
+      return false;
+    }
+    *out = v;
+    return true;
+  }
+
+  int64_t CurrentStage() const {
+    if (!shared_) {
+      return 0;
+    }
+    return shared_->shift_stage.load();
+  }
+
+  void FlushWindow(bool force) {
+    if (!window_out_.is_open()) {
+      return;
+    }
+    const uint64_t now_us = FLAGS_env->NowMicros();
+    const uint64_t elapsed_us = now_us > start_us_ ? now_us - start_us_ : 0;
+    const uint64_t windows_started = elapsed_us / window_us_;
+    int64_t target = static_cast<int64_t>(windows_started);
+    if (!force) {
+      if (windows_started == 0) {
+        return;
+      }
+      target = static_cast<int64_t>(windows_started - 1);
+    }
+    if (target <= last_window_id_) {
+      return;
+    }
+
+    const Snapshot cur = CaptureSnapshot();
+    const Snapshot d = Delta(last_snapshot_, cur);
+    last_snapshot_ = cur;
+
+    uint64_t usage = 0;
+    uint64_t pinned = 0;
+    uint64_t capacity = 0;
+    GetIntProp("rocksdb.block-cache-usage", &usage);
+    GetIntProp("rocksdb.block-cache-pinned-usage", &pinned);
+    GetIntProp("rocksdb.block-cache-capacity", &capacity);
+
+    window_out_ << now_us << "," << elapsed_us << "," << target << ","
+                << CurrentStage() << "," << d.block_cache_hit << ","
+                << d.block_cache_miss << "," << d.data_hit << "," << d.data_miss
+                << "," << d.data_bytes_insert << "," << d.bytes_read << ","
+                << d.bytes_write << "," << d.add_failures << "," << usage << ","
+                << pinned << "," << capacity << "," << d.burst_scans << ","
+                << d.burst_entries << "," << d.probe_ops << "," << d.probe_hit
+                << "," << d.probe_incomplete << "," << d.probe_notfound << ","
+                << d.probe_error << "\n";
+    last_window_id_ = target;
+    window_out_.flush();
+  }
+
+  void FlushStage(bool force) {
+    if (!stage_out_.is_open()) {
+      return;
+    }
+    const int64_t stage = CurrentStage();
+    if (!force && stage == last_stage_id_) {
+      return;
+    }
+    const uint64_t now_us = FLAGS_env->NowMicros();
+
+    const Snapshot cur = CaptureSnapshot();
+    const Snapshot d = Delta(stage_prev_snapshot_, cur);
+    stage_prev_snapshot_ = cur;
+
+    stage_out_ << last_stage_id_ << "," << stage_start_us_ << "," << now_us
+               << "," << d.block_cache_hit << "," << d.block_cache_miss << ","
+               << d.data_hit << "," << d.data_miss << "," << d.data_bytes_insert
+               << "," << d.bytes_read << "," << d.bytes_write << ","
+               << d.add_failures << "," << d.burst_scans << ","
+               << d.burst_entries << "," << d.probe_ops << "," << d.probe_hit
+               << "," << d.probe_incomplete << "," << d.probe_notfound << ","
+               << d.probe_error << "\n";
+    stage_out_.flush();
+
+    last_stage_id_ = stage;
+    stage_start_us_ = now_us;
+  }
+
+  void ThreadBody() {
+    while (!stop_.load()) {
+      std::this_thread::sleep_for(std::chrono::microseconds(window_us_));
+      if (stop_.load()) {
+        break;
+      }
+      FlushWindow(/*force=*/false);
+      FlushStage(/*force=*/false);
+    }
+  }
+
+  DB* db_;
+  std::shared_ptr<Statistics> stats_;
+  std::shared_ptr<MixGraphMonitorShared> shared_;
+  std::string window_csv_;
+  std::string stage_csv_;
+  uint64_t window_us_;
+  bool enabled_ = false;
+
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+  uint64_t start_us_ = 0;
+
+  Snapshot last_snapshot_;
+  int64_t last_window_id_ = -1;
+
+  bool stage_initialized_ = false;
+  int64_t last_stage_id_ = 0;
+  uint64_t stage_start_us_ = 0;
+  Snapshot stage_prev_snapshot_;
+
+  std::ofstream window_out_;
+  std::ofstream stage_out_;
+};
+
 enum OperationType : unsigned char {
   kRead = 0,
   kWrite,
@@ -3549,6 +3989,10 @@ struct SharedState {
   int perf_level;
   std::shared_ptr<RateLimiter> write_rate_limiter;
   std::shared_ptr<RateLimiter> read_rate_limiter;
+  uint64_t mixgraph_start_us = 0;
+  std::shared_ptr<MixGraphMonitorShared> mix_monitor_shared;
+  std::shared_ptr<MixGraphEventWriter> mix_event_writer;
+  std::unique_ptr<MixGraphCacheSampler> mix_cache_sampler;
 
   // Each thread goes through the following states:
   //    (1) initializing
@@ -5085,6 +5529,45 @@ class Benchmark {
           10 /* fairness */, RateLimiter::Mode::kReadsOnly));
     }
 
+    if (name == "mixgraph") {
+      shared.mixgraph_start_us = FLAGS_env->NowMicros();
+      if (FLAGS_mix_monitor_enable) {
+        shared.mix_monitor_shared = std::make_shared<MixGraphMonitorShared>();
+        if (!FLAGS_mix_monitor_events_csv.empty()) {
+          shared.mix_event_writer =
+              std::make_shared<MixGraphEventWriter>(FLAGS_mix_monitor_events_csv);
+        }
+        DB* db = db_.db;
+        if (db == nullptr && !multi_dbs_.empty()) {
+          db = multi_dbs_[0].db;
+        }
+        if (db != nullptr && dbstats != nullptr &&
+            (!FLAGS_mix_monitor_cache_csv.empty() ||
+             !FLAGS_mix_monitor_stage_csv.empty())) {
+          shared.mix_cache_sampler = std::make_unique<MixGraphCacheSampler>(
+              db, dbstats, shared.mix_monitor_shared, FLAGS_mix_monitor_cache_csv,
+              FLAGS_mix_monitor_stage_csv, FLAGS_mix_monitor_window_us);
+          if (shared.mix_cache_sampler->Enabled()) {
+            shared.mix_cache_sampler->Start(shared.mixgraph_start_us);
+          }
+        }
+        if (shared.mix_event_writer != nullptr &&
+            shared.mix_event_writer->Enabled()) {
+          shared.mix_event_writer->LogEvent(
+              shared.mixgraph_start_us, "workload_start", /*thread_id=*/-1,
+              /*stage=*/0, /*range_id=*/-1, /*key_id=*/-1, /*value_a=*/0,
+              /*value_b=*/0);
+        }
+      }
+
+      // Best-effort: align simfs monitor epoch with mixgraph start.
+      auto* simfs =
+          FLAGS_env->GetFileSystem()->CheckedCast<SimulatedHybridFileSystem>();
+      if (simfs != nullptr) {
+        simfs->SetMonitorStartTimeMicros(shared.mixgraph_start_us);
+      }
+    }
+
     std::unique_ptr<ReporterAgent> reporter_agent;
     if (FLAGS_report_interval_seconds > 0) {
       reporter_agent.reset(new ReporterAgent(FLAGS_env, FLAGS_report_file,
@@ -5132,6 +5615,16 @@ class Benchmark {
       shared.cv.Wait();
     }
     shared.mu.Unlock();
+
+    if (shared.mix_cache_sampler != nullptr) {
+      shared.mix_cache_sampler->Stop();
+    }
+    if (shared.mix_event_writer != nullptr && shared.mix_event_writer->Enabled()) {
+      shared.mix_event_writer->LogEvent(
+          FLAGS_env->NowMicros(), "workload_end", /*thread_id=*/-1,
+          /*stage=*/0, /*range_id=*/-1, /*key_id=*/-1, /*value_a=*/0,
+          /*value_b=*/0);
+    }
 
     // Stats for some threads can be excluded.
     Stats merge_stats;
@@ -7924,6 +8417,8 @@ class Benchmark {
     bool shift_inited_ = false;
     int64_t last_shift_stage_ = -1;
     uint64_t shift_base_usecs_ = 0;
+    bool shift_base_forced_ = false;
+    uint64_t forced_shift_base_usecs_ = 0;
     double hot_range_access_pct_ = 0.0;
     double hot_key_pct_ = 0.0;
     std::vector<double> hot_zipf_weights_;
@@ -8046,11 +8541,22 @@ class Benchmark {
       if (hot_count_ <= 0) {
         return;
       }
-      shift_base_usecs_ = FLAGS_env->NowMicros();
+      shift_base_usecs_ =
+          shift_base_forced_ ? forced_shift_base_usecs_ : FLAGS_env->NowMicros();
       hot_window_start_ = NextStartByMode(0);
       last_shift_stage_ = 0;
       ApplyShiftWindowLayout();
       shift_inited_ = true;
+    }
+
+    void SetShiftBaseUsecs(uint64_t base_usecs) {
+      forced_shift_base_usecs_ = base_usecs;
+      shift_base_forced_ = true;
+      // Best-effort: if shift state is not initialized yet, allow callers to
+      // align stage boundaries across threads by setting a common epoch.
+      if (!shift_inited_) {
+        shift_base_usecs_ = base_usecs;
+      }
     }
 
     void MaybeAdvanceShiftWindow(uint64_t now_usecs) {
@@ -8086,6 +8592,10 @@ class Benchmark {
                 hot_count_);
       }
     }
+
+    int64_t shift_stage() const { return last_shift_stage_; }
+    int64_t hot_window_start() const { return hot_window_start_; }
+    int64_t hot_count() const { return hot_count_; }
 
     static double Clamp01(double value) {
       if (value < 0.0) {
@@ -8468,6 +8978,92 @@ class Benchmark {
       }
       return keyrange_size_ * keyrange_id + key_offset;
     }
+
+    // Pick a key ID from a cold key range (outside the current hot window)
+    // when hotset+shift modeling is enabled. Falls back to DistGetKeyID if
+    // cold ranges are unavailable.
+    int64_t DistGetColdKeyID(int64_t ini_rand) {
+      if (keyrange_num_ <= 0 || keyrange_size_ <= 0 || keyrange_set_.empty()) {
+        return 0;
+      }
+
+      if (FLAGS_mix_shift_enable) {
+        MaybeAdvanceShiftWindow(FLAGS_env->NowMicros());
+      }
+
+      const uint64_t rand_a = MixBits(static_cast<uint64_t>(ini_rand) ^
+                                      0x3c79ac492ba7b653ULL);
+      const uint64_t rand_b = MixBits(rand_a + 0x1c69b3f74ac4ae35ULL);
+
+      int64_t picked = -1;
+      if (FLAGS_mix_hotset_enable && FLAGS_mix_burst_cold_ranges_only) {
+        const int64_t attempts = std::min<int64_t>(keyrange_num_, 16);
+        for (int64_t i = 0; i < attempts; ++i) {
+          const int64_t keyrange_id = static_cast<int64_t>(
+              (rand_a + static_cast<uint64_t>(i) * 0x9e3779b97f4a7c15ULL) %
+              static_cast<uint64_t>(keyrange_num_));
+          if (!keyrange_set_[static_cast<size_t>(keyrange_id)].is_hot) {
+            picked = keyrange_id;
+            break;
+          }
+        }
+
+        // Deterministic fallback: pick the first range right after the hot
+        // window (if any).
+        if (picked < 0 && hot_count_ > 0 && hot_count_ < keyrange_num_) {
+          const int64_t candidate =
+              PositiveMod(hot_window_start_ + hot_count_, keyrange_num_);
+          if (!keyrange_set_[static_cast<size_t>(candidate)].is_hot) {
+            picked = candidate;
+          }
+        }
+      }
+
+      if (picked < 0) {
+        picked = static_cast<int64_t>(rand_a %
+                                      static_cast<uint64_t>(keyrange_num_));
+      }
+
+      const int64_t key_offset = static_cast<int64_t>(
+          rand_b % static_cast<uint64_t>(keyrange_size_));
+      return keyrange_size_ * picked + key_offset;
+    }
+
+    // Pick a key ID from the current hot window (hot range + hot key window)
+    // when hotset modeling is enabled. Falls back to DistGetKeyID when
+    // hotset/shift is not available.
+    int64_t DistGetHotKeyID(int64_t ini_rand, double key_dist_a,
+                            double key_dist_b) {
+      if (!FLAGS_mix_hotset_enable || keyrange_num_ <= 0 ||
+          keyrange_size_ <= 0 || keyrange_set_.empty() || hot_count_ <= 0) {
+        return DistGetKeyID(ini_rand, key_dist_a, key_dist_b);
+      }
+
+      if (FLAGS_mix_shift_enable) {
+        MaybeAdvanceShiftWindow(FLAGS_env->NowMicros());
+      }
+
+      const uint64_t rand_a =
+          MixBits(static_cast<uint64_t>(ini_rand) ^ 0xa8b5d8e20e0f2d3dULL);
+      const uint64_t rand_b = MixBits(rand_a + 0x1f123bb5f5d1b2a3ULL);
+      const int64_t hot_rank = static_cast<int64_t>(
+          rand_a %
+          static_cast<uint64_t>(std::max<int64_t>(1, hot_count_)));
+      const int64_t keyrange_id =
+          PositiveMod(hot_window_start_ + hot_rank, keyrange_num_);
+      const auto& unit = keyrange_set_[static_cast<size_t>(keyrange_id)];
+      int64_t key_offset = 0;
+      if (unit.hot_key_count > 0) {
+        key_offset = unit.hot_key_start +
+                     static_cast<int64_t>(
+                         rand_b %
+                         static_cast<uint64_t>(unit.hot_key_count));
+      } else {
+        key_offset =
+            static_cast<int64_t>(rand_b % static_cast<uint64_t>(keyrange_size_));
+      }
+      return keyrange_size_ * keyrange_id + key_offset;
+    }
   };
 
   // The social graph workload mixed with Get, Put, Iterator queries.
@@ -8483,6 +9079,11 @@ class Benchmark {
     int64_t get_found = 0;
     int64_t seek = 0;
     int64_t seek_found = 0;
+    int64_t multigets = 0;
+    int64_t multiget_keys = 0;
+    int64_t multiget_found = 0;
+    int64_t burst_scans = 0;
+    int64_t burst_scan_entries = 0;
     int64_t bytes = 0;
     double total_scan_length = 0;
     double total_val_size = 0;
@@ -8494,8 +9095,11 @@ class Benchmark {
     bool use_prefix_modeling = false;
     bool use_random_modeling = false;
     GenerateTwoTermExpKeys gen_exp;
+    const uint64_t mixgraph_start_us = thread->shared->mixgraph_start_us;
+    auto monitor_shared = thread->shared->mix_monitor_shared;
+    auto event_writer = thread->shared->mix_event_writer;
     std::vector<double> ratio{FLAGS_mix_get_ratio, FLAGS_mix_put_ratio,
-                              FLAGS_mix_seek_ratio};
+                              FLAGS_mix_seek_ratio, FLAGS_mix_multiget_ratio};
     char value_buffer[default_value_max];
     QueryDecider query;
     RandomGenerator gen;
@@ -8509,6 +9113,20 @@ class Benchmark {
     PinnableSlice pinnable_val;
     query.Initiate(ratio);
 
+    const int32_t multiget_batch =
+        std::max<int32_t>(1, FLAGS_mix_multiget_batch);
+    std::vector<Slice> multiget_key_slices;
+    std::vector<std::unique_ptr<const char[]>> multiget_key_guards;
+    std::vector<PinnableSlice> multiget_vals(
+        static_cast<size_t>(multiget_batch));
+    std::vector<Status> multiget_statuses(static_cast<size_t>(multiget_batch));
+    multiget_key_slices.reserve(static_cast<size_t>(multiget_batch));
+    multiget_key_guards.reserve(static_cast<size_t>(multiget_batch));
+    for (int32_t i = 0; i < multiget_batch; ++i) {
+      multiget_key_guards.emplace_back(std::unique_ptr<const char[]>());
+      multiget_key_slices.emplace_back(AllocateKey(&multiget_key_guards.back()));
+    }
+
     // the limit of qps initiation
     if (FLAGS_sine_mix_rate) {
       thread->shared->read_rate_limiter.reset(
@@ -8518,6 +9136,9 @@ class Benchmark {
     }
 
     // Decide if user wants to use prefix based key generation
+    if (FLAGS_mix_shift_enable && mixgraph_start_us > 0) {
+      gen_exp.SetShiftBaseUsecs(mixgraph_start_us);
+    }
     if (FLAGS_keyrange_dist_a != 0.0 || FLAGS_keyrange_dist_b != 0.0 ||
         FLAGS_keyrange_dist_c != 0.0 || FLAGS_keyrange_dist_d != 0.0) {
       use_prefix_modeling = true;
@@ -8552,6 +9173,16 @@ class Benchmark {
       use_random_modeling = true;
     }
 
+    if (FLAGS_mix_shift_enable && event_writer != nullptr &&
+        event_writer->Enabled() && thread->tid == 0 && use_prefix_modeling) {
+      event_writer->LogEvent(FLAGS_env->NowMicros(), "shift_stage", thread->tid,
+                             /*stage=*/0,
+                             /*range_id=*/gen_exp.hot_window_start(),
+                             /*key_id=*/-1,
+                             /*value_a=*/static_cast<uint64_t>(gen_exp.hot_count()),
+                             /*value_b=*/0);
+    }
+
     Duration duration(FLAGS_duration, reads_);
     while (!duration.Done(1)) {
       DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(thread);
@@ -8578,6 +9209,32 @@ class Benchmark {
       }
       GenerateKeyFromInt(key_rand, FLAGS_num, &key);
       int query_type = query.GetType(rand_v);
+
+      const int64_t issued_ops = gets + puts + seek + multigets;
+      const bool do_burst =
+          FLAGS_mix_burst_enable && FLAGS_mix_burst_interval_ops > 0 &&
+          FLAGS_mix_burst_scan_nexts > 0 && issued_ops > 0 &&
+          (issued_ops % FLAGS_mix_burst_interval_ops == 0);
+
+      if (FLAGS_mix_shift_enable && monitor_shared != nullptr &&
+          use_prefix_modeling) {
+        const int64_t stage = gen_exp.shift_stage();
+        if (stage >= 0) {
+          int64_t prev = monitor_shared->shift_stage.load();
+          while (stage > prev &&
+                 !monitor_shared->shift_stage.compare_exchange_weak(prev, stage)) {
+          }
+          if (stage > prev && event_writer != nullptr &&
+              event_writer->Enabled()) {
+            event_writer->LogEvent(FLAGS_env->NowMicros(), "shift_stage",
+                                   thread->tid, stage,
+                                   /*range_id=*/gen_exp.hot_window_start(),
+                                   /*key_id=*/-1,
+                                   /*value_a=*/static_cast<uint64_t>(gen_exp.hot_count()),
+                                   /*value_b=*/0);
+          }
+        }
+      }
 
       // change the qps
       uint64_t now = FLAGS_env->NowMicros();
@@ -8609,6 +9266,126 @@ class Benchmark {
         }
       }
       // Start the query
+      if (do_burst) {
+        int64_t burst_key_rand = key_rand;
+        if (use_prefix_modeling && FLAGS_mix_hotset_enable &&
+            FLAGS_mix_burst_cold_ranges_only) {
+          burst_key_rand = gen_exp.DistGetColdKeyID(ini_rand);
+        } else {
+          if (FLAGS_num > 0) {
+            burst_key_rand = (key_rand + (FLAGS_num / 2)) % FLAGS_num;
+          }
+        }
+        GenerateKeyFromInt(burst_key_rand, FLAGS_num, &key);
+        int32_t scanned_this_burst = 0;
+
+        if (db_with_cfh->db != nullptr) {
+          std::unique_ptr<Iterator> burst_iter(
+              db_with_cfh->db->NewIterator(read_options_));
+          if (burst_iter != nullptr) {
+            burst_iter->Seek(key);
+            seek++;
+            burst_scans++;
+            if (burst_iter->Valid() && burst_iter->key().compare(key) == 0) {
+              seek_found++;
+            }
+            for (int32_t j = 0; j < FLAGS_mix_burst_scan_nexts &&
+                                 burst_iter->Valid();
+                 ++j) {
+              Slice value = burst_iter->value();
+              memcpy(value_buffer, value.data(),
+                     std::min(value.size(), sizeof(value_buffer)));
+              bytes += burst_iter->key().size() + burst_iter->value().size();
+              burst_scan_entries++;
+              scanned_this_burst++;
+              total_scan_length++;
+              burst_iter->Next();
+              assert(burst_iter->status().ok());
+            }
+          }
+        }
+
+        if (monitor_shared != nullptr) {
+          monitor_shared->burst_scans.fetch_add(1);
+          monitor_shared->burst_entries.fetch_add(
+              static_cast<uint64_t>(scanned_this_burst));
+        }
+        if (event_writer != nullptr && event_writer->Enabled()) {
+          int64_t range_id = -1;
+          if (use_prefix_modeling && FLAGS_keyrange_num > 0) {
+            range_id = burst_key_rand /
+                       std::max<int64_t>(1, (FLAGS_num / FLAGS_keyrange_num));
+          }
+          event_writer->LogEvent(
+              FLAGS_env->NowMicros(), "burst_scan", thread->tid,
+              monitor_shared ? monitor_shared->shift_stage.load() : 0, range_id,
+              burst_key_rand,
+              /*value_a=*/static_cast<uint64_t>(FLAGS_mix_burst_scan_nexts),
+              /*value_b=*/static_cast<uint64_t>(scanned_this_burst));
+        }
+
+        if (FLAGS_mix_burst_log) {
+          fprintf(stderr,
+                  "mix_burst tid=%d op=%" PRId64 " key=%" PRId64 " nexts=%d\n",
+                  thread->tid, issued_ops, burst_key_rand,
+                  FLAGS_mix_burst_scan_nexts);
+        }
+
+        const bool do_probe =
+            FLAGS_mix_probe_enable && FLAGS_mix_probe_interval_ops > 0 &&
+            FLAGS_mix_probe_reads > 0 && issued_ops > 0 &&
+            (issued_ops % FLAGS_mix_probe_interval_ops == 0);
+        if (do_probe && db_with_cfh->db != nullptr && monitor_shared != nullptr &&
+            use_prefix_modeling && FLAGS_mix_hotset_enable) {
+          std::unique_ptr<const char[]> probe_key_guard;
+          Slice probe_key = AllocateKey(&probe_key_guard);
+          ReadOptions probe_options = read_options_;
+          probe_options.fill_cache = false;
+          probe_options.read_tier = ReadTier::kBlockCacheTier;
+          std::string probe_value;
+          for (int32_t i = 0; i < FLAGS_mix_probe_reads; ++i) {
+            Status ps;
+            bool counted = false;
+            constexpr int kMaxNotFoundRetries = 8;
+            for (int attempt = 0; attempt < kMaxNotFoundRetries; ++attempt) {
+              const int64_t probe_rand =
+                  gen_exp.DistGetHotKeyID(ini_rand + i + attempt * 101,
+                                          FLAGS_key_dist_a, FLAGS_key_dist_b);
+              GenerateKeyFromInt(probe_rand, FLAGS_num, &probe_key);
+              if (FLAGS_num_column_families > 1) {
+                ps = db_with_cfh->db->Get(probe_options,
+                                          db_with_cfh->GetCfh(probe_rand),
+                                          probe_key, &probe_value);
+              } else {
+                ps = db_with_cfh->db->Get(
+                    probe_options, db_with_cfh->db->DefaultColumnFamily(),
+                    probe_key, &probe_value);
+              }
+              if (ps.IsNotFound()) {
+                continue;
+              }
+              monitor_shared->probe_ops.fetch_add(1);
+              counted = true;
+              if (ps.ok()) {
+                monitor_shared->probe_hit.fetch_add(1);
+              } else if (ps.IsIncomplete()) {
+                monitor_shared->probe_incomplete.fetch_add(1);
+              } else {
+                monitor_shared->probe_error.fetch_add(1);
+              }
+              break;
+            }
+            if (!counted) {
+              monitor_shared->probe_ops.fetch_add(1);
+              monitor_shared->probe_notfound.fetch_add(1);
+            }
+          }
+        }
+
+        thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, 1, kSeek);
+        continue;
+      }
+
       if (query_type == 0) {
         // the Get query
         gets++;
@@ -8664,7 +9441,11 @@ class Benchmark {
         // Seek query
         if (db_with_cfh->db != nullptr) {
           Iterator* single_iter = nullptr;
-          single_iter = db_with_cfh->db->NewIterator(read_options_);
+          ReadOptions seek_read_options = read_options_;
+          if (FLAGS_mix_seek_readahead_size > 0) {
+            seek_read_options.readahead_size = FLAGS_mix_seek_readahead_size;
+          }
+          single_iter = db_with_cfh->db->NewIterator(seek_read_options);
           if (single_iter != nullptr) {
             single_iter->Seek(key);
             seek++;
@@ -8693,19 +9474,145 @@ class Benchmark {
           delete single_iter;
         }
         thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, 1, kSeek);
+      } else if (query_type == 3) {
+        // MultiGet query
+        multigets++;
+        if (db_with_cfh->db != nullptr) {
+          for (int32_t i = 0; i < multiget_batch; ++i) {
+            int64_t k = ini_rand + i * 101;
+            int64_t kg;
+            if (use_prefix_modeling) {
+              if (use_random_modeling) {
+                kg = gen_exp.DistGetKeyID(k, 0.0, 0.0);
+              } else {
+                kg = gen_exp.DistGetKeyID(k, FLAGS_key_dist_a, FLAGS_key_dist_b);
+              }
+            } else if (use_random_modeling) {
+              kg = k;
+            } else {
+              int64_t rv = k % FLAGS_num;
+              double uu = static_cast<double>(rv) / FLAGS_num;
+              int64_t seed =
+                  PowerCdfInversion(uu, FLAGS_key_dist_a, FLAGS_key_dist_b);
+              Random64 rr(seed);
+              kg = static_cast<int64_t>(rr.Next()) % FLAGS_num;
+            }
+            GenerateKeyFromInt(kg, FLAGS_num,
+                               &multiget_key_slices[static_cast<size_t>(i)]);
+          }
+
+          if (FLAGS_num_column_families > 1) {
+            fprintf(stderr,
+                    "mix_multiget_ratio requires --num_column_families=1 for "
+                    "mixgraph (MultiGet CF sharding not supported)\n");
+            ErrorExit();
+          } else {
+            db_with_cfh->db->MultiGet(
+                read_options_, db_with_cfh->db->DefaultColumnFamily(),
+                multiget_key_slices.size(), multiget_key_slices.data(),
+                multiget_vals.data(), multiget_statuses.data());
+
+            multiget_keys += multiget_batch;
+            for (int32_t i = 0; i < multiget_batch; ++i) {
+              const auto idx = static_cast<size_t>(i);
+              if (multiget_statuses[idx].ok()) {
+                multiget_found++;
+                bytes += multiget_key_slices[idx].size() +
+                         multiget_vals[idx].size();
+              } else if (!multiget_statuses[idx].IsNotFound()) {
+                fprintf(stderr, "MultiGet returned an error: %s\n",
+                        multiget_statuses[idx].ToString().c_str());
+                abort();
+              }
+              multiget_statuses[idx] = Status::OK();
+              multiget_vals[idx].Reset();
+            }
+          }
+        }
+
+        if (thread->shared->read_rate_limiter &&
+            (gets + seek + multigets) % 100 == 0) {
+          thread->shared->read_rate_limiter->Request(100, Env::IO_HIGH,
+                                                     nullptr /*stats*/);
+        }
+        thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, multiget_batch,
+                                  kRead);
+      }
+
+      const bool do_probe =
+          FLAGS_mix_probe_enable && FLAGS_mix_probe_interval_ops > 0 &&
+          FLAGS_mix_probe_reads > 0 && issued_ops > 0 &&
+          (issued_ops % FLAGS_mix_probe_interval_ops == 0);
+      if (do_probe && db_with_cfh->db != nullptr && monitor_shared != nullptr &&
+          use_prefix_modeling && FLAGS_mix_hotset_enable) {
+        std::unique_ptr<const char[]> probe_key_guard;
+        Slice probe_key = AllocateKey(&probe_key_guard);
+        ReadOptions probe_options = read_options_;
+        probe_options.fill_cache = false;
+        probe_options.read_tier = ReadTier::kBlockCacheTier;
+        std::string probe_value;
+        for (int32_t i = 0; i < FLAGS_mix_probe_reads; ++i) {
+          Status ps;
+          bool counted = false;
+          constexpr int kMaxNotFoundRetries = 8;
+          for (int attempt = 0; attempt < kMaxNotFoundRetries; ++attempt) {
+            const int64_t probe_rand =
+                gen_exp.DistGetHotKeyID(ini_rand + i + attempt * 101,
+                                        FLAGS_key_dist_a, FLAGS_key_dist_b);
+            GenerateKeyFromInt(probe_rand, FLAGS_num, &probe_key);
+            if (FLAGS_num_column_families > 1) {
+              ps = db_with_cfh->db->Get(probe_options,
+                                        db_with_cfh->GetCfh(probe_rand),
+                                        probe_key, &probe_value);
+            } else {
+              ps = db_with_cfh->db->Get(
+                  probe_options, db_with_cfh->db->DefaultColumnFamily(),
+                  probe_key, &probe_value);
+            }
+            if (ps.IsNotFound()) {
+              continue;
+            }
+            monitor_shared->probe_ops.fetch_add(1);
+            counted = true;
+            if (ps.ok()) {
+              monitor_shared->probe_hit.fetch_add(1);
+            } else if (ps.IsIncomplete()) {
+              monitor_shared->probe_incomplete.fetch_add(1);
+            } else {
+              monitor_shared->probe_error.fetch_add(1);
+            }
+            break;
+          }
+          if (!counted) {
+            monitor_shared->probe_ops.fetch_add(1);
+            monitor_shared->probe_notfound.fetch_add(1);
+          }
+        }
       }
     }
     char msg[256];
     snprintf(msg, sizeof(msg),
              "( Gets:%" PRIu64 " Puts:%" PRIu64 " Seek:%" PRIu64
-             ", reads %" PRIu64 " in %" PRIu64
-             " found, "
+             " MultiGet:%" PRIu64 " Burst:%" PRIu64
+             ", read_keys %" PRIu64 " in %" PRIu64 " found, "
              "avg size: %.1f value, %.1f scan)\n",
-             gets, puts, seek, get_found + seek_found, gets + seek,
+             gets, puts, seek, multigets, burst_scans,
+             get_found + seek_found + multiget_found,
+             gets + seek + multiget_keys,
              total_val_size / puts, total_scan_length / seek);
 
     thread->stats.AddBytes(bytes);
     thread->stats.AddMessage(msg);
+
+    if (burst_scans > 0) {
+      char burst_msg[200];
+      snprintf(burst_msg, sizeof(burst_msg),
+               "( mixgraph burst: scans=%" PRIu64 " entries=%" PRIu64
+               " interval_ops=%" PRId64 " scan_nexts=%d cold_ranges_only=%d )\n",
+               burst_scans, burst_scan_entries, FLAGS_mix_burst_interval_ops,
+               FLAGS_mix_burst_scan_nexts, FLAGS_mix_burst_cold_ranges_only);
+      thread->stats.AddMessage(burst_msg);
+    }
   }
 
   void IteratorCreation(ThreadState* thread) {
