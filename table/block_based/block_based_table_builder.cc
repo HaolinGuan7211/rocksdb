@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdio>
+#include <limits>
 #include <list>
 #include <map>
 #include <memory>
@@ -45,6 +46,7 @@
 #include "table/block_based/filter_block.h"
 #include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/full_filter_block.h"
+#include "table/block_based/kvsep_bptree_format.h"
 #include "table/block_based/partitioned_filter_block.h"
 #include "table/block_based/user_defined_index_wrapper.h"
 #include "table/format.h"
@@ -810,6 +812,13 @@ struct BlockBasedTableBuilder::Rep {
   RelaxedAtomic<uint64_t> offset{0};
   size_t alignment;
   BlockBuilder data_block;
+  const bool experimental_kvsep_bptree_enable;
+  const uint64_t kvsep_leaf_block_bytes;
+  const uint64_t kvsep_value_block_bytes;
+  std::string kvsep_value_block_buf;
+  std::vector<KVSepBptreeValueMapEntry> kvsep_value_map_entries;
+  uint64_t kvsep_value_blocks_written = 0;
+  uint64_t kvsep_value_bytes_written = 0;
   // Buffers uncompressed data blocks to replay later. Needed when
   // compression dictionary is enabled so we can finalize the dictionary before
   // compressing any data blocks.
@@ -1038,6 +1047,11 @@ struct BlockBasedTableBuilder::Rep {
                        : table_options.data_block_index_type,
                    table_options.data_block_hash_table_util_ratio, ts_sz,
                    persist_user_defined_timestamps),
+        experimental_kvsep_bptree_enable(
+            table_opt.experimental_kvsep_bptree_enable),
+        kvsep_leaf_block_bytes(table_opt.experimental_kvsep_bptree_leaf_block_bytes),
+        kvsep_value_block_bytes(
+            table_opt.experimental_kvsep_bptree_value_block_bytes),
         range_del_block(
             1 /* block_restart_interval */, true /* use_delta_encoding */,
             false /* use_value_delta_encoding */,
@@ -1047,7 +1061,8 @@ struct BlockBasedTableBuilder::Rep {
         internal_prefix_transform(prefix_extractor.get()),
         sample_for_compression(tbo.moptions.sample_for_compression),
         compression_parallel_threads(
-            ((table_opt.partition_filters &&
+            (table_opt.experimental_kvsep_bptree_enable ||
+             (table_opt.partition_filters &&
               !table_opt.decouple_partitioned_filters) ||
              table_options.user_defined_index_factory)
                 ? uint32_t{1}
@@ -1088,6 +1103,17 @@ struct BlockBasedTableBuilder::Rep {
 
     props.compression_options =
         CompressionOptionsToString(tbo.compression_opts);
+    if (experimental_kvsep_bptree_enable) {
+      props.user_collected_properties[kKVSepBptreeTablePropertyKey] = "1";
+      props.user_collected_properties
+          ["rocksdb.experimental.kvsep_bptree.leaf_block_bytes"] =
+              std::to_string(kvsep_leaf_block_bytes);
+      props.user_collected_properties
+          ["rocksdb.experimental.kvsep_bptree.value_block_bytes"] =
+              std::to_string(kvsep_value_block_bytes);
+      props.user_collected_properties["rocksdb.experimental.kvsep_bptree.note"] =
+          "keys in data blocks, values in kKVSepValue blocks";
+    }
 
     auto* mgr = tbo.moptions.compression_manager.get();
     if (mgr == nullptr) {
@@ -1121,6 +1147,12 @@ struct BlockBasedTableBuilder::Rep {
       }
       max_dict_sample_bytes = basic_compressor->GetMaxSampleSizeIfWantDict(
           CacheEntryRole::kDataBlock);
+      if (experimental_kvsep_bptree_enable) {
+        // KV-separation currently does not support buffering/replay of data
+        // blocks for dictionary training because values are written into
+        // separate blocks alongside the data blocks.
+        max_dict_sample_bytes = 0;
+      }
       if (max_dict_sample_bytes > 0) {
         state = State::kBuffered;
         if (tbo.target_file_size == 0) {
@@ -1435,6 +1467,13 @@ BlockBasedTableBuilder::BlockBasedTableBuilder(
     const BlockBasedTableOptions& table_options, const TableBuilderOptions& tbo,
     WritableFileWriter* file) {
   BlockBasedTableOptions sanitized_table_options(table_options);
+  if (sanitized_table_options.experimental_kvsep_bptree_enable) {
+    // Keep the existing flush policy behavior roughly aligned with the leaf
+    // block target size, even though the KV-sep path also has its own flush
+    // constraints (values).
+    sanitized_table_options.block_size =
+        sanitized_table_options.experimental_kvsep_bptree_leaf_block_bytes;
+  }
   auto ucmp = tbo.internal_comparator.user_comparator();
   assert(ucmp);
   (void)ucmp;  // avoids unused variable error.
@@ -1482,10 +1521,46 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
     }
 #endif  // !NDEBUG
 
-    auto should_flush = r->flush_block_policy->Update(ikey, value);
-    if (should_flush) {
-      assert(!r->data_block.empty());
-      Flush(/*first_key_in_next_block=*/&ikey);
+    Slice value_for_data_block = value;
+    std::string kvsep_ptr;
+    if (r->experimental_kvsep_bptree_enable) {
+      // Flush condition must account for (1) key+pointer leaf block size and
+      // (2) value block capacity.
+      for (;;) {
+        const size_t value_off = r->kvsep_value_block_buf.size();
+        if (UNLIKELY(value_off > std::numeric_limits<uint32_t>::max())) {
+          r->SetStatus(Status::Corruption("kvsep value block offset overflow"));
+          return;
+        }
+        if (UNLIKELY(value.size() > std::numeric_limits<uint32_t>::max())) {
+          r->SetStatus(Status::InvalidArgument("kvsep value too large"));
+          return;
+        }
+        kvsep_ptr.clear();
+        PutVarint32(&kvsep_ptr, static_cast<uint32_t>(value_off));
+        PutVarint32(&kvsep_ptr, static_cast<uint32_t>(value.size()));
+
+        const bool need_flush =
+            !r->data_block.empty() &&
+            (r->data_block.EstimateSizeAfterKV(ikey, Slice(kvsep_ptr)) >
+                 r->kvsep_leaf_block_bytes ||
+             (value_off + value.size()) > r->kvsep_value_block_bytes);
+        if (need_flush) {
+          Flush(/*first_key_in_next_block=*/&ikey);
+          continue;
+        }
+        if (!value.empty()) {
+          r->kvsep_value_block_buf.append(value.data(), value.size());
+        }
+        value_for_data_block = Slice(kvsep_ptr);
+        break;
+      }
+    } else {
+      auto should_flush = r->flush_block_policy->Update(ikey, value);
+      if (should_flush) {
+        assert(!r->data_block.empty());
+        Flush(/*first_key_in_next_block=*/&ikey);
+      }
     }
 
     // Note: PartitionedFilterBlockBuilder with
@@ -1502,7 +1577,7 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
       }
     }
 
-    r->data_block.AddWithLastKey(ikey, value, r->last_ikey);
+    r->data_block.AddWithLastKey(ikey, value_for_data_block, r->last_ikey);
     r->last_ikey.assign(ikey.data(), ikey.size());
     assert(!r->last_ikey.empty());
     if (r->state == Rep::State::kBuffered) {
@@ -1565,6 +1640,42 @@ void BlockBasedTableBuilder::Flush(const Slice* first_key_in_next_block) {
   if (r->data_block.empty()) {
     return;
   }
+
+  if (UNLIKELY(r->experimental_kvsep_bptree_enable &&
+               rep_->state == Rep::State::kBuffered)) {
+    r->SetStatus(Status::NotSupported(
+        "kvsep_bptree does not support dictionary-buffered table building"));
+    return;
+  }
+
+  BlockHandle kvsep_value_handle = BlockHandle::NullBlockHandle();
+  if (r->experimental_kvsep_bptree_enable && !r->kvsep_value_block_buf.empty()) {
+    // Value-only blocks are written separately from data blocks so that data
+    // blocks contain only keys + (value_offset,value_length) pointers.
+    Slice uncompressed_value_block(r->kvsep_value_block_buf);
+    CompressionType value_comp_type = kNoCompression;
+    Status compress_status = CompressAndVerifyBlock(
+        uncompressed_value_block, /*is_data_block=*/true,
+        r->data_block_working_area, &r->single_threaded_compressed_output,
+        &value_comp_type);
+    r->SetStatus(compress_status);
+    if (UNLIKELY(!ok())) {
+      return;
+    }
+    WriteMaybeCompressedBlock(
+        value_comp_type == kNoCompression
+            ? uncompressed_value_block
+            : Slice(r->single_threaded_compressed_output),
+        value_comp_type, &kvsep_value_handle, BlockType::kKVSepValue,
+        &uncompressed_value_block);
+    r->single_threaded_compressed_output.Reset();
+    if (UNLIKELY(!ok())) {
+      return;
+    }
+    r->kvsep_value_blocks_written++;
+    r->kvsep_value_bytes_written += uncompressed_value_block.size();
+  }
+
   Slice uncompressed_block_data = r->data_block.Finish();
 
   // NOTE: compression sampling is done here in the same thread as building
@@ -1663,6 +1774,14 @@ void BlockBasedTableBuilder::Flush(const Slice* first_key_in_next_block) {
     } else {
       EmitBlock(r->data_block.MutableBuffer(), r->last_ikey,
                 first_key_in_next_block);
+    }
+    if (r->experimental_kvsep_bptree_enable) {
+      KVSepBptreeValueMapEntry e;
+      e.data_block_offset = r->pending_handle.offset();
+      e.value_block_offset = kvsep_value_handle.offset();
+      e.value_block_size = kvsep_value_handle.size();
+      r->kvsep_value_map_entries.push_back(e);
+      r->kvsep_value_block_buf.clear();
     }
     r->data_block.Reset();
   }
@@ -2760,6 +2879,17 @@ Status BlockBasedTableBuilder::Finish() {
   }
 
   r->props.tail_start_offset = r->offset.LoadRelaxed();
+  if (r->experimental_kvsep_bptree_enable) {
+    r->props.user_collected_properties
+        ["rocksdb.experimental.kvsep_bptree.value_blocks_written"] =
+            std::to_string(r->kvsep_value_blocks_written);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.kvsep_bptree.value_bytes_written"] =
+            std::to_string(r->kvsep_value_bytes_written);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.kvsep_bptree.value_map_entries"] =
+            std::to_string(r->kvsep_value_map_entries.size());
+  }
 
   uint64_t last_estimated_tail_size = EstimatedTailSize();
 
@@ -2777,6 +2907,18 @@ Status BlockBasedTableBuilder::Finish() {
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
+  if (r->experimental_kvsep_bptree_enable) {
+    std::string map_block;
+    EncodeKVSepBptreeValueMap(r->kvsep_value_map_entries,
+                              static_cast<uint32_t>(r->kvsep_value_block_bytes),
+                              &map_block);
+    BlockHandle map_handle;
+    WriteMaybeCompressedBlock(Slice(map_block), kNoCompression, &map_handle,
+                              BlockType::kProperties);
+    if (LIKELY(ok())) {
+      meta_index_builder.Add(kKVSepBptreeValueMapBlockName, map_handle);
+    }
+  }
   WritePropertiesBlock(&meta_index_builder);
   if (LIKELY(ok())) {
     // flush the meta index block

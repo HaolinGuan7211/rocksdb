@@ -135,9 +135,66 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
       seek_stat_state_ = kDataBlockReadSinceLastSeek;
     }
 
-    return block_iter_.value();
+    if (LIKELY(!table_->get_rep()->experimental_kvsep_bptree_enabled)) {
+      return block_iter_.value();
+    }
+
+    // KV-separation: block_iter_.value() encodes (value_off, value_len) into
+    // a corresponding value-only block for the current data block.
+    const BlockHandle data_block_handle = index_iter_->value().handle;
+    BlockHandle value_block_handle;
+    if (UNLIKELY(!table_->KVSepBptreeLookupValueHandle(data_block_handle,
+                                                      &value_block_handle))) {
+      kvsep_status_ =
+          Status::Corruption("kvsep missing value block mapping for data block");
+      return Slice();
+    }
+
+    uint32_t value_off = 0;
+    uint32_t value_len = 0;
+    Status decode_status = BlockBasedTable::KVSepBptreeDecodePointer(
+        block_iter_.value(), &value_off, &value_len);
+    if (UNLIKELY(!decode_status.ok())) {
+      kvsep_status_ = decode_status;
+      return Slice();
+    }
+    if (value_len == 0) {
+      return Slice();
+    }
+
+    const bool need_reload =
+        kvsep_value_block_.GetValue() == nullptr ||
+        kvsep_value_block_handle_.offset() != value_block_handle.offset() ||
+        kvsep_value_block_handle_.size() != value_block_handle.size();
+    if (need_reload) {
+      kvsep_value_block_.Reset();
+      kvsep_value_block_handle_ = value_block_handle;
+      kvsep_status_ = table_->KVSepBptreeGetValueBlock(
+          read_options_, value_block_handle, &kvsep_value_block_,
+          &lookup_context_);
+      if (UNLIKELY(!kvsep_status_.ok())) {
+        return Slice();
+      }
+    }
+    if (UNLIKELY(kvsep_value_block_.GetValue() == nullptr)) {
+      kvsep_status_ = Status::Corruption("kvsep missing value block contents");
+      return Slice();
+    }
+
+    const Slice value_block_contents =
+        kvsep_value_block_.GetValue()->ContentSlice();
+    if (UNLIKELY(static_cast<size_t>(value_off) +
+                     static_cast<size_t>(value_len) >
+                 value_block_contents.size())) {
+      kvsep_status_ = Status::Corruption("kvsep pointer out of range");
+      return Slice();
+    }
+    return Slice(value_block_contents.data() + value_off, value_len);
   }
   Status status() const override {
+    if (UNLIKELY(!kvsep_status_.ok())) {
+      return kvsep_status_;
+    }
     if (!multi_scan_status_.ok()) {
       return multi_scan_status_;
     }
@@ -190,6 +247,12 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
     assert(!is_at_first_key_from_index_);
     assert(Valid());
 
+    if (UNLIKELY(table_->get_rep()->experimental_kvsep_bptree_enabled)) {
+      // Value slices come from separate value-only blocks and are not pinned by
+      // the data block iterator's cleanups.
+      return false;
+    }
+
     // BlockIter::IsValuePinned() is always true. No need to check
     return pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled() &&
            block_iter_points_to_real_block_;
@@ -203,6 +266,9 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
       block_iter_.Invalidate(Status::OK());
       block_iter_points_to_real_block_ = false;
     }
+    kvsep_value_block_.Reset();
+    kvsep_value_block_handle_ = BlockHandle::NullBlockHandle();
+    kvsep_status_ = Status::OK();
     block_upper_bound_check_ = BlockUpperBound::kUnknown;
   }
 
@@ -327,9 +393,12 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   UserComparatorWrapper user_comparator_;
   PinnedIteratorsManager* pinned_iters_mgr_;
   DataBlockIter block_iter_;
+  mutable Status kvsep_status_;
+  mutable CachableEntry<Block_kKVSepValue> kvsep_value_block_;
+  mutable BlockHandle kvsep_value_block_handle_;
   const SliceTransform* prefix_extractor_;
   uint64_t prev_block_offset_ = std::numeric_limits<uint64_t>::max();
-  BlockCacheLookupContext lookup_context_;
+  mutable BlockCacheLookupContext lookup_context_;
 
   BlockPrefetcher block_prefetcher_;
 

@@ -473,6 +473,79 @@ void BlockBasedTable::UpdateCacheInsertionMetrics(
   }
 }
 
+Status BlockBasedTable::KVSepBptreeDecodePointer(const Slice& ptr,
+                                                uint32_t* value_off,
+                                                uint32_t* value_len) {
+  if (value_off == nullptr || value_len == nullptr) {
+    return Status::InvalidArgument("kvsep pointer decode: null output");
+  }
+  const char* p = ptr.data();
+  const char* limit = ptr.data() + ptr.size();
+  if (p == limit) {
+    // Empty value (common for deletions).
+    *value_off = 0;
+    *value_len = 0;
+    return Status::OK();
+  }
+  p = GetVarint32Ptr(p, limit, value_off);
+  if (p == nullptr) {
+    return Status::Corruption("kvsep pointer decode: bad value_off");
+  }
+  p = GetVarint32Ptr(p, limit, value_len);
+  if (p == nullptr) {
+    return Status::Corruption("kvsep pointer decode: bad value_len");
+  }
+  if (p != limit) {
+    return Status::Corruption("kvsep pointer decode: trailing bytes");
+  }
+  return Status::OK();
+}
+
+bool BlockBasedTable::KVSepBptreeLookupValueHandle(
+    const BlockHandle& data_block_handle, BlockHandle* value_block_handle) const {
+  if (value_block_handle == nullptr) {
+    return false;
+  }
+  if (!rep_->experimental_kvsep_bptree_enabled) {
+    return false;
+  }
+  const uint64_t data_off = data_block_handle.offset();
+  const auto& entries = rep_->kvsep_value_map_entries;
+  auto it = std::lower_bound(
+      entries.begin(), entries.end(), data_off,
+      [](const KVSepBptreeValueMapEntry& e, uint64_t target_off) {
+        return e.data_block_offset < target_off;
+      });
+  if (it == entries.end() || it->data_block_offset != data_off) {
+    return false;
+  }
+  value_block_handle->set_offset(it->value_block_offset);
+  value_block_handle->set_size(it->value_block_size);
+  return true;
+}
+
+Status BlockBasedTable::KVSepBptreeGetValueBlock(
+    const ReadOptions& ro, const BlockHandle& value_block_handle,
+    CachableEntry<Block_kKVSepValue>* value_block,
+    BlockCacheLookupContext* lookup_context) const {
+  if (value_block == nullptr) {
+    return Status::InvalidArgument("kvsep value block: null output");
+  }
+  value_block->Reset();
+  if (value_block_handle.IsNull()) {
+    return Status::OK();
+  }
+
+  Status s;
+  s = RetrieveBlock<Block_kKVSepValue>(
+      /*prefetch_buffer=*/nullptr, ro, value_block_handle,
+      rep_->decompressor.get(),
+      value_block, /*get_context=*/nullptr, lookup_context,
+      /*for_compaction=*/false, /*use_cache=*/true, /*async_read=*/false,
+      /*use_block_cache_for_lookup=*/true);
+  return s;
+}
+
 namespace {
 // Return True if table_properties has `user_prop_name` has a `true` value
 // or it doesn't contain this property (for backward compatible).
@@ -878,6 +951,39 @@ Status BlockBasedTable::Open(
       rep->decompressor.get(), block_protection_bytes_per_key,
       rep->internal_comparator.user_comparator(), rep->index_value_is_full,
       rep->index_has_first_key);
+
+  // Experimental: KV-separation (keys in data blocks, values in dedicated
+  // value-only blocks). Load the mapping if present.
+  {
+    BlockHandle kvsep_value_map_handle;
+    Status kvsep_meta_status =
+        FindOptionalMetaBlock(metaindex_iter.get(),
+                              kKVSepBptreeValueMapBlockName,
+                              &kvsep_value_map_handle);
+    if (!kvsep_meta_status.ok()) {
+      return kvsep_meta_status;
+    }
+    if (!kvsep_value_map_handle.IsNull()) {
+      std::unique_ptr<Block_kUserDefinedIndex> kvsep_map_block;
+      Status kvsep_read_status = ReadAndParseBlockFromFile<Block_kUserDefinedIndex>(
+          rep->file.get(), prefetch_buffer.get(), footer, ro,
+          kvsep_value_map_handle, &kvsep_map_block, ioptions, rep->create_context,
+          /*maybe_compressed=*/true, rep->decompressor.get(),
+          rep->persistent_cache_options,
+          /*memory_allocator=*/nullptr, /*for_compaction=*/false,
+          /*async_read=*/false);
+      if (!kvsep_read_status.ok()) {
+        return kvsep_read_status;
+      }
+      Status kvsep_decode_status = DecodeKVSepBptreeValueMap(
+          kvsep_map_block->ContentSlice(), &rep->kvsep_value_map_entries,
+          &rep->kvsep_value_block_bytes_hint);
+      if (!kvsep_decode_status.ok()) {
+        return kvsep_decode_status;
+      }
+      rep->experimental_kvsep_bptree_enabled = true;
+    }
+  }
 
   // Check expected unique id if provided
   if (expected_unique_id != kNullUniqueId64x2) {
@@ -2597,6 +2703,13 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
         done = true;
       } else {
         // Call the *saver function on each entry/block until it returns false
+        BlockHandle kvsep_value_block_handle;
+        const bool kvsep_enabled = rep_->experimental_kvsep_bptree_enabled;
+        const bool kvsep_have_value_handle =
+            kvsep_enabled &&
+            KVSepBptreeLookupValueHandle(v.handle, &kvsep_value_block_handle);
+        CachableEntry<Block_kKVSepValue> kvsep_value_block;
+        bool kvsep_value_block_loaded = false;
         for (; biter.Valid(); biter.Next()) {
           ParsedInternalKey parsed_key;
           Status pik_status = ParseInternalKey(
@@ -2606,10 +2719,54 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
             break;
           }
 
+          Slice value_to_save = biter.value();
+          if (kvsep_enabled) {
+            if (UNLIKELY(!kvsep_have_value_handle)) {
+              s = Status::Corruption("kvsep enabled but missing value map entry");
+              break;
+            }
+            uint32_t value_off = 0;
+            uint32_t value_len = 0;
+            Status decode_status =
+                KVSepBptreeDecodePointer(value_to_save, &value_off, &value_len);
+            if (UNLIKELY(!decode_status.ok())) {
+              s = decode_status;
+              break;
+            }
+            if (value_len == 0) {
+              value_to_save = Slice();
+            } else {
+              if (!kvsep_value_block_loaded) {
+                Status vb_status = KVSepBptreeGetValueBlock(
+                    read_options, kvsep_value_block_handle, &kvsep_value_block,
+                    &lookup_data_block_context);
+                if (UNLIKELY(!vb_status.ok())) {
+                  s = vb_status;
+                  break;
+                }
+                kvsep_value_block_loaded = true;
+              }
+              if (UNLIKELY(kvsep_value_block.GetValue() == nullptr)) {
+                s = Status::Corruption("kvsep missing value block");
+                break;
+              }
+              const Slice value_block_contents =
+                  kvsep_value_block.GetValue()->ContentSlice();
+              if (UNLIKELY(static_cast<size_t>(value_off) +
+                               static_cast<size_t>(value_len) >
+                           value_block_contents.size())) {
+                s = Status::Corruption("kvsep pointer out of range");
+                break;
+              }
+              value_to_save = Slice(value_block_contents.data() + value_off,
+                                    value_len);
+            }
+          }
+
           Status read_status;
           bool ret = get_context->SaveValue(
-              parsed_key, biter.value(), &matched, &read_status,
-              biter.IsValuePinned() ? &biter : nullptr);
+              parsed_key, value_to_save, &matched, &read_status,
+              (kvsep_enabled || !biter.IsValuePinned()) ? nullptr : &biter);
           if (!read_status.ok()) {
             s = read_status;
             break;
@@ -2617,7 +2774,7 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
           if (!ret) {
             if (get_context->State() == GetContext::GetState::kFound) {
               does_referenced_key_exist = true;
-              referenced_data_size = biter.key().size() + biter.value().size();
+              referenced_data_size = biter.key().size() + value_to_save.size();
             }
             done = true;
             break;

@@ -77,6 +77,19 @@ class Block_kUserDefinedIndex : public BlockContents {
   const Slice& ContentSlice() const { return data; }
 };
 
+// Experimental: value-only blocks for KV-separation experiments.
+// Kept as raw BlockContents (not parsed as Block) because its internal encoding
+// is "byte array of values", not a block of KV entries.
+class Block_kKVSepValue : public BlockContents {
+ public:
+  static constexpr CacheEntryRole kCacheEntryRole = CacheEntryRole::kDataBlock;
+  static constexpr BlockType kBlockType = BlockType::kKVSepValue;
+
+  explicit Block_kKVSepValue(BlockContents&& other)
+      : BlockContents(std::move(other)) {}
+  const Slice& ContentSlice() const { return data; }
+};
+
 struct BlockCreateContext : public Cache::CreateContext {
   BlockCreateContext() {}
   BlockCreateContext(const BlockBasedTableOptions* _table_options,
@@ -137,6 +150,8 @@ struct BlockCreateContext : public Cache::CreateContext {
   void Create(std::unique_ptr<Block_kMetaIndex>* parsed_out,
               BlockContents&& block);
   void Create(std::unique_ptr<Block_kUserDefinedIndex>* parsed_out,
+              BlockContents&& block);
+  void Create(std::unique_ptr<Block_kKVSepValue>* parsed_out,
               BlockContents&& block);
   void Create(std::unique_ptr<ParsedFullFilterBlock>* parsed_out,
               BlockContents&& block);
