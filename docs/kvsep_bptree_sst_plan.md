@@ -217,7 +217,7 @@ Leaf/data block 复用 RocksDB 的 BlockBuilder（prefix-compress + restarts）�
   - Seek 打空（key->value_ptr 映射错误）
   - Iterator Next/Prev 语义不一致
   - 读放大反而增大（leaf 太大、value block 读多）
-- cache=500MB 下如果 value blocks 不进 block cache，会导致不公平对比
+- value blocks 的读路径/缓存路径与原版不同，可能导致统计口径变化（需要在分析脚本中显式区分 data/value block）
 
 ### 第一轮验收门槛（cache=0）
 
@@ -231,7 +231,32 @@ Leaf/data block 复用 RocksDB 的 BlockBuilder（prefix-compress + restarts）�
 
 ## 8. 下一步（本分支的实施顺序建议）
 
-1) 先实现最小可跑通版本（cache=0）：
-   - 仅支持 mixgraph 需要的 Seek/Next/MultiGet
-2) 再补 value blocks 的 cache 支持（cache=500MB 公平对比）
-3) 再扩展 B+Tree 深度、fanout tuning、leaf/value block size sweep
+1) 已实现：最小可跑通版本（cache=0/500MB）：
+   - KV-SEP 写入（value blocks + ValueMap meta block）
+   - 读路径支持 Seek/Next/MultiGet（返回真实 value）
+2) 待实现：更“论文化”的 B+Tree 结构控制：
+   - 把 `experimental_kvsep_bptree_fanout` 参与到 partitioned index / 多层索引构造
+   - 扩展到更深层级（更接近“显式 B+Tree”而不是复用现有 index 的形态）
+3) 参数 sweep：
+   - leaf/value block size sweep
+   - cache=0/cache=500MB 交叉对比
+
+---
+
+## 9. 运行指令（Exp42）
+
+脚本：`tools/run_exp42_simfs_mixgraph_kvsep_bptree_compare_cache0_500m.sh`
+
+建议先跑一个 smoke（0.1GiB）验证正确性，再跑 4GiB：
+
+```bash
+# smoke
+TARGET_DB_GIB=0.10 THREADS=4 FILL_THREADS=4 MIXGRAPH_DURATION_SECONDS=120 \
+USE_TMPFS_REDIRECT=1 TMPFS_ROOT=/dev/shm/nvm_tmpfs_root.exp42_simfs \
+  bash tools/run_exp42_simfs_mixgraph_kvsep_bptree_compare_cache0_500m.sh
+
+# 4GiB（注意 /dev/shm 容量）
+TARGET_DB_GIB=4 THREADS=8 FILL_THREADS=8 MIXGRAPH_DURATION_SECONDS=600 \
+USE_TMPFS_REDIRECT=1 TMPFS_ROOT=/dev/shm/nvm_tmpfs_root.exp42_simfs \
+  bash tools/run_exp42_simfs_mixgraph_kvsep_bptree_compare_cache0_500m.sh
+```
