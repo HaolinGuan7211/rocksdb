@@ -328,10 +328,18 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
     }
 
     uint64_t prev_offset = std::numeric_limits<uint64_t>::max();
-    autovector<BlockHandle, MultiGetContext::MAX_BATCH_SIZE> block_handles;
-    std::array<CachableEntry<Block_kData>, MultiGetContext::MAX_BATCH_SIZE>
-        results;
-    std::array<Status, MultiGetContext::MAX_BATCH_SIZE> statuses;
+	    autovector<BlockHandle, MultiGetContext::MAX_BATCH_SIZE> block_handles;
+	    // NOTE: `block_handles` is mutated as part of MultiGet execution:
+	    // - Set to NullBlockHandle() for keys that reuse a prior key's data block
+	    // - Set to NullBlockHandle() on block cache hits (so later we don't issue IO)
+	    //
+	    // Some consumers (e.g. experimental kv-separation) still need to know the
+	    // data block's BlockHandle (offset/size) even when the block was served
+	    // from cache. Preserve the original handles here.
+	    std::vector<BlockHandle> original_block_handles;
+	    std::array<CachableEntry<Block_kData>, MultiGetContext::MAX_BATCH_SIZE>
+	        results;
+	    std::array<Status, MultiGetContext::MAX_BATCH_SIZE> statuses;
     // Empty data_lookup_contexts means "unused," when block cache tracing is
     // disabled. (Limited options as element type is not default contructible.)
     std::vector<BlockCacheLookupContext> data_lookup_contexts;
@@ -451,13 +459,14 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
           }
         }
 
-        if (block_cache) {
-          block_cache.get()->WaitAll(&async_handles[0], cache_lookup_count);
-        }
-        size_t lookup_idx = 0;
-        for (size_t i = 0; i < block_handles.size(); ++i) {
-          // If this block was a success or failure or not needed because
-          // the corresponding key is in the same block as a prior key, skip
+	        if (block_cache) {
+	          block_cache.get()->WaitAll(&async_handles[0], cache_lookup_count);
+	        }
+	        original_block_handles.assign(block_handles.begin(), block_handles.end());
+	        size_t lookup_idx = 0;
+	        for (size_t i = 0; i < block_handles.size(); ++i) {
+	          // If this block was a success or failure or not needed because
+	          // the corresponding key is in the same block as a prior key, skip
           if (block_handles[i] == BlockHandle::NullBlockHandle()) {
             continue;
           }
@@ -546,11 +555,11 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
       bool matched = false;  // if such user key matched a key in SST
       bool done = false;
       bool first_block = true;
-      do {
-        DataBlockIter* biter = nullptr;
-        BlockHandle cur_data_block_handle = BlockHandle::NullBlockHandle();
-        uint64_t referenced_data_size = 0;
-        Block_kData* parsed_block_value = nullptr;
+	      do {
+	        DataBlockIter* biter = nullptr;
+	        BlockHandle cur_data_block_handle = BlockHandle::NullBlockHandle();
+	        uint64_t referenced_data_size = 0;
+	        Block_kData* parsed_block_value = nullptr;
         bool reusing_prev_block;
         bool later_reused;
         bool does_referenced_key_exist = false;
@@ -558,21 +567,33 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
         BlockCacheLookupContext* lookup_data_block_context =
             data_lookup_contexts.empty() ? nullptr
                                          : &data_lookup_contexts[idx_in_batch];
-        if (first_block) {
-          handle_present = !block_handles[idx_in_batch].IsNull();
-          parsed_block_value = results[idx_in_batch].GetValue();
-          if (handle_present || parsed_block_value) {
-            first_biter.Invalidate(Status::OK());
-            NewDataBlockIterator<DataBlockIter>(
-                read_options, results[idx_in_batch].As<Block>(), &first_biter,
-                statuses[idx_in_batch]);
-            reusing_prev_block = false;
-            cur_data_block_handle = block_handles[idx_in_batch];
-            prev_data_block_handle = cur_data_block_handle;
-          } else {
-            // If handle is null and result is empty, then the status is never
-            // set, which should be the initial value: ok().
-            assert(statuses[idx_in_batch].ok());
+	        if (first_block) {
+	          handle_present = !block_handles[idx_in_batch].IsNull();
+	          parsed_block_value = results[idx_in_batch].GetValue();
+	          if (handle_present || parsed_block_value) {
+	            // If the block was found in the block cache, `block_handles` is
+	            // set to NullBlockHandle() to avoid reading the block from file,
+	            // but we might still need the real handle (e.g. kvsep value map
+	            // lookup keyed by data block offset).
+	            if (cur_data_block_handle.IsNull()) {
+	              cur_data_block_handle = block_handles[idx_in_batch];
+	              if (cur_data_block_handle.IsNull() && parsed_block_value &&
+	                  idx_in_batch < original_block_handles.size()) {
+	                cur_data_block_handle = original_block_handles[idx_in_batch];
+	              }
+	            }
+	            first_biter.Invalidate(Status::OK());
+	            NewDataBlockIterator<DataBlockIter>(
+	                read_options, results[idx_in_batch].As<Block>(), &first_biter,
+	                statuses[idx_in_batch]);
+	            reusing_prev_block = false;
+	            if (!cur_data_block_handle.IsNull()) {
+	              prev_data_block_handle = cur_data_block_handle;
+	            }
+	          } else {
+	            // If handle is null and result is empty, then the status is never
+	            // set, which should be the initial value: ok().
+	            assert(statuses[idx_in_batch].ok());
             reusing_prev_block = true;
             cur_data_block_handle = prev_data_block_handle;
           }
