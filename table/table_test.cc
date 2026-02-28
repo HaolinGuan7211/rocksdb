@@ -5711,6 +5711,8 @@ TEST_P(BlockBasedTableTest, PropertiesBlockRestartPointTest) {
           GetCompressFormatForVersion(footer.format_version()));
       BlockFetcher block_fetcher(file, nullptr /* prefetch_buffer */, footer,
                                  read_options_for_helper, handle, contents,
+                                 /*super_block_alignment_size=*/0,
+                                 /*enable_super_block_read_coalescing=*/false,
                                  ioptions, false /* decompress */,
                                  false /*maybe_compressed*/, block_type,
                                  mgr->GetDecompressor().get(), cache_options);
@@ -5850,7 +5852,9 @@ TEST_P(BlockBasedTableTest, PropertiesMetaBlockLast) {
       GetCompressFormatForVersion(footer.format_version()));
   BlockFetcher block_fetcher(
       table_reader.get(), nullptr /* prefetch_buffer */, footer, ReadOptions(),
-      metaindex_handle, &metaindex_contents, ioptions, false /* decompress */,
+      metaindex_handle, &metaindex_contents, /*super_block_alignment_size=*/0,
+      /*enable_super_block_read_coalescing=*/false, ioptions,
+      false /* decompress */,
       false /*maybe_compressed*/, BlockType::kMetaIndex,
       mgr->GetDecompressor().get(), pcache_opts, nullptr /*memory_allocator*/);
   ASSERT_OK(block_fetcher.ReadBlockContents());
@@ -5933,7 +5937,9 @@ TEST_P(BlockBasedTableTest, SeekMetaBlocks) {
       GetCompressFormatForVersion(footer.format_version()));
   BlockFetcher block_fetcher(
       table_reader.get(), nullptr /* prefetch_buffer */, footer, ReadOptions(),
-      metaindex_handle, &metaindex_contents, ioptions, false /* decompress */,
+      metaindex_handle, &metaindex_contents, /*super_block_alignment_size=*/0,
+      /*enable_super_block_read_coalescing=*/false, ioptions,
+      false /* decompress */,
       false /*maybe_compressed*/, BlockType::kMetaIndex,
       mgr->GetDecompressor().get(), pcache_opts, nullptr /*memory_allocator*/);
   ASSERT_OK(block_fetcher.ReadBlockContents());

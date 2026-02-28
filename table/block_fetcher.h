@@ -45,6 +45,8 @@ class BlockFetcher {
                const ReadOptions& read_options,
                const BlockHandle& handle /* ref retained */,
                BlockContents* contents,
+               size_t super_block_alignment_size,
+               bool enable_super_block_read_coalescing,
                const ImmutableOptions& ioptions /* ref retained */,
                bool do_uncompress, bool maybe_compressed, BlockType block_type,
                UnownedPtr<Decompressor> decompressor,
@@ -58,6 +60,9 @@ class BlockFetcher {
         read_options_(read_options),
         handle_(handle),
         contents_(contents),
+        super_block_alignment_size_(super_block_alignment_size),
+        enable_super_block_read_coalescing_(
+            enable_super_block_read_coalescing),
         ioptions_(ioptions),
         do_uncompress_(do_uncompress),
         maybe_compressed_(maybe_compressed),
@@ -119,6 +124,8 @@ class BlockFetcher {
   const ReadOptions read_options_;
   const BlockHandle& handle_;
   BlockContents* contents_;
+  const size_t super_block_alignment_size_;
+  const bool enable_super_block_read_coalescing_;
   const ImmutableOptions& ioptions_;
   const bool do_uncompress_;
   const bool maybe_compressed_;

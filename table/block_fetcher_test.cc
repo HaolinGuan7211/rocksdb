@@ -323,6 +323,8 @@ class BlockFetcherTest : public testing::Test {
         GetCompressFormatForVersion(footer.format_version()));
     std::unique_ptr<BlockFetcher> fetcher(new BlockFetcher(
         file, nullptr /* prefetch_buffer */, footer, roptions, block, contents,
+        /*super_block_alignment_size=*/0,
+        /*enable_super_block_read_coalescing=*/false,
         ioptions, do_uncompress, compressed, block_type,
         mgr->GetDecompressor().get(), persistent_cache_options,
         heap_buf_allocator, compressed_buf_allocator));

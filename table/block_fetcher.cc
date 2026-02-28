@@ -29,6 +29,30 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+struct SuperBlockReadCache {
+  RandomAccessFileReader* file = nullptr;
+  uint64_t base_offset = 0;
+  size_t bytes = 0;
+  AlignedBuf direct_io_buf;
+  std::string buffered;
+  bool valid = false;
+
+  void Reset() {
+    file = nullptr;
+    base_offset = 0;
+    bytes = 0;
+    direct_io_buf.reset();
+    buffered.clear();
+    valid = false;
+  }
+};
+
+thread_local SuperBlockReadCache tls_super_block_cache;
+
+inline bool IsPowerOfTwo(size_t x) { return x != 0 && (x & (x - 1)) == 0; }
+}  // namespace
+
 inline void BlockFetcher::ProcessTrailerIfPresent() {
   if (footer_.GetBlockTrailerSize() > 0) {
     assert(footer_.GetBlockTrailerSize() == BlockBasedTable::kBlockTrailerSize);
@@ -251,9 +275,101 @@ void BlockFetcher::ReadBlock(bool retry) {
   io_status_ = file_->PrepareIOOptions(read_options_, opts, &dbg);
   opts.verify_and_reconstruct_read = retry;
   read_req.status.PermitUncheckedError();
+  bool did_physical_read = false;
+  size_t physical_read_bytes = 0;
+
+  const bool enable_super_block =
+      enable_super_block_read_coalescing_ &&
+      block_type_ == BlockType::kData && !retry &&
+      super_block_alignment_size_ > 0 && IsPowerOfTwo(super_block_alignment_size_);
+
+  auto try_super_block_cache = [&]() -> bool {
+    if (!enable_super_block) {
+      return false;
+    }
+    const size_t sb = super_block_alignment_size_;
+    const uint64_t base = handle_.offset() & ~(static_cast<uint64_t>(sb) - 1);
+    const uint64_t delta = handle_.offset() - base;
+    if (delta + block_size_with_trailer_ > sb) {
+      return false;
+    }
+
+    // Ensure we have a local buffer to copy into.
+    PrepareBufferForBlockFromFile();
+
+    // Cache hit path.
+    if (tls_super_block_cache.valid && tls_super_block_cache.file == file_ &&
+        tls_super_block_cache.base_offset == base &&
+        tls_super_block_cache.bytes >= delta + block_size_with_trailer_) {
+      const char* src = nullptr;
+      if (file_->use_direct_io()) {
+        src = static_cast<const char*>(tls_super_block_cache.direct_io_buf.get());
+      } else {
+        src = tls_super_block_cache.buffered.data();
+      }
+      if (src == nullptr) {
+        tls_super_block_cache.Reset();
+        return false;
+      }
+      memcpy(used_buf_, src + delta, block_size_with_trailer_);
+      slice_ = Slice(used_buf_, block_size_with_trailer_);
+      used_buf_ = const_cast<char*>(slice_.data());
+      return true;
+    }
+
+    // Cache miss: read a whole super block and cache it (best-effort).
+    tls_super_block_cache.Reset();
+    tls_super_block_cache.file = file_;
+    tls_super_block_cache.base_offset = base;
+
+    Slice sb_slice;
+    if (file_->use_direct_io()) {
+      PERF_TIMER_GUARD(block_read_time);
+      PERF_CPU_TIMER_GUARD(
+          block_read_cpu_time,
+          ioptions_.env ? ioptions_.env->GetSystemClock().get() : nullptr);
+      io_status_ = file_->Read(opts, base, sb, &sb_slice, /*scratch=*/nullptr,
+                               &tls_super_block_cache.direct_io_buf, &dbg);
+      did_physical_read = true;
+      physical_read_bytes = sb_slice.size();
+    } else {
+      tls_super_block_cache.buffered.resize(sb);
+      PERF_TIMER_GUARD(block_read_time);
+      PERF_CPU_TIMER_GUARD(
+          block_read_cpu_time,
+          ioptions_.env ? ioptions_.env->GetSystemClock().get() : nullptr);
+      io_status_ =
+          file_->Read(opts, base, sb, &sb_slice,
+                      /*scratch=*/tls_super_block_cache.buffered.data(),
+                      /*aligned_buf=*/nullptr, &dbg);
+      did_physical_read = true;
+      physical_read_bytes = sb_slice.size();
+    }
+    if (!io_status_.ok()) {
+      tls_super_block_cache.Reset();
+      return true;  // handled (error)
+    }
+    if (sb_slice.size() < delta + block_size_with_trailer_) {
+      // Unexpected truncation: fall back to normal read.
+      tls_super_block_cache.Reset();
+      return false;
+    }
+
+    tls_super_block_cache.bytes = sb_slice.size();
+    tls_super_block_cache.valid = true;
+    const char* src = sb_slice.data();
+    memcpy(used_buf_, src + delta, block_size_with_trailer_);
+    slice_ = Slice(used_buf_, block_size_with_trailer_);
+    used_buf_ = const_cast<char*>(slice_.data());
+    return true;
+  };
+
   // Actual file read
   if (io_status_.ok()) {
-    if (file_->use_direct_io()) {
+    if (try_super_block_cache()) {
+      // The request is satisfied either from cached super block or by reading
+      // and caching a super block. Counters are handled below.
+    } else if (file_->use_direct_io()) {
       PERF_TIMER_GUARD(block_read_time);
       PERF_CPU_TIMER_GUARD(
           block_read_cpu_time,
@@ -261,7 +377,8 @@ void BlockFetcher::ReadBlock(bool retry) {
       io_status_ =
           file_->Read(opts, handle_.offset(), block_size_with_trailer_, &slice_,
                       /*scratch=*/nullptr, &direct_io_buf_, &dbg);
-      PERF_COUNTER_ADD(block_read_count, 1);
+      did_physical_read = true;
+      physical_read_bytes = block_size_with_trailer_;
       used_buf_ = const_cast<char*>(slice_.data());
     } else if (use_fs_scratch_) {
       PERF_TIMER_GUARD(block_read_time);
@@ -273,7 +390,8 @@ void BlockFetcher::ReadBlock(bool retry) {
       read_req.scratch = nullptr;
       io_status_ = file_->MultiRead(opts, &read_req, /*num_reqs=*/1,
                                     /*AlignedBuf* =*/nullptr, &dbg);
-      PERF_COUNTER_ADD(block_read_count, 1);
+      did_physical_read = true;
+      physical_read_bytes = block_size_with_trailer_;
 
       slice_ = Slice(read_req.result.data(), read_req.result.size());
       used_buf_ = const_cast<char*>(slice_.data());
@@ -290,7 +408,8 @@ void BlockFetcher::ReadBlock(bool retry) {
           file_->Read(opts, handle_.offset(), /*size*/ block_size_with_trailer_,
                       /*result*/ &slice_, /*scratch*/ used_buf_,
                       /*aligned_buf=*/nullptr, &dbg);
-      PERF_COUNTER_ADD(block_read_count, 1);
+      did_physical_read = true;
+      physical_read_bytes = block_size_with_trailer_;
 #ifndef NDEBUG
       if (slice_.data() == &stack_buf_[0]) {
         num_stack_buf_memcpy_++;
@@ -303,27 +422,29 @@ void BlockFetcher::ReadBlock(bool retry) {
     }
   }
 
-  // TODO: introduce dedicated perf counter for range tombstones
-  switch (block_type_) {
-    case BlockType::kFilter:
-    case BlockType::kFilterPartitionIndex:
-      PERF_COUNTER_ADD(filter_block_read_count, 1);
-      break;
+  if (did_physical_read) {
+    PERF_COUNTER_ADD(block_read_count, 1);
+    // TODO: introduce dedicated perf counter for range tombstones
+    switch (block_type_) {
+      case BlockType::kFilter:
+      case BlockType::kFilterPartitionIndex:
+        PERF_COUNTER_ADD(filter_block_read_count, 1);
+        break;
 
-    case BlockType::kCompressionDictionary:
-      PERF_COUNTER_ADD(compression_dict_block_read_count, 1);
-      break;
+      case BlockType::kCompressionDictionary:
+        PERF_COUNTER_ADD(compression_dict_block_read_count, 1);
+        break;
 
-    case BlockType::kIndex:
-      PERF_COUNTER_ADD(index_block_read_count, 1);
-      break;
+      case BlockType::kIndex:
+        PERF_COUNTER_ADD(index_block_read_count, 1);
+        break;
 
-    // Nothing to do here as we don't have counters for the other types.
-    default:
-      break;
+      // Nothing to do here as we don't have counters for the other types.
+      default:
+        break;
+    }
+    PERF_COUNTER_ADD(block_read_byte, physical_read_bytes);
   }
-
-  PERF_COUNTER_ADD(block_read_byte, block_size_with_trailer_);
   IGNORE_STATUS_IF_ERROR(io_status_);
   if (io_status_.ok()) {
     if (use_fs_scratch_ && !read_req.status.ok()) {

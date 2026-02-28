@@ -209,7 +209,9 @@ Status ReadAndParseBlockFromFile(
 
   BlockContents contents;
   BlockFetcher block_fetcher(
-      file, prefetch_buffer, footer, options, handle, &contents, ioptions,
+      file, prefetch_buffer, footer, options, handle, &contents,
+      /*super_block_alignment_size=*/0,
+      /*enable_super_block_read_coalescing=*/false, ioptions,
       /*do_uncompress*/ maybe_compressed, maybe_compressed,
       TBlocklike::kBlockType, decomp, cache_options, memory_allocator, nullptr,
       for_compaction);
@@ -1911,8 +1913,10 @@ BlockBasedTable::MaybeReadBlockAndLoadToCache(
         // stack if the compressed block size is < 5KB
         BlockFetcher block_fetcher(
             rep_->file.get(), prefetch_buffer, rep_->footer, ro, handle,
-            &tmp_contents, rep_->ioptions, do_uncompress, maybe_compressed,
-            TBlocklike::kBlockType, decomp, rep_->persistent_cache_options,
+            &tmp_contents, rep_->table_options.super_block_alignment_size,
+            rep_->table_options.enable_super_block_read_coalescing,
+            rep_->ioptions, do_uncompress, maybe_compressed, TBlocklike::kBlockType,
+            decomp, rep_->persistent_cache_options,
             GetMemoryAllocator(rep_->table_options),
             /*allocator=*/nullptr);
 
@@ -2820,7 +2824,9 @@ Status BlockBasedTable::VerifyChecksumInBlocks(
     BlockContents contents;
     BlockFetcher block_fetcher(
         rep_->file.get(), &prefetch_buffer, rep_->footer, read_options, handle,
-        &contents, rep_->ioptions, false /* decompress */,
+        &contents, rep_->table_options.super_block_alignment_size,
+        rep_->table_options.enable_super_block_read_coalescing,
+        rep_->ioptions, false /* decompress */,
         false /*maybe_compressed*/, BlockType::kData, nullptr /*decompressor*/,
         rep_->persistent_cache_options);
     s = block_fetcher.ReadBlockContents();
@@ -2917,6 +2923,8 @@ Status BlockBasedTable::VerifyChecksumInMetaBlocks(
       // FIXME? Need to verify checksums of index and filter partitions?
       s = BlockFetcher(rep_->file.get(), nullptr /* prefetch buffer */,
                        rep_->footer, read_options, handle, &contents,
+                       rep_->table_options.super_block_alignment_size,
+                       rep_->table_options.enable_super_block_read_coalescing,
                        rep_->ioptions, false /* decompress */,
                        false /*maybe_compressed*/,
                        GetBlockTypeForMetaBlockByName(meta_block_name),

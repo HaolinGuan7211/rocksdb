@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <chrono>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -178,6 +180,7 @@ void SleepForNanoseconds(uint64_t delay_ns) {
 }
 
 uint64_t NowNanos() { return Env::Default()->GetSystemClock()->NowNanos(); }
+uint64_t NowMicros() { return Env::Default()->GetSystemClock()->NowMicros(); }
 
 thread_local bool g_xp_forced_stream_tag_valid = false;
 thread_local uint64_t g_xp_forced_stream_tag = 0;
@@ -258,6 +261,409 @@ struct DimmControllerState {
 
 std::mutex g_dimm_mu;
 std::unordered_map<uintptr_t, DimmControllerState> g_dimm_states;
+}  // namespace
+
+enum class SimFsMonitorOp : uint8_t { kRead = 0, kOpen = 1, kPrefetch = 2 };
+
+struct SimFsMonitorCounters {
+  std::atomic<uint64_t> ops{0};
+  std::atomic<uint64_t> bytes{0};
+  std::atomic<uint64_t> max_us{0};
+  std::atomic<uint64_t> tmpfs_ops{0};
+  std::atomic<uint64_t> tmpfs_bytes{0};
+  std::atomic<uint64_t> base_ops{0};
+  std::atomic<uint64_t> base_bytes{0};
+};
+
+class SimulatedFsLatencyMonitor {
+ public:
+  explicit SimulatedFsLatencyMonitor(const SimulatedStorageModelOptions& options)
+      : enabled_(options.monitor_enable),
+        window_us_(std::max<uint64_t>(1, options.monitor_window_us)),
+        stage_us_(options.monitor_stage_seconds > 0
+                      ? options.monitor_stage_seconds * 1000000ULL
+                      : 0),
+        max_read_(options.monitor_max_read),
+        max_open_(options.monitor_max_open),
+        max_prefetch_(options.monitor_max_prefetch),
+        window_csv_(options.monitor_window_csv),
+        stage_csv_(options.monitor_stage_csv) {
+    if (!enabled_) {
+      return;
+    }
+    if (window_csv_.empty() && stage_csv_.empty()) {
+      enabled_ = false;
+      return;
+    }
+    start_us_.store(Env::Default()->GetSystemClock()->NowMicros());
+    OpenOutputs();
+    thread_ = std::thread([this]() { ThreadBody(); });
+  }
+
+  ~SimulatedFsLatencyMonitor() { Stop(); }
+
+  bool Enabled() const { return enabled_; }
+
+  void SetStartTimeMicros(uint64_t start_us) {
+    if (!enabled_) {
+      return;
+    }
+    start_us_.store(start_us);
+    // Reset counters to avoid mixing stages across benchmark phases.
+    ResetCounters();
+    Notify();
+  }
+
+  void Record(SimFsMonitorOp op, bool is_tmpfs, uint64_t bytes,
+              uint64_t latency_us) {
+    if (!enabled_) {
+      return;
+    }
+    if (latency_us == 0) {
+      latency_us = 1;
+    }
+    switch (op) {
+      case SimFsMonitorOp::kRead:
+        if (max_read_) {
+          AtomicMax(&window_read_.max_us, latency_us);
+          AtomicMax(&stage_read_.max_us, latency_us);
+        }
+        window_read_.ops.fetch_add(1);
+        window_read_.bytes.fetch_add(bytes);
+        stage_read_.ops.fetch_add(1);
+        stage_read_.bytes.fetch_add(bytes);
+        if (is_tmpfs) {
+          window_read_.tmpfs_ops.fetch_add(1);
+          window_read_.tmpfs_bytes.fetch_add(bytes);
+          stage_read_.tmpfs_ops.fetch_add(1);
+          stage_read_.tmpfs_bytes.fetch_add(bytes);
+        } else {
+          window_read_.base_ops.fetch_add(1);
+          window_read_.base_bytes.fetch_add(bytes);
+          stage_read_.base_ops.fetch_add(1);
+          stage_read_.base_bytes.fetch_add(bytes);
+        }
+        return;
+      case SimFsMonitorOp::kOpen:
+        if (max_open_) {
+          AtomicMax(&window_open_.max_us, latency_us);
+          AtomicMax(&stage_open_.max_us, latency_us);
+        }
+        window_open_.ops.fetch_add(1);
+        stage_open_.ops.fetch_add(1);
+        if (is_tmpfs) {
+          window_open_.tmpfs_ops.fetch_add(1);
+          stage_open_.tmpfs_ops.fetch_add(1);
+        } else {
+          window_open_.base_ops.fetch_add(1);
+          stage_open_.base_ops.fetch_add(1);
+        }
+        return;
+      case SimFsMonitorOp::kPrefetch:
+        if (max_prefetch_) {
+          AtomicMax(&window_prefetch_.max_us, latency_us);
+          AtomicMax(&stage_prefetch_.max_us, latency_us);
+        }
+        window_prefetch_.ops.fetch_add(1);
+        window_prefetch_.bytes.fetch_add(bytes);
+        stage_prefetch_.ops.fetch_add(1);
+        stage_prefetch_.bytes.fetch_add(bytes);
+        if (is_tmpfs) {
+          window_prefetch_.tmpfs_ops.fetch_add(1);
+          window_prefetch_.tmpfs_bytes.fetch_add(bytes);
+          stage_prefetch_.tmpfs_ops.fetch_add(1);
+          stage_prefetch_.tmpfs_bytes.fetch_add(bytes);
+        } else {
+          window_prefetch_.base_ops.fetch_add(1);
+          window_prefetch_.base_bytes.fetch_add(bytes);
+          stage_prefetch_.base_ops.fetch_add(1);
+          stage_prefetch_.base_bytes.fetch_add(bytes);
+        }
+        return;
+    }
+  }
+
+  void Stop() {
+    if (!enabled_) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lk(cv_mu_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+    // Final flush to avoid losing the last partial window/stage.
+    FlushWindow(/*force=*/true);
+    FlushStage(/*force=*/true);
+    if (window_out_.is_open()) {
+      window_out_.flush();
+      window_out_.close();
+    }
+    if (stage_out_.is_open()) {
+      stage_out_.flush();
+      stage_out_.close();
+    }
+    enabled_ = false;
+  }
+
+ private:
+  void Notify() {
+    std::lock_guard<std::mutex> lk(cv_mu_);
+    cv_.notify_all();
+  }
+
+  void ResetCounters() {
+    window_read_.ops.store(0);
+    window_read_.bytes.store(0);
+    window_read_.max_us.store(0);
+    window_read_.tmpfs_ops.store(0);
+    window_read_.tmpfs_bytes.store(0);
+    window_read_.base_ops.store(0);
+    window_read_.base_bytes.store(0);
+
+    window_open_.ops.store(0);
+    window_open_.bytes.store(0);
+    window_open_.max_us.store(0);
+    window_open_.tmpfs_ops.store(0);
+    window_open_.tmpfs_bytes.store(0);
+    window_open_.base_ops.store(0);
+    window_open_.base_bytes.store(0);
+
+    window_prefetch_.ops.store(0);
+    window_prefetch_.bytes.store(0);
+    window_prefetch_.max_us.store(0);
+    window_prefetch_.tmpfs_ops.store(0);
+    window_prefetch_.tmpfs_bytes.store(0);
+    window_prefetch_.base_ops.store(0);
+    window_prefetch_.base_bytes.store(0);
+
+    stage_read_.ops.store(0);
+    stage_read_.bytes.store(0);
+    stage_read_.max_us.store(0);
+    stage_read_.tmpfs_ops.store(0);
+    stage_read_.tmpfs_bytes.store(0);
+    stage_read_.base_ops.store(0);
+    stage_read_.base_bytes.store(0);
+
+    stage_open_.ops.store(0);
+    stage_open_.bytes.store(0);
+    stage_open_.max_us.store(0);
+    stage_open_.tmpfs_ops.store(0);
+    stage_open_.tmpfs_bytes.store(0);
+    stage_open_.base_ops.store(0);
+    stage_open_.base_bytes.store(0);
+
+    stage_prefetch_.ops.store(0);
+    stage_prefetch_.bytes.store(0);
+    stage_prefetch_.max_us.store(0);
+    stage_prefetch_.tmpfs_ops.store(0);
+    stage_prefetch_.tmpfs_bytes.store(0);
+    stage_prefetch_.base_ops.store(0);
+    stage_prefetch_.base_bytes.store(0);
+
+    last_flushed_window_id_ = -1;
+    last_flushed_stage_id_ = -1;
+  }
+
+  void OpenOutputs() {
+    if (!window_csv_.empty()) {
+      window_out_.open(window_csv_, std::ofstream::out | std::ofstream::trunc);
+      if (window_out_.good()) {
+        window_out_
+            << "window_id,window_start_us,window_end_us,"
+               "read_ops,read_bytes,tmpfs_read_ops,tmpfs_read_bytes,base_read_ops,base_read_bytes,max_read_us,"
+               "prefetch_ops,prefetch_bytes,tmpfs_prefetch_ops,tmpfs_prefetch_bytes,base_prefetch_ops,base_prefetch_bytes,max_prefetch_us,"
+               "open_ops,tmpfs_open_ops,base_open_ops,max_open_us\n";
+      }
+    }
+    if (!stage_csv_.empty()) {
+      stage_out_.open(stage_csv_, std::ofstream::out | std::ofstream::trunc);
+      if (stage_out_.good()) {
+        stage_out_
+            << "stage_id,stage_start_us,stage_end_us,"
+               "read_ops,read_bytes,tmpfs_read_ops,tmpfs_read_bytes,base_read_ops,base_read_bytes,max_read_us,"
+               "prefetch_ops,prefetch_bytes,tmpfs_prefetch_ops,tmpfs_prefetch_bytes,base_prefetch_ops,base_prefetch_bytes,max_prefetch_us,"
+               "open_ops,tmpfs_open_ops,base_open_ops,max_open_us\n";
+      }
+    }
+  }
+
+  static uint64_t ExchangeMax(std::atomic<uint64_t>* v) {
+    return v ? v->exchange(0) : 0;
+  }
+
+  static void AtomicMax(std::atomic<uint64_t>* dst, uint64_t value) {
+    if (dst == nullptr) {
+      return;
+    }
+    uint64_t prev = dst->load(std::memory_order_relaxed);
+    while (prev < value &&
+           !dst->compare_exchange_weak(prev, value, std::memory_order_relaxed)) {
+    }
+  }
+
+  void FlushWindow(bool force) {
+    if (!window_out_.is_open()) {
+      return;
+    }
+    const uint64_t start_us = start_us_.load();
+    const uint64_t now_us = Env::Default()->GetSystemClock()->NowMicros();
+    const uint64_t elapsed_us = now_us > start_us ? now_us - start_us : 0;
+    const uint64_t windows_started = elapsed_us / window_us_;
+    int64_t target = static_cast<int64_t>(windows_started);
+    if (!force) {
+      if (windows_started == 0) {
+        return;
+      }
+      target = static_cast<int64_t>(windows_started - 1);
+    }
+    if (target <= last_flushed_window_id_) {
+      return;
+    }
+
+    const uint64_t w_start = start_us + static_cast<uint64_t>(target) * window_us_;
+    const uint64_t w_end = w_start + window_us_;
+
+    const uint64_t read_ops = window_read_.ops.exchange(0);
+    const uint64_t read_bytes = window_read_.bytes.exchange(0);
+    const uint64_t tmpfs_read_ops = window_read_.tmpfs_ops.exchange(0);
+    const uint64_t tmpfs_read_bytes = window_read_.tmpfs_bytes.exchange(0);
+    const uint64_t base_read_ops = window_read_.base_ops.exchange(0);
+    const uint64_t base_read_bytes = window_read_.base_bytes.exchange(0);
+    const uint64_t max_read_us = ExchangeMax(&window_read_.max_us);
+
+    const uint64_t prefetch_ops = window_prefetch_.ops.exchange(0);
+    const uint64_t prefetch_bytes = window_prefetch_.bytes.exchange(0);
+    const uint64_t tmpfs_prefetch_ops = window_prefetch_.tmpfs_ops.exchange(0);
+    const uint64_t tmpfs_prefetch_bytes = window_prefetch_.tmpfs_bytes.exchange(0);
+    const uint64_t base_prefetch_ops = window_prefetch_.base_ops.exchange(0);
+    const uint64_t base_prefetch_bytes = window_prefetch_.base_bytes.exchange(0);
+    const uint64_t max_prefetch_us = ExchangeMax(&window_prefetch_.max_us);
+
+    const uint64_t open_ops = window_open_.ops.exchange(0);
+    (void)window_open_.bytes.exchange(0);
+    const uint64_t tmpfs_open_ops = window_open_.tmpfs_ops.exchange(0);
+    const uint64_t base_open_ops = window_open_.base_ops.exchange(0);
+    const uint64_t max_open_us = ExchangeMax(&window_open_.max_us);
+
+    window_out_ << target << "," << w_start << "," << w_end << "," << read_ops
+                << "," << read_bytes << "," << tmpfs_read_ops << ","
+                << tmpfs_read_bytes << "," << base_read_ops << ","
+                << base_read_bytes << "," << max_read_us << ","
+                << prefetch_ops << "," << prefetch_bytes << ","
+                << tmpfs_prefetch_ops << "," << tmpfs_prefetch_bytes << ","
+                << base_prefetch_ops << "," << base_prefetch_bytes << ","
+                << max_prefetch_us << "," << open_ops << "," << tmpfs_open_ops
+                << "," << base_open_ops << "," << max_open_us << "\n";
+    last_flushed_window_id_ = target;
+    window_out_.flush();
+  }
+
+  void FlushStage(bool force) {
+    if (stage_us_ == 0 || !stage_out_.is_open()) {
+      return;
+    }
+    const uint64_t start_us = start_us_.load();
+    const uint64_t now_us = Env::Default()->GetSystemClock()->NowMicros();
+    const uint64_t elapsed_us = now_us > start_us ? now_us - start_us : 0;
+    const uint64_t stages_started = elapsed_us / stage_us_;
+    int64_t target = static_cast<int64_t>(stages_started);
+    if (!force) {
+      if (stages_started == 0) {
+        return;
+      }
+      target = static_cast<int64_t>(stages_started - 1);
+    }
+    if (target <= last_flushed_stage_id_) {
+      return;
+    }
+
+    const uint64_t s_start = start_us + static_cast<uint64_t>(target) * stage_us_;
+    const uint64_t s_end = s_start + stage_us_;
+
+    const uint64_t read_ops = stage_read_.ops.exchange(0);
+    const uint64_t read_bytes = stage_read_.bytes.exchange(0);
+    const uint64_t tmpfs_read_ops = stage_read_.tmpfs_ops.exchange(0);
+    const uint64_t tmpfs_read_bytes = stage_read_.tmpfs_bytes.exchange(0);
+    const uint64_t base_read_ops = stage_read_.base_ops.exchange(0);
+    const uint64_t base_read_bytes = stage_read_.base_bytes.exchange(0);
+    const uint64_t max_read_us = ExchangeMax(&stage_read_.max_us);
+
+    const uint64_t prefetch_ops = stage_prefetch_.ops.exchange(0);
+    const uint64_t prefetch_bytes = stage_prefetch_.bytes.exchange(0);
+    const uint64_t tmpfs_prefetch_ops = stage_prefetch_.tmpfs_ops.exchange(0);
+    const uint64_t tmpfs_prefetch_bytes = stage_prefetch_.tmpfs_bytes.exchange(0);
+    const uint64_t base_prefetch_ops = stage_prefetch_.base_ops.exchange(0);
+    const uint64_t base_prefetch_bytes = stage_prefetch_.base_bytes.exchange(0);
+    const uint64_t max_prefetch_us = ExchangeMax(&stage_prefetch_.max_us);
+
+    const uint64_t open_ops = stage_open_.ops.exchange(0);
+    (void)stage_open_.bytes.exchange(0);
+    const uint64_t tmpfs_open_ops = stage_open_.tmpfs_ops.exchange(0);
+    const uint64_t base_open_ops = stage_open_.base_ops.exchange(0);
+    const uint64_t max_open_us = ExchangeMax(&stage_open_.max_us);
+
+    stage_out_ << target << "," << s_start << "," << s_end << "," << read_ops
+               << "," << read_bytes << "," << tmpfs_read_ops << ","
+               << tmpfs_read_bytes << "," << base_read_ops << ","
+               << base_read_bytes << "," << max_read_us << ","
+               << prefetch_ops << "," << prefetch_bytes << ","
+               << tmpfs_prefetch_ops << "," << tmpfs_prefetch_bytes << ","
+               << base_prefetch_ops << "," << base_prefetch_bytes << ","
+               << max_prefetch_us << "," << open_ops << "," << tmpfs_open_ops
+               << "," << base_open_ops << "," << max_open_us << "\n";
+    last_flushed_stage_id_ = target;
+    stage_out_.flush();
+  }
+
+  void ThreadBody() {
+    while (true) {
+      {
+        std::unique_lock<std::mutex> lk(cv_mu_);
+        cv_.wait_for(lk, std::chrono::microseconds(window_us_), [this]() {
+          return stop_;
+        });
+        if (stop_) {
+          return;
+        }
+      }
+      FlushWindow(/*force=*/false);
+      FlushStage(/*force=*/false);
+    }
+  }
+
+  bool enabled_{false};
+  const uint64_t window_us_;
+  const uint64_t stage_us_;
+  const bool max_read_;
+  const bool max_open_;
+  const bool max_prefetch_;
+  const std::string window_csv_;
+  const std::string stage_csv_;
+
+  std::atomic<uint64_t> start_us_{0};
+  SimFsMonitorCounters window_read_;
+  SimFsMonitorCounters window_open_;
+  SimFsMonitorCounters window_prefetch_;
+  SimFsMonitorCounters stage_read_;
+  SimFsMonitorCounters stage_open_;
+  SimFsMonitorCounters stage_prefetch_;
+  int64_t last_flushed_window_id_{-1};
+  int64_t last_flushed_stage_id_{-1};
+
+  std::ofstream window_out_;
+  std::ofstream stage_out_;
+
+  std::mutex cv_mu_;
+  std::condition_variable cv_;
+  bool stop_{false};
+  std::thread thread_;
+};
+
+namespace {
 std::mutex g_xp_file_levels_mu;
 std::unordered_map<std::string, int> g_xp_file_levels;
 struct VirtualNowKey {
@@ -1148,6 +1554,33 @@ SimulatedHybridFileSystem::SimulatedHybridFileSystem(
     }
   }
 
+  if (model_options_.monitor_enable &&
+      (!model_options_.monitor_window_csv.empty() ||
+       !model_options_.monitor_stage_csv.empty())) {
+    if (!model_options_.monitor_window_csv.empty()) {
+      const IOStatus s =
+          EnsureParentDir(model_options_.monitor_window_csv, nullptr);
+      if (!s.ok()) {
+        std::cerr << "[simfs] failed to create monitor window csv parent dir '"
+                  << model_options_.monitor_window_csv
+                  << "': " << s.ToString() << "\n";
+        std::exit(1);
+      }
+    }
+    if (!model_options_.monitor_stage_csv.empty()) {
+      const IOStatus s =
+          EnsureParentDir(model_options_.monitor_stage_csv, nullptr);
+      if (!s.ok()) {
+        std::cerr << "[simfs] failed to create monitor stage csv parent dir '"
+                  << model_options_.monitor_stage_csv
+                  << "': " << s.ToString() << "\n";
+        std::exit(1);
+      }
+    }
+    latency_monitor_ =
+        std::make_shared<SimulatedFsLatencyMonitor>(model_options_);
+  }
+
   if (metadata_file_name.empty()) {
     return;
   }
@@ -1178,6 +1611,9 @@ SimulatedHybridFileSystem::SimulatedHybridFileSystem(
 // SimulatedHybridFileSystem::SimulatedHybridFileSystem() for format of the
 // file.
 SimulatedHybridFileSystem::~SimulatedHybridFileSystem() {
+  if (latency_monitor_ != nullptr) {
+    latency_monitor_->Stop();
+  }
   MaybeWriteModelStats();
   CleanupXpControllerState(stats_);
   CleanupDimmControllerState(stats_);
@@ -1196,6 +1632,12 @@ SimulatedHybridFileSystem::~SimulatedHybridFileSystem() {
   if (!s.ok()) {
     fprintf(stderr, "Error writing to file %s: %s", metadata_file_name_.c_str(),
             s.ToString().c_str());
+  }
+}
+
+void SimulatedHybridFileSystem::SetMonitorStartTimeMicros(uint64_t start_us) {
+  if (latency_monitor_ != nullptr) {
+    latency_monitor_->SetStartTimeMicros(start_us);
   }
 }
 
@@ -1300,6 +1742,14 @@ void SimulatedHybridFileSystem::MaybeWriteModelStats() const {
   out << "xp_tmpfs_root=" << model_options_.xp_tmpfs_root << "\n";
   out << "tmpfs_read_opens=" << tmpfs_read_opens << "\n";
   out << "tmpfs_write_opens=" << tmpfs_write_opens << "\n";
+  out << "tmpfs_read_ops=" << stats_->tmpfs_read_ops.load() << "\n";
+  out << "tmpfs_read_bytes=" << stats_->tmpfs_read_bytes.load() << "\n";
+  out << "base_read_ops=" << stats_->base_read_ops.load() << "\n";
+  out << "base_read_bytes=" << stats_->base_read_bytes.load() << "\n";
+  out << "tmpfs_prefetch_ops=" << stats_->tmpfs_prefetch_ops.load() << "\n";
+  out << "tmpfs_prefetch_bytes=" << stats_->tmpfs_prefetch_bytes.load() << "\n";
+  out << "base_prefetch_ops=" << stats_->base_prefetch_ops.load() << "\n";
+  out << "base_prefetch_bytes=" << stats_->base_prefetch_bytes.load() << "\n";
   out << "logical_read_bytes=" << logical_read << "\n";
   out << "logical_write_bytes=" << logical_write << "\n";
   out << "media_read_bytes=" << media_read << "\n";
@@ -1518,14 +1968,29 @@ IOStatus SimulatedHybridFileSystem::NewRandomAccessFile(
   }
 
   const std::string real_path = ResolveReadPath(fname);
+  const bool is_tmpfs = real_path != fname;
   if (stats_ != nullptr && real_path != fname) {
     stats_->tmpfs_read_opens.fetch_add(1);
   }
-  IOStatus s = target()->NewRandomAccessFile(real_path, file_opts, result, dbg);
+  FileOptions open_opts = file_opts;
+  if (IsTmpfsRedirectEnabled() && IsUnderTmpfsRoot(real_path)) {
+    // tmpfs generally does not support O_DIRECT; opening a direct-read file
+    // may fail with EINVAL. Disable direct IO for tmpfs paths only.
+    open_opts.use_direct_reads = false;
+    open_opts.use_direct_writes = false;
+  }
+  const uint64_t start_us = NowMicros();
+  IOStatus s = target()->NewRandomAccessFile(real_path, open_opts, result, dbg);
+  const uint64_t end_us = NowMicros();
+  if (latency_monitor_ != nullptr) {
+    latency_monitor_->Record(SimFsMonitorOp::kOpen, is_tmpfs, /*bytes=*/0,
+                             end_us >= start_us ? end_us - start_us : 0);
+  }
   if (s.ok() && should_simulate) {
     result->reset(new SimulatedHybridRaf(std::move(*result), rate_limiter_,
-                                         fname, should_simulate,
-                                         model_options_, stats_));
+                                         fname, is_tmpfs, should_simulate,
+                                         model_options_, stats_,
+                                         latency_monitor_));
   }
   return s;
 }
@@ -1534,10 +1999,23 @@ IOStatus SimulatedHybridFileSystem::NewSequentialFile(
     const std::string& fname, const FileOptions& file_opts,
     std::unique_ptr<FSSequentialFile>* result, IODebugContext* dbg) {
   const std::string real_path = ResolveReadPath(fname);
+  const bool is_tmpfs = real_path != fname;
   if (stats_ != nullptr && real_path != fname) {
     stats_->tmpfs_read_opens.fetch_add(1);
   }
-  return target()->NewSequentialFile(real_path, file_opts, result, dbg);
+  FileOptions open_opts = file_opts;
+  if (IsTmpfsRedirectEnabled() && IsUnderTmpfsRoot(real_path)) {
+    open_opts.use_direct_reads = false;
+    open_opts.use_direct_writes = false;
+  }
+  const uint64_t start_us = NowMicros();
+  IOStatus s = target()->NewSequentialFile(real_path, open_opts, result, dbg);
+  const uint64_t end_us = NowMicros();
+  if (latency_monitor_ != nullptr) {
+    latency_monitor_->Record(SimFsMonitorOp::kOpen, is_tmpfs, /*bytes=*/0,
+                             end_us >= start_us ? end_us - start_us : 0);
+  }
+  return s;
 }
 
 IOStatus SimulatedHybridFileSystem::NewDirectory(
@@ -1569,6 +2047,7 @@ IOStatus SimulatedHybridFileSystem::NewWritableFile(
   }
 
   const std::string real_path = ResolveWritePath(fname);
+  const bool is_tmpfs = real_path != fname;
   if (stats_ != nullptr && real_path != fname) {
     stats_->tmpfs_write_opens.fetch_add(1);
   }
@@ -1576,7 +2055,18 @@ IOStatus SimulatedHybridFileSystem::NewWritableFile(
   if (!s.ok()) {
     return s;
   }
-  s = target()->NewWritableFile(real_path, file_opts, result, dbg);
+  FileOptions open_opts = file_opts;
+  if (IsTmpfsRedirectEnabled() && IsUnderTmpfsRoot(real_path)) {
+    open_opts.use_direct_reads = false;
+    open_opts.use_direct_writes = false;
+  }
+  const uint64_t start_us = NowMicros();
+  s = target()->NewWritableFile(real_path, open_opts, result, dbg);
+  const uint64_t end_us = NowMicros();
+  if (latency_monitor_ != nullptr) {
+    latency_monitor_->Record(SimFsMonitorOp::kOpen, is_tmpfs, /*bytes=*/0,
+                             end_us >= start_us ? end_us - start_us : 0);
+  }
   if (s.ok() && should_simulate) {
     result->reset(new SimulatedWritableFile(std::move(*result), rate_limiter_,
                                             fname, model_options_, stats_));
@@ -1606,6 +2096,7 @@ IOStatus SimulatedHybridFileSystem::ReopenWritableFile(
   if (real_path == fname) {
     real_path = ResolveWritePath(fname);
   }
+  const bool is_tmpfs = real_path != fname;
   if (stats_ != nullptr && real_path != fname) {
     stats_->tmpfs_write_opens.fetch_add(1);
   }
@@ -1613,7 +2104,18 @@ IOStatus SimulatedHybridFileSystem::ReopenWritableFile(
   if (!s.ok()) {
     return s;
   }
-  s = target()->ReopenWritableFile(real_path, file_opts, result, dbg);
+  FileOptions open_opts = file_opts;
+  if (IsTmpfsRedirectEnabled() && IsUnderTmpfsRoot(real_path)) {
+    open_opts.use_direct_reads = false;
+    open_opts.use_direct_writes = false;
+  }
+  const uint64_t start_us = NowMicros();
+  s = target()->ReopenWritableFile(real_path, open_opts, result, dbg);
+  const uint64_t end_us = NowMicros();
+  if (latency_monitor_ != nullptr) {
+    latency_monitor_->Record(SimFsMonitorOp::kOpen, is_tmpfs, /*bytes=*/0,
+                             end_us >= start_us ? end_us - start_us : 0);
+  }
   if (s.ok() && should_simulate) {
     result->reset(new SimulatedWritableFile(std::move(*result), rate_limiter_,
                                             fname, model_options_, stats_));
@@ -1645,6 +2147,7 @@ IOStatus SimulatedHybridFileSystem::ReuseWritableFile(
   if (IsTmpfsRedirectEnabled() && IsUnderTmpfsRoot(old_real)) {
     new_real = ToTmpfsPath(fname);
   }
+  const bool is_tmpfs = new_real != fname;
   if (stats_ != nullptr && new_real != fname) {
     stats_->tmpfs_write_opens.fetch_add(1);
   }
@@ -1652,7 +2155,18 @@ IOStatus SimulatedHybridFileSystem::ReuseWritableFile(
   if (!s.ok()) {
     return s;
   }
-  s = target()->ReuseWritableFile(new_real, old_real, file_opts, result, dbg);
+  FileOptions open_opts = file_opts;
+  if (IsTmpfsRedirectEnabled() && IsUnderTmpfsRoot(new_real)) {
+    open_opts.use_direct_reads = false;
+    open_opts.use_direct_writes = false;
+  }
+  const uint64_t start_us = NowMicros();
+  s = target()->ReuseWritableFile(new_real, old_real, open_opts, result, dbg);
+  const uint64_t end_us = NowMicros();
+  if (latency_monitor_ != nullptr) {
+    latency_monitor_->Record(SimFsMonitorOp::kOpen, is_tmpfs, /*bytes=*/0,
+                             end_us >= start_us ? end_us - start_us : 0);
+  }
   if (s.ok() && should_simulate) {
     result->reset(new SimulatedWritableFile(std::move(*result), rate_limiter_,
                                             fname, model_options_, stats_));
@@ -1963,23 +2477,58 @@ IOStatus SimulatedHybridFileSystem::DeleteFile(const std::string& fname,
 IOStatus SimulatedHybridRaf::Read(uint64_t offset, size_t n,
                                   const IOOptions& options, Slice* result,
                                   char* scratch, IODebugContext* dbg) const {
+  const uint64_t start_us = NowMicros();
   if (should_simulate_) {
     SimulateIOWait(offset, static_cast<uint64_t>(n));
     if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
         model_options_.xp_bypass_base_io) {
       *result = Slice(scratch, n);
+      const uint64_t end_us = NowMicros();
+      if (stats_ != nullptr) {
+        if (is_tmpfs_) {
+          stats_->tmpfs_read_ops.fetch_add(1);
+          stats_->tmpfs_read_bytes.fetch_add(static_cast<uint64_t>(n));
+        } else {
+          stats_->base_read_ops.fetch_add(1);
+          stats_->base_read_bytes.fetch_add(static_cast<uint64_t>(n));
+        }
+      }
+      if (monitor_ != nullptr) {
+        monitor_->Record(SimFsMonitorOp::kRead, is_tmpfs_,
+                         static_cast<uint64_t>(n),
+                         end_us >= start_us ? end_us - start_us : 0);
+      }
       return IOStatus::OK();
     }
   }
-  return target()->Read(offset, n, options, result, scratch, dbg);
+  IOStatus s = target()->Read(offset, n, options, result, scratch, dbg);
+  const uint64_t end_us = NowMicros();
+  if (stats_ != nullptr) {
+    if (is_tmpfs_) {
+      stats_->tmpfs_read_ops.fetch_add(1);
+      stats_->tmpfs_read_bytes.fetch_add(static_cast<uint64_t>(n));
+    } else {
+      stats_->base_read_ops.fetch_add(1);
+      stats_->base_read_bytes.fetch_add(static_cast<uint64_t>(n));
+    }
+  }
+  if (monitor_ != nullptr) {
+    monitor_->Record(SimFsMonitorOp::kRead, is_tmpfs_,
+                     static_cast<uint64_t>(n),
+                     end_us >= start_us ? end_us - start_us : 0);
+  }
+  return s;
 }
 
 IOStatus SimulatedHybridRaf::MultiRead(FSReadRequest* reqs, size_t num_reqs,
                                        const IOOptions& options,
                                        IODebugContext* dbg) {
+  const uint64_t start_us = NowMicros();
+  uint64_t total_bytes = 0;
   if (should_simulate_) {
     for (size_t i = 0; i < num_reqs; i++) {
       SimulateIOWait(reqs[i].offset, static_cast<uint64_t>(reqs[i].len));
+      total_bytes += static_cast<uint64_t>(reqs[i].len);
       if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
           model_options_.xp_bypass_base_io) {
         reqs[i].status = IOStatus::OK();
@@ -1988,23 +2537,90 @@ IOStatus SimulatedHybridRaf::MultiRead(FSReadRequest* reqs, size_t num_reqs,
     }
     if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
         model_options_.xp_bypass_base_io) {
+      const uint64_t end_us = NowMicros();
+      if (stats_ != nullptr) {
+        if (is_tmpfs_) {
+          stats_->tmpfs_read_ops.fetch_add(num_reqs);
+          stats_->tmpfs_read_bytes.fetch_add(total_bytes);
+        } else {
+          stats_->base_read_ops.fetch_add(num_reqs);
+          stats_->base_read_bytes.fetch_add(total_bytes);
+        }
+      }
+      if (monitor_ != nullptr) {
+        monitor_->Record(SimFsMonitorOp::kRead, is_tmpfs_, total_bytes,
+                         end_us >= start_us ? end_us - start_us : 0);
+      }
       return IOStatus::OK();
     }
   }
-  return target()->MultiRead(reqs, num_reqs, options, dbg);
+  IOStatus s = target()->MultiRead(reqs, num_reqs, options, dbg);
+  // Best-effort bytes accounting for non-simulated path.
+  if (total_bytes == 0) {
+    for (size_t i = 0; i < num_reqs; ++i) {
+      total_bytes += static_cast<uint64_t>(reqs[i].len);
+    }
+  }
+  const uint64_t end_us = NowMicros();
+  if (stats_ != nullptr) {
+    if (is_tmpfs_) {
+      stats_->tmpfs_read_ops.fetch_add(num_reqs);
+      stats_->tmpfs_read_bytes.fetch_add(total_bytes);
+    } else {
+      stats_->base_read_ops.fetch_add(num_reqs);
+      stats_->base_read_bytes.fetch_add(total_bytes);
+    }
+  }
+  if (monitor_ != nullptr) {
+    monitor_->Record(SimFsMonitorOp::kRead, is_tmpfs_, total_bytes,
+                     end_us >= start_us ? end_us - start_us : 0);
+  }
+  return s;
 }
 
 IOStatus SimulatedHybridRaf::Prefetch(uint64_t offset, size_t n,
                                       const IOOptions& options,
                                       IODebugContext* dbg) {
+  const uint64_t start_us = NowMicros();
   if (should_simulate_) {
     SimulateIOWait(offset, static_cast<uint64_t>(n));
     if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
         model_options_.xp_bypass_base_io) {
+      const uint64_t end_us = NowMicros();
+      if (stats_ != nullptr) {
+        if (is_tmpfs_) {
+          stats_->tmpfs_prefetch_ops.fetch_add(1);
+          stats_->tmpfs_prefetch_bytes.fetch_add(static_cast<uint64_t>(n));
+        } else {
+          stats_->base_prefetch_ops.fetch_add(1);
+          stats_->base_prefetch_bytes.fetch_add(static_cast<uint64_t>(n));
+        }
+      }
+      if (monitor_ != nullptr) {
+        monitor_->Record(SimFsMonitorOp::kPrefetch, is_tmpfs_,
+                         static_cast<uint64_t>(n),
+                         end_us >= start_us ? end_us - start_us : 0);
+      }
       return IOStatus::OK();
     }
   }
-  return target()->Prefetch(offset, n, options, dbg);
+  IOStatus s = target()->Prefetch(offset, n, options, dbg);
+  const uint64_t end_us = NowMicros();
+  if (stats_ != nullptr) {
+    if (is_tmpfs_) {
+      stats_->tmpfs_prefetch_ops.fetch_add(1);
+      stats_->tmpfs_prefetch_bytes.fetch_add(static_cast<uint64_t>(n));
+    } else {
+      stats_->base_prefetch_ops.fetch_add(1);
+      stats_->base_prefetch_bytes.fetch_add(static_cast<uint64_t>(n));
+    }
+  }
+  if (monitor_ != nullptr) {
+    monitor_->Record(SimFsMonitorOp::kPrefetch, is_tmpfs_,
+                     static_cast<uint64_t>(n),
+                     end_us >= start_us ? end_us - start_us : 0);
+  }
+  return s;
 }
 
 void SimulatedHybridRaf::SimulateIOWait(uint64_t offset,

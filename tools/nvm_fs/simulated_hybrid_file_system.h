@@ -18,6 +18,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+class SimulatedFsLatencyMonitor;
+
 struct SimulatedStorageModelOptions {
   // XP-like NVM simulation model:
   // delay_ns = ceil(bytes / xp_line_bytes) * xp_latency_ns.
@@ -95,6 +97,22 @@ struct SimulatedStorageModelOptions {
   std::unordered_set<int> target_levels;
   // Optional output path for model statistics (key=value).
   std::string stats_file;
+
+  // Optional time-series latency monitor (CSV).
+  // Intended for correlating workload bursts with storage-side tail latency.
+  bool monitor_enable = false;
+  // Fixed window size in microseconds. Typical: 1000000 (1s).
+  uint64_t monitor_window_us = 1000000;
+  // Optional stage window size in seconds (e.g., align to mix_shift_stage_seconds).
+  // 0 disables stage aggregation output.
+  uint64_t monitor_stage_seconds = 0;
+  // Track per-window max latency for specific op types.
+  bool monitor_max_read = true;
+  bool monitor_max_open = true;
+  bool monitor_max_prefetch = true;
+  // Output CSV paths. Empty disables writing that stream.
+  std::string monitor_window_csv;
+  std::string monitor_stage_csv;
 };
 
 struct SimulatedStorageModelStats {
@@ -125,6 +143,17 @@ struct SimulatedStorageModelStats {
   // verification).
   std::atomic<uint64_t> tmpfs_read_opens{0};
   std::atomic<uint64_t> tmpfs_write_opens{0};
+
+  // When tmpfs redirection is enabled, approximate how many read/prefetch ops
+  // are served from tmpfs vs the base filesystem (based on resolved open path).
+  std::atomic<uint64_t> tmpfs_read_ops{0};
+  std::atomic<uint64_t> tmpfs_read_bytes{0};
+  std::atomic<uint64_t> base_read_ops{0};
+  std::atomic<uint64_t> base_read_bytes{0};
+  std::atomic<uint64_t> tmpfs_prefetch_ops{0};
+  std::atomic<uint64_t> tmpfs_prefetch_bytes{0};
+  std::atomic<uint64_t> base_prefetch_ops{0};
+  std::atomic<uint64_t> base_prefetch_bytes{0};
 };
 
 // Profiling-only utility: override the current thread's simulated stream tag.
@@ -163,6 +192,8 @@ class SimulatedHybridFileSystem : public FileSystemWrapper {
   ~SimulatedHybridFileSystem() override;
 
  public:
+  static const char* kClassName() { return "SimulatedHybridFileSystem"; }
+
   IOStatus NewRandomAccessFile(const std::string& fname,
                                const FileOptions& file_opts,
                                std::unique_ptr<FSRandomAccessFile>* result,
@@ -218,7 +249,11 @@ class SimulatedHybridFileSystem : public FileSystemWrapper {
   IOStatus DeleteFile(const std::string& fname, const IOOptions& options,
                       IODebugContext* dbg) override;
 
-  const char* Name() const override { return name_.c_str(); }
+  const char* Name() const override { return kClassName(); }
+
+  // Best-effort: align monitor epoch with benchmark stage start.
+  // Calling this resets internal window/stage aggregations.
+  void SetMonitorStartTimeMicros(uint64_t start_us);
 
  private:
   // Limit 100 requests per second. Rate limiter is designed to byte but
@@ -232,6 +267,7 @@ class SimulatedHybridFileSystem : public FileSystemWrapper {
   bool is_full_fs_warm_;
   SimulatedStorageModelOptions model_options_;
   std::shared_ptr<SimulatedStorageModelStats> stats_;
+  std::shared_ptr<SimulatedFsLatencyMonitor> latency_monitor_;
 
   bool ShouldSimulatePath(const std::string& fname) const;
   bool IsTmpfsRedirectEnabled() const;
@@ -257,15 +293,19 @@ class SimulatedHybridRaf : public FSRandomAccessFileOwnerWrapper {
   SimulatedHybridRaf(std::unique_ptr<FSRandomAccessFile>&& t,
                      std::shared_ptr<RateLimiter> rate_limiter,
                      std::string file_name,
+                     bool is_tmpfs,
                      bool should_simulate,
                      const SimulatedStorageModelOptions& model_options,
-                     std::shared_ptr<SimulatedStorageModelStats> stats)
+                     std::shared_ptr<SimulatedStorageModelStats> stats,
+                     std::shared_ptr<SimulatedFsLatencyMonitor> monitor)
       : FSRandomAccessFileOwnerWrapper(std::move(t)),
         rate_limiter_(rate_limiter),
         file_name_(std::move(file_name)),
+        is_tmpfs_(is_tmpfs),
         should_simulate_(should_simulate),
         model_options_(model_options),
-        stats_(std::move(stats)) {}
+        stats_(std::move(stats)),
+        monitor_(std::move(monitor)) {}
 
   ~SimulatedHybridRaf() override {}
 
@@ -282,9 +322,11 @@ class SimulatedHybridRaf : public FSRandomAccessFileOwnerWrapper {
  private:
   std::shared_ptr<RateLimiter> rate_limiter_;
   std::string file_name_;
+  bool is_tmpfs_;
   bool should_simulate_;
   SimulatedStorageModelOptions model_options_;
   std::shared_ptr<SimulatedStorageModelStats> stats_;
+  std::shared_ptr<SimulatedFsLatencyMonitor> monitor_;
 
   void SimulateIOWait(uint64_t offset, uint64_t logical_bytes) const;
 };

@@ -828,13 +828,23 @@ def plot_phase_component_share_distribution(
 
     for ax, lb in zip(axes, labels):
         data = per_label_data[lb]
-        bp = ax.boxplot(
-            data,
-            tick_labels=stages,
-            showfliers=False,
-            patch_artist=True,
-            medianprops={"color": "#111111", "linewidth": 1.0},
-        )
+        # Matplotlib compatibility: older versions use "labels=", newer accepts "tick_labels=".
+        try:
+            bp = ax.boxplot(
+                data,
+                tick_labels=stages,
+                showfliers=False,
+                patch_artist=True,
+                medianprops={"color": "#111111", "linewidth": 1.0},
+            )
+        except TypeError:
+            bp = ax.boxplot(
+                data,
+                labels=stages,
+                showfliers=False,
+                patch_artist=True,
+                medianprops={"color": "#111111", "linewidth": 1.0},
+            )
         for patch, st in zip(bp["boxes"], stages):
             patch.set_facecolor(STAGE_COLORS.get(st, "#cccccc"))
             patch.set_alpha(0.85)

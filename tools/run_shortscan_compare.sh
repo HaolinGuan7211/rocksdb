@@ -27,16 +27,21 @@ VALUE_SIZE="${VALUE_SIZE:-256}"
 COMPRESSION_TYPE="${COMPRESSION_TYPE:-none}"
 USE_DIRECT="${USE_DIRECT:-true}"
 SKIP_FILL="${SKIP_FILL:-0}"
+FILL_BENCHMARK="${FILL_BENCHMARK:-fillrandom}" # fillrandom | fillseq | fillseqdeterministic | filluniquerandom
 ISOLATE_BY_CACHE="${ISOLATE_BY_CACHE:-1}"
 EXTRA_DB_BENCH_ARGS="${EXTRA_DB_BENCH_ARGS:-}"
 CLEAR_OS_CACHE_BETWEEN_STEPS="${CLEAR_OS_CACHE_BETWEEN_STEPS:-0}"
 DROP_CACHE_CMD="${DROP_CACHE_CMD:-}"
 AUTO_POST_PROCESS="${AUTO_POST_PROCESS:-1}"
 PLOT_SCRIPT="${PLOT_SCRIPT:-$ROOT_DIR/tools/plot_shortscan_results.py}"
+RUN_ONLY_MIXGRAPH="${RUN_ONLY_MIXGRAPH:-0}"
+MIXGRAPH_DURATION_SECONDS="${MIXGRAPH_DURATION_SECONDS:-0}"
 
 MIX_GET_RATIO="${MIX_GET_RATIO:-0.10}"
 MIX_PUT_RATIO="${MIX_PUT_RATIO:-0.05}"
 MIX_SEEK_RATIO="${MIX_SEEK_RATIO:-0.85}"
+MIX_MULTIGET_RATIO="${MIX_MULTIGET_RATIO:-0.0}"
+MIX_MULTIGET_BATCH="${MIX_MULTIGET_BATCH:-16}"
 MIX_KEY_DIST_A="${MIX_KEY_DIST_A:-0.0016}"
 MIX_KEY_DIST_B="${MIX_KEY_DIST_B:--0.71}"
 MIX_KEYRANGE_DIST_A="${MIX_KEYRANGE_DIST_A:-14.18}"
@@ -63,6 +68,32 @@ MIX_ITER_K="${MIX_ITER_K:-0.08}"
 MIX_ITER_SIGMA="${MIX_ITER_SIGMA:-1.75}"
 MIX_ITER_THETA="${MIX_ITER_THETA:-0}"
 
+MIX_BURST_ENABLE="${MIX_BURST_ENABLE:-0}"
+MIX_BURST_INTERVAL_OPS="${MIX_BURST_INTERVAL_OPS:-0}"
+MIX_BURST_SCAN_NEXTS="${MIX_BURST_SCAN_NEXTS:-0}"
+MIX_BURST_COLD_RANGES_ONLY="${MIX_BURST_COLD_RANGES_ONLY:-1}"
+MIX_BURST_LOG="${MIX_BURST_LOG:-0}"
+
+MIX_MONITOR_ENABLE="${MIX_MONITOR_ENABLE:-0}"
+MIX_MONITOR_WINDOW_US="${MIX_MONITOR_WINDOW_US:-1000000}"
+MIX_PROBE_ENABLE="${MIX_PROBE_ENABLE:-0}"
+MIX_PROBE_INTERVAL_OPS="${MIX_PROBE_INTERVAL_OPS:-0}"
+MIX_PROBE_READS="${MIX_PROBE_READS:-0}"
+
+SIMFS_MONITOR_ENABLE="${SIMFS_MONITOR_ENABLE:-0}"
+SIMFS_MONITOR_WINDOW_US="${SIMFS_MONITOR_WINDOW_US:-1000000}"
+SIMFS_MONITOR_STAGE_SECONDS="${SIMFS_MONITOR_STAGE_SECONDS:-0}"
+SIMFS_MONITOR_MAX_READ="${SIMFS_MONITOR_MAX_READ:-1}"
+SIMFS_MONITOR_MAX_OPEN="${SIMFS_MONITOR_MAX_OPEN:-1}"
+SIMFS_MONITOR_MAX_PREFETCH="${SIMFS_MONITOR_MAX_PREFETCH:-1}"
+
+# Tail probe (P99 composition) capture for mixgraph seeks/reads.
+TAIL_PROBE_ENABLE="${TAIL_PROBE_ENABLE:-0}"
+TAIL_PROBE_THRESHOLD_US="${TAIL_PROBE_THRESHOLD_US:-0}"
+TAIL_PROBE_MAX_SAMPLES="${TAIL_PROBE_MAX_SAMPLES:-20000}"
+TAIL_PROBE_CASE_LABEL="${TAIL_PROBE_CASE_LABEL:-}"
+TAIL_PROBE_SCENARIO="${TAIL_PROBE_SCENARIO:-mixgraph}"
+
 EXPERIMENT_TITLE="${EXPERIMENT_TITLE:-RocksDB shortscan benchmark}"
 EXPERIMENT_OBJECTIVE="${EXPERIMENT_OBJECTIVE:-在当前文件格式与读模式下，验证装载与 seek 行为是否符合预期。}"
 EXPERIMENT_VARIABLES="${EXPERIMENT_VARIABLES:-cache_size,read_mode,seek_nexts,mix_ratio}"
@@ -84,6 +115,11 @@ if [[ -n "$EXTRA_DB_BENCH_ARGS" ]]; then
   # Intentionally split on spaces so callers can pass extra db_bench flags.
   # shellcheck disable=SC2206
   EXTRA_ARGS_ARRAY=($EXTRA_DB_BENCH_ARGS)
+fi
+
+MIXGRAPH_DURATION_ARGS=()
+if [[ "$MIXGRAPH_DURATION_SECONDS" != "0" ]]; then
+  MIXGRAPH_DURATION_ARGS+=(--duration="$MIXGRAPH_DURATION_SECONDS")
 fi
 
 BASE_NUM_KEYS=50000000
@@ -134,10 +170,24 @@ mapfile -t CACHE_SIZE_ARRAY < <(echo "$CACHE_SIZES" | tr ',' '\n')
 run_step() {
   local name="$1"
   shift
+  local args=("$@")
+  if [[ "$SKIP_FILL" == "1" ]]; then
+    local is_fill=0
+    local a
+    for a in "${args[@]}"; do
+      if [[ "$a" == --benchmarks=fillrandom* ]]; then
+        is_fill=1
+        break
+      fi
+    done
+    if [[ "$is_fill" == "0" ]]; then
+      args+=(--readonly=1 --disable_auto_compactions=1)
+    fi
+  fi
   local log_file="$OUT_DIR/${name}.log"
   echo "[$(date '+%F %T')] START $name" | tee -a "$OUT_DIR/runner.log"
-  echo "$DB_BENCH $* ${EXTRA_ARGS_ARRAY[*]}" >"$OUT_DIR/${name}.cmd"
-  "$DB_BENCH" "$@" "${EXTRA_ARGS_ARRAY[@]}" 2>&1 | tee "$log_file"
+  echo "$DB_BENCH ${args[*]} ${EXTRA_ARGS_ARRAY[*]}" >"$OUT_DIR/${name}.cmd"
+  "$DB_BENCH" "${args[@]}" "${EXTRA_ARGS_ARRAY[@]}" 2>&1 | tee "$log_file"
   echo "[$(date '+%F %T')] END   $name" | tee -a "$OUT_DIR/runner.log"
 }
 
@@ -201,6 +251,7 @@ write_experiment_plan_doc() {
 ## 负载计划
 - mixgraph: reads=$REALISTIC_READS per-thread, ratio(get/put/seek)=$MIX_GET_RATIO/$MIX_PUT_RATIO/$MIX_SEEK_RATIO
 - mixgraph_locality: key_dist=($MIX_KEY_DIST_A,$MIX_KEY_DIST_B), keyrange_dist=($MIX_KEYRANGE_DIST_A,$MIX_KEYRANGE_DIST_B,$MIX_KEYRANGE_DIST_C,$MIX_KEYRANGE_DIST_D), keyrange_num=$MIX_KEYRANGE_NUM, hot_keyranges=$MIX_HOT_KEYRANGE_COUNT, hotset=(enable=$MIX_HOTSET_ENABLE,range_pct=$MIX_HOTSET_RANGE_PCT,range_access_pct=$MIX_HOTSET_RANGE_ACCESS_PCT,range_zipf_theta=$MIX_HOTSET_RANGE_ZIPF_THETA,key_pct=$MIX_HOTSET_KEY_PCT,key_access_pct=$MIX_HOTSET_KEY_ACCESS_PCT,evenly_spread=$MIX_HOTSET_EVENLY_SPREAD_RANGES), shift=(enable=$MIX_SHIFT_ENABLE,mode=$MIX_SHIFT_MODE,stage_seconds=$MIX_SHIFT_STAGE_SECONDS,stride_ranges=$MIX_SHIFT_STRIDE_RANGES,jump_multiplier=$MIX_SHIFT_JUMP_MULTIPLIER,base_start_range=$MIX_SHIFT_BASE_START_RANGE,log_transitions=$MIX_SHIFT_LOG_STAGE_TRANSITIONS), iter=($MIX_ITER_K,$MIX_ITER_SIGMA,$MIX_ITER_THETA)
+- mixgraph_burst: enable=$MIX_BURST_ENABLE, interval_ops=$MIX_BURST_INTERVAL_OPS, scan_nexts=$MIX_BURST_SCAN_NEXTS, cold_ranges_only=$MIX_BURST_COLD_RANGES_ONLY, log=$MIX_BURST_LOG
 - seek200: reads=$STEP200_READS per-thread, seek_nexts=200
 - worst_locality: seek_nexts={1,4,20,200,10000}, reads={$WORST_READS_1,$WORST_READS_4,$WORST_READS_20,$WORST_READS_200,$WORST_READS_10000}
 
@@ -256,6 +307,7 @@ CLEAR_OS_CACHE_BETWEEN_STEPS=$CLEAR_OS_CACHE_BETWEEN_STEPS
 DROP_CACHE_CMD=$DROP_CACHE_CMD
 AUTO_POST_PROCESS=$AUTO_POST_PROCESS
 PLOT_SCRIPT=$PLOT_SCRIPT
+RUN_ONLY_MIXGRAPH=$RUN_ONLY_MIXGRAPH
 MIX_GET_RATIO=$MIX_GET_RATIO
 MIX_PUT_RATIO=$MIX_PUT_RATIO
 MIX_SEEK_RATIO=$MIX_SEEK_RATIO
@@ -267,9 +319,28 @@ MIX_KEYRANGE_DIST_C=$MIX_KEYRANGE_DIST_C
 MIX_KEYRANGE_DIST_D=$MIX_KEYRANGE_DIST_D
 MIX_KEYRANGE_NUM=$MIX_KEYRANGE_NUM
 MIX_HOT_KEYRANGE_COUNT=$MIX_HOT_KEYRANGE_COUNT
+MIX_HOTSET_ENABLE=$MIX_HOTSET_ENABLE
+MIX_HOTSET_RANGE_PCT=$MIX_HOTSET_RANGE_PCT
+MIX_HOTSET_RANGE_ACCESS_PCT=$MIX_HOTSET_RANGE_ACCESS_PCT
+MIX_HOTSET_RANGE_ZIPF_THETA=$MIX_HOTSET_RANGE_ZIPF_THETA
+MIX_HOTSET_KEY_PCT=$MIX_HOTSET_KEY_PCT
+MIX_HOTSET_KEY_ACCESS_PCT=$MIX_HOTSET_KEY_ACCESS_PCT
+MIX_HOTSET_EVENLY_SPREAD_RANGES=$MIX_HOTSET_EVENLY_SPREAD_RANGES
+MIX_SHIFT_ENABLE=$MIX_SHIFT_ENABLE
+MIX_SHIFT_MODE=$MIX_SHIFT_MODE
+MIX_SHIFT_STAGE_SECONDS=$MIX_SHIFT_STAGE_SECONDS
+MIX_SHIFT_STRIDE_RANGES=$MIX_SHIFT_STRIDE_RANGES
+MIX_SHIFT_JUMP_MULTIPLIER=$MIX_SHIFT_JUMP_MULTIPLIER
+MIX_SHIFT_BASE_START_RANGE=$MIX_SHIFT_BASE_START_RANGE
+MIX_SHIFT_LOG_STAGE_TRANSITIONS=$MIX_SHIFT_LOG_STAGE_TRANSITIONS
 MIX_ITER_K=$MIX_ITER_K
 MIX_ITER_SIGMA=$MIX_ITER_SIGMA
 MIX_ITER_THETA=$MIX_ITER_THETA
+MIX_BURST_ENABLE=$MIX_BURST_ENABLE
+MIX_BURST_INTERVAL_OPS=$MIX_BURST_INTERVAL_OPS
+MIX_BURST_SCAN_NEXTS=$MIX_BURST_SCAN_NEXTS
+MIX_BURST_COLD_RANGES_ONLY=$MIX_BURST_COLD_RANGES_ONLY
+MIX_BURST_LOG=$MIX_BURST_LOG
 EXPERIMENT_TITLE=$EXPERIMENT_TITLE
 EXPERIMENT_OBJECTIVE=$EXPERIMENT_OBJECTIVE
 EXPERIMENT_VARIABLES=$EXPERIMENT_VARIABLES
@@ -311,7 +382,7 @@ else
   run_step "01_fillrandom" \
     --db="$fill_db" \
     --wal_dir="$fill_wal" \
-    --benchmarks=fillrandom,stats \
+    --benchmarks="${FILL_BENCHMARK}",stats \
     --statistics \
     --num="$NUM_KEYS" \
     --key_size="$KEY_SIZE" \
@@ -345,6 +416,24 @@ for cache_size in "${CACHE_SIZE_ARRAY[@]}"; do
   fi
 
   drop_os_cache "02_mixgraph_cache_${cache_size}"
+  mix_monitor_cache_csv=""
+  mix_monitor_stage_csv=""
+  mix_monitor_events_csv=""
+  if [[ "$MIX_MONITOR_ENABLE" == "1" ]]; then
+    mix_monitor_cache_csv="$OUT_DIR/02_mixgraph_cache_${cache_size}.mix_monitor_window.csv"
+    mix_monitor_stage_csv="$OUT_DIR/02_mixgraph_cache_${cache_size}.mix_monitor_stage.csv"
+    mix_monitor_events_csv="$OUT_DIR/02_mixgraph_cache_${cache_size}.mix_events.csv"
+  fi
+  simfs_window_csv=""
+  simfs_stage_csv=""
+  if [[ "$SIMFS_MONITOR_ENABLE" == "1" ]]; then
+    simfs_window_csv="$OUT_DIR/02_mixgraph_cache_${cache_size}.simfs_window.csv"
+    simfs_stage_csv="$OUT_DIR/02_mixgraph_cache_${cache_size}.simfs_stage.csv"
+  fi
+  tail_probe_csv=""
+  if [[ "$TAIL_PROBE_ENABLE" == "1" ]]; then
+    tail_probe_csv="$OUT_DIR/02_mixgraph_cache_${cache_size}.tail_probe.csv"
+  fi
   run_step "02_mixgraph_cache_${cache_size}" \
     --db="$current_db" \
     --wal_dir="$current_wal" \
@@ -353,6 +442,7 @@ for cache_size in "${CACHE_SIZE_ARRAY[@]}"; do
     --statistics \
     --num="$NUM_KEYS" \
     --reads="$REALISTIC_READS" \
+    "${MIXGRAPH_DURATION_ARGS[@]}" \
     --threads="$THREADS" \
     --key_size="$KEY_SIZE" \
     --compression_type="$COMPRESSION_TYPE" \
@@ -380,7 +470,45 @@ for cache_size in "${CACHE_SIZE_ARRAY[@]}"; do
     --mix_shift_base_start_range="$MIX_SHIFT_BASE_START_RANGE" \
     --mix_shift_log_stage_transitions="$MIX_SHIFT_LOG_STAGE_TRANSITIONS" \
     --iter_k="$MIX_ITER_K" --iter_sigma="$MIX_ITER_SIGMA" --iter_theta="$MIX_ITER_THETA" \
-    --mix_get_ratio="$MIX_GET_RATIO" --mix_put_ratio="$MIX_PUT_RATIO" --mix_seek_ratio="$MIX_SEEK_RATIO"
+    --mix_burst_enable="$MIX_BURST_ENABLE" \
+    --mix_burst_interval_ops="$MIX_BURST_INTERVAL_OPS" \
+    --mix_burst_scan_nexts="$MIX_BURST_SCAN_NEXTS" \
+    --mix_burst_cold_ranges_only="$MIX_BURST_COLD_RANGES_ONLY" \
+    --mix_burst_log="$MIX_BURST_LOG" \
+    --mix_monitor_enable="$MIX_MONITOR_ENABLE" \
+    --mix_monitor_window_us="$MIX_MONITOR_WINDOW_US" \
+    --mix_monitor_cache_csv="$mix_monitor_cache_csv" \
+    --mix_monitor_stage_csv="$mix_monitor_stage_csv" \
+    --mix_monitor_events_csv="$mix_monitor_events_csv" \
+    --mix_probe_enable="$MIX_PROBE_ENABLE" \
+    --mix_probe_interval_ops="$MIX_PROBE_INTERVAL_OPS" \
+    --mix_probe_reads="$MIX_PROBE_READS" \
+    --simulate_xp_monitor_enable="$SIMFS_MONITOR_ENABLE" \
+    --simulate_xp_monitor_window_us="$SIMFS_MONITOR_WINDOW_US" \
+    --simulate_xp_monitor_stage_seconds="$SIMFS_MONITOR_STAGE_SECONDS" \
+    --simulate_xp_monitor_max_read="$SIMFS_MONITOR_MAX_READ" \
+    --simulate_xp_monitor_max_open="$SIMFS_MONITOR_MAX_OPEN" \
+    --simulate_xp_monitor_max_prefetch="$SIMFS_MONITOR_MAX_PREFETCH" \
+    --simulate_xp_monitor_window_csv="$simfs_window_csv" \
+    --simulate_xp_monitor_stage_csv="$simfs_stage_csv" \
+    --mix_get_ratio="$MIX_GET_RATIO" --mix_put_ratio="$MIX_PUT_RATIO" --mix_seek_ratio="$MIX_SEEK_RATIO" \
+    --mix_multiget_ratio="$MIX_MULTIGET_RATIO" --mix_multiget_batch="$MIX_MULTIGET_BATCH" \
+    --tail_probe_output="$tail_probe_csv" \
+    --tail_probe_threshold_us="$TAIL_PROBE_THRESHOLD_US" \
+    --tail_probe_max_samples="$TAIL_PROBE_MAX_SAMPLES" \
+    --tail_probe_case_label="$TAIL_PROBE_CASE_LABEL" \
+    --tail_probe_scenario="$TAIL_PROBE_SCENARIO"
+
+  if [[ "$RUN_ONLY_MIXGRAPH" == "1" ]]; then
+    drop_os_cache "09_final_stats_cache_${cache_size}"
+    if [[ "$ISOLATE_BY_CACHE" == "1" ]]; then
+      run_step "09_final_stats_cache_${cache_size}" \
+        --db="$current_db" --wal_dir="$current_wal" --use_existing_db=1 \
+        --benchmarks=stats --statistics \
+        --compression_type="$COMPRESSION_TYPE"
+    fi
+    continue
+  fi
   drop_os_cache "03_seek200_cache_${cache_size}"
 
   run_step "03_seek200_cache_${cache_size}" \
