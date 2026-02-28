@@ -636,6 +636,25 @@ struct BlockBasedTableOptions {
   // tail latency.
   bool enable_super_block_read_coalescing = false;
 
+  // Experimental (thesis work): KV separation + B+Tree index SST format.
+  //
+  // When enabled, newly created SSTs may be written in an alternative layout
+  // where keys live in B+Tree index/leaf blocks and values live in separate
+  // value blocks. This is intended for controlled experiments only.
+  //
+  // NOTE: This is a construction-time option. Turning it off will not change
+  // the layout of already-written SSTs.
+  bool experimental_kvsep_bptree_enable = false;
+
+  // Target uncompressed bytes per leaf block (keys + value pointers).
+  uint64_t experimental_kvsep_bptree_leaf_block_bytes = 16 * 1024;
+
+  // Target uncompressed bytes per value block (values only).
+  uint64_t experimental_kvsep_bptree_value_block_bytes = 16 * 1024;
+
+  // Target maximum children per internal node (fanout).
+  uint32_t experimental_kvsep_bptree_fanout = 64;
+
   // This enum allows trading off increased index size for improved iterator
   // seek performance in some situations, particularly when block cache is
   // disabled (ReadOptions::fill_cache = false) and direct IO is
