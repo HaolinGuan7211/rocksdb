@@ -110,6 +110,8 @@ third-party/folly/
 # Local experiments (generated outputs; keep specs tracked)
 experiment/202*
 experiment/*.run.log
+experiment/*.log
+experiment/REBOOT_RESUME.md
 
 # Local tooling artifacts
 .codex_write_probe
