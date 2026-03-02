@@ -760,6 +760,21 @@ DEFINE_bool(experimental_kvsep_bptree_enable,
             "Experimental: enable KV-separation + B+Tree SST format. Requires "
             "rebuilding SSTs (clear DB + re-fill) to take effect.");
 
+DEFINE_bool(experimental_kvsep_bptree_pair_blocks,
+            ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                .experimental_kvsep_bptree_pair_blocks,
+            "Experimental: store KV-sep leaf + value bytes in a single on-disk "
+            "pair block and have the B+Tree index point to it (leaf format v3). "
+            "Requires rebuilding SSTs (clear DB + re-fill) to take effect.");
+
+DEFINE_bool(experimental_kvsep_bptree_superblock_align_pair_blocks,
+            ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                .experimental_kvsep_bptree_superblock_align_pair_blocks,
+            "Experimental: for KV-sep pair-block SSTs, pad the SST after each "
+            "pair block so the next pair block starts aligned to "
+            "super_block_alignment_size. Requires rebuilding SSTs (clear DB + "
+            "re-fill) to take effect.");
+
 DEFINE_uint64(experimental_kvsep_bptree_leaf_block_bytes,
               ROCKSDB_NAMESPACE::BlockBasedTableOptions()
                   .experimental_kvsep_bptree_leaf_block_bytes,
@@ -776,6 +791,29 @@ DEFINE_uint32(experimental_kvsep_bptree_fanout,
               ROCKSDB_NAMESPACE::BlockBasedTableOptions()
                   .experimental_kvsep_bptree_fanout,
               "Experimental: B+Tree internal node fanout for KV-sep SST.");
+
+DEFINE_bool(experimental_kvsep_bptree_leaf_prefix_compress,
+            ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                .experimental_kvsep_bptree_leaf_prefix_compress,
+            "Experimental: store a shared key prefix once per KV-sep leaf block "
+            "and store per-entry key suffix + (value_off,value_len) only. "
+            "Requires rebuilding SSTs (clear DB + re-fill) to take effect.");
+
+DEFINE_bool(experimental_kvsep_bptree_disable_compression,
+            ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                .experimental_kvsep_bptree_disable_compression,
+            "Experimental: disable compression for KV-sep blocks (leaf/value/"
+            "pair). This can improve cache=0 + direct IO experiments under "
+            "super-block aligned reads by avoiding decompress CPU while the "
+            "aligned read still pulls the full super-block anyway. Requires "
+            "rebuilding SSTs (clear DB + re-fill) to take effect.");
+
+DEFINE_bool(experimental_kvsep_bptree_multiget_leaf_grouping,
+            ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                .experimental_kvsep_bptree_multiget_leaf_grouping,
+            "Experimental: for KV-sep leaf v2 SSTs, group MultiGet keys by leaf "
+            "BlockHandle and reuse leaf parsing + per-leaf value-only block "
+            "reads. Set to false to use a per-key fallback (baseline) path.");
 
 DEFINE_int64(prepopulate_block_cache, 0,
              "Pre-populate hot/warm blocks in block cache. 0 to disable and 1 "
@@ -3114,6 +3152,28 @@ class MixGraphCacheSampler {
     uint64_t bytes_read = 0;
     uint64_t bytes_write = 0;
     uint64_t add_failures = 0;
+    uint64_t kvsep_leaf_cache_hit = 0;
+    uint64_t kvsep_leaf_cache_miss = 0;
+    uint64_t kvsep_leaf_file_reads = 0;
+    uint64_t kvsep_leaf_file_read_bytes = 0;
+    uint64_t kvsep_value_cache_hit = 0;
+    uint64_t kvsep_value_cache_miss = 0;
+    uint64_t kvsep_value_file_reads = 0;
+    uint64_t kvsep_value_file_read_bytes = 0;
+    uint64_t kvsep_pair_cache_hit = 0;
+    uint64_t kvsep_pair_cache_miss = 0;
+    uint64_t kvsep_pair_file_reads = 0;
+    uint64_t kvsep_pair_file_read_bytes = 0;
+    uint64_t kvsep_pair_file_reads_seek = 0;
+    uint64_t kvsep_pair_file_read_bytes_seek = 0;
+    uint64_t kvsep_pair_file_reads_scan = 0;
+    uint64_t kvsep_pair_file_read_bytes_scan = 0;
+    uint64_t kvsep_pair_file_reads_multiget = 0;
+    uint64_t kvsep_pair_file_read_bytes_multiget = 0;
+    uint64_t super_block_cache_hit = 0;
+    uint64_t super_block_cache_miss = 0;
+    uint64_t super_block_unusable_too_large = 0;
+    uint64_t super_block_unusable_cross_boundary = 0;
     uint64_t probe_ops = 0;
     uint64_t probe_hit = 0;
     uint64_t probe_incomplete = 0;
@@ -3133,6 +3193,50 @@ class MixGraphCacheSampler {
     s.bytes_read = stats_->getTickerCount(BLOCK_CACHE_BYTES_READ);
     s.bytes_write = stats_->getTickerCount(BLOCK_CACHE_BYTES_WRITE);
     s.add_failures = stats_->getTickerCount(BLOCK_CACHE_ADD_FAILURES);
+    s.kvsep_leaf_cache_hit =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_LEAF_CACHE_HIT);
+    s.kvsep_leaf_cache_miss =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_LEAF_CACHE_MISS);
+    s.kvsep_leaf_file_reads =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_LEAF_FILE_READS);
+    s.kvsep_leaf_file_read_bytes =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_LEAF_FILE_READ_BYTES);
+    s.kvsep_value_cache_hit =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_VALUE_CACHE_HIT);
+    s.kvsep_value_cache_miss =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_VALUE_CACHE_MISS);
+    s.kvsep_value_file_reads =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_VALUE_FILE_READS);
+    s.kvsep_value_file_read_bytes =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_VALUE_FILE_READ_BYTES);
+    s.kvsep_pair_cache_hit =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_PAIR_CACHE_HIT);
+    s.kvsep_pair_cache_miss =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_PAIR_CACHE_MISS);
+    s.kvsep_pair_file_reads =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READS);
+    s.kvsep_pair_file_read_bytes =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READ_BYTES);
+    s.kvsep_pair_file_reads_seek =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READS_SEEK);
+    s.kvsep_pair_file_read_bytes_seek = stats_->getTickerCount(
+        EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READ_BYTES_SEEK);
+    s.kvsep_pair_file_reads_scan =
+        stats_->getTickerCount(EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READS_SCAN);
+    s.kvsep_pair_file_read_bytes_scan = stats_->getTickerCount(
+        EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READ_BYTES_SCAN);
+    s.kvsep_pair_file_reads_multiget = stats_->getTickerCount(
+        EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READS_MULTIGET);
+    s.kvsep_pair_file_read_bytes_multiget = stats_->getTickerCount(
+        EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READ_BYTES_MULTIGET);
+    s.super_block_cache_hit =
+        stats_->getTickerCount(EXPERIMENTAL_SUPER_BLOCK_READ_CACHE_HIT);
+    s.super_block_cache_miss =
+        stats_->getTickerCount(EXPERIMENTAL_SUPER_BLOCK_READ_CACHE_MISS);
+    s.super_block_unusable_too_large = stats_->getTickerCount(
+        EXPERIMENTAL_SUPER_BLOCK_READ_UNUSABLE_TOO_LARGE);
+    s.super_block_unusable_cross_boundary = stats_->getTickerCount(
+        EXPERIMENTAL_SUPER_BLOCK_READ_UNUSABLE_CROSS_BOUNDARY);
     if (shared_) {
       s.probe_ops = shared_->probe_ops.load();
       s.probe_hit = shared_->probe_hit.load();
@@ -3155,6 +3259,46 @@ class MixGraphCacheSampler {
     d.bytes_read = b.bytes_read - a.bytes_read;
     d.bytes_write = b.bytes_write - a.bytes_write;
     d.add_failures = b.add_failures - a.add_failures;
+    d.kvsep_leaf_cache_hit = b.kvsep_leaf_cache_hit - a.kvsep_leaf_cache_hit;
+    d.kvsep_leaf_cache_miss = b.kvsep_leaf_cache_miss - a.kvsep_leaf_cache_miss;
+    d.kvsep_leaf_file_reads = b.kvsep_leaf_file_reads - a.kvsep_leaf_file_reads;
+    d.kvsep_leaf_file_read_bytes =
+        b.kvsep_leaf_file_read_bytes - a.kvsep_leaf_file_read_bytes;
+    d.kvsep_value_cache_hit = b.kvsep_value_cache_hit - a.kvsep_value_cache_hit;
+    d.kvsep_value_cache_miss =
+        b.kvsep_value_cache_miss - a.kvsep_value_cache_miss;
+    d.kvsep_value_file_reads =
+        b.kvsep_value_file_reads - a.kvsep_value_file_reads;
+    d.kvsep_value_file_read_bytes =
+        b.kvsep_value_file_read_bytes - a.kvsep_value_file_read_bytes;
+    d.kvsep_pair_cache_hit = b.kvsep_pair_cache_hit - a.kvsep_pair_cache_hit;
+    d.kvsep_pair_cache_miss =
+        b.kvsep_pair_cache_miss - a.kvsep_pair_cache_miss;
+    d.kvsep_pair_file_reads = b.kvsep_pair_file_reads - a.kvsep_pair_file_reads;
+    d.kvsep_pair_file_read_bytes =
+        b.kvsep_pair_file_read_bytes - a.kvsep_pair_file_read_bytes;
+    d.kvsep_pair_file_reads_seek =
+        b.kvsep_pair_file_reads_seek - a.kvsep_pair_file_reads_seek;
+    d.kvsep_pair_file_read_bytes_seek =
+        b.kvsep_pair_file_read_bytes_seek - a.kvsep_pair_file_read_bytes_seek;
+    d.kvsep_pair_file_reads_scan =
+        b.kvsep_pair_file_reads_scan - a.kvsep_pair_file_reads_scan;
+    d.kvsep_pair_file_read_bytes_scan =
+        b.kvsep_pair_file_read_bytes_scan - a.kvsep_pair_file_read_bytes_scan;
+    d.kvsep_pair_file_reads_multiget =
+        b.kvsep_pair_file_reads_multiget - a.kvsep_pair_file_reads_multiget;
+    d.kvsep_pair_file_read_bytes_multiget =
+        b.kvsep_pair_file_read_bytes_multiget -
+        a.kvsep_pair_file_read_bytes_multiget;
+    d.super_block_cache_hit =
+        b.super_block_cache_hit - a.super_block_cache_hit;
+    d.super_block_cache_miss =
+        b.super_block_cache_miss - a.super_block_cache_miss;
+    d.super_block_unusable_too_large =
+        b.super_block_unusable_too_large - a.super_block_unusable_too_large;
+    d.super_block_unusable_cross_boundary =
+        b.super_block_unusable_cross_boundary -
+        a.super_block_unusable_cross_boundary;
     d.probe_ops = b.probe_ops - a.probe_ops;
     d.probe_hit = b.probe_hit - a.probe_hit;
     d.probe_incomplete = b.probe_incomplete - a.probe_incomplete;
@@ -3173,6 +3317,18 @@ class MixGraphCacheSampler {
             << "wall_time_us,elapsed_us,window_id,shift_stage,"
                "block_cache_hit,block_cache_miss,data_hit,data_miss,"
                "data_bytes_insert,bytes_read,bytes_write,add_failures,"
+               "kvsep_leaf_cache_hit,kvsep_leaf_cache_miss,"
+               "kvsep_leaf_file_reads,kvsep_leaf_file_read_bytes,"
+               "kvsep_value_cache_hit,kvsep_value_cache_miss,"
+               "kvsep_value_file_reads,kvsep_value_file_read_bytes,"
+               "kvsep_pair_cache_hit,kvsep_pair_cache_miss,"
+               "kvsep_pair_file_reads,kvsep_pair_file_read_bytes,"
+               "kvsep_pair_file_reads_seek,kvsep_pair_file_read_bytes_seek,"
+               "kvsep_pair_file_reads_scan,kvsep_pair_file_read_bytes_scan,"
+               "kvsep_pair_file_reads_multiget,"
+               "kvsep_pair_file_read_bytes_multiget,"
+               "super_block_cache_hit,super_block_cache_miss,"
+               "super_block_unusable_too_large,super_block_unusable_cross_boundary,"
                "block_cache_usage,block_cache_pinned_usage,block_cache_capacity,"
                "burst_scans,burst_entries,probe_ops,probe_hit,probe_incomplete,"
                "probe_notfound,probe_error\n";
@@ -3185,6 +3341,18 @@ class MixGraphCacheSampler {
             << "stage_id,stage_start_us,stage_end_us,"
                "block_cache_hit,block_cache_miss,data_hit,data_miss,"
                "data_bytes_insert,bytes_read,bytes_write,add_failures,"
+               "kvsep_leaf_cache_hit,kvsep_leaf_cache_miss,"
+               "kvsep_leaf_file_reads,kvsep_leaf_file_read_bytes,"
+               "kvsep_value_cache_hit,kvsep_value_cache_miss,"
+               "kvsep_value_file_reads,kvsep_value_file_read_bytes,"
+               "kvsep_pair_cache_hit,kvsep_pair_cache_miss,"
+               "kvsep_pair_file_reads,kvsep_pair_file_read_bytes,"
+               "kvsep_pair_file_reads_seek,kvsep_pair_file_read_bytes_seek,"
+               "kvsep_pair_file_reads_scan,kvsep_pair_file_read_bytes_scan,"
+               "kvsep_pair_file_reads_multiget,"
+               "kvsep_pair_file_read_bytes_multiget,"
+               "super_block_cache_hit,super_block_cache_miss,"
+               "super_block_unusable_too_large,super_block_unusable_cross_boundary,"
                "burst_scans,burst_entries,probe_ops,probe_hit,probe_incomplete,"
                "probe_notfound,probe_error\n";
       }
@@ -3243,11 +3411,27 @@ class MixGraphCacheSampler {
                 << CurrentStage() << "," << d.block_cache_hit << ","
                 << d.block_cache_miss << "," << d.data_hit << "," << d.data_miss
                 << "," << d.data_bytes_insert << "," << d.bytes_read << ","
-                << d.bytes_write << "," << d.add_failures << "," << usage << ","
-                << pinned << "," << capacity << "," << d.burst_scans << ","
-                << d.burst_entries << "," << d.probe_ops << "," << d.probe_hit
-                << "," << d.probe_incomplete << "," << d.probe_notfound << ","
-                << d.probe_error << "\n";
+                << d.bytes_write << "," << d.add_failures << ","
+                << d.kvsep_leaf_cache_hit << "," << d.kvsep_leaf_cache_miss << ","
+                << d.kvsep_leaf_file_reads << "," << d.kvsep_leaf_file_read_bytes
+                << "," << d.kvsep_value_cache_hit << ","
+                << d.kvsep_value_cache_miss << "," << d.kvsep_value_file_reads
+                << "," << d.kvsep_value_file_read_bytes << ","
+                << d.kvsep_pair_cache_hit << "," << d.kvsep_pair_cache_miss << ","
+                << d.kvsep_pair_file_reads << "," << d.kvsep_pair_file_read_bytes
+                << "," << d.kvsep_pair_file_reads_seek << ","
+                << d.kvsep_pair_file_read_bytes_seek << ","
+                << d.kvsep_pair_file_reads_scan << ","
+                << d.kvsep_pair_file_read_bytes_scan << ","
+                << d.kvsep_pair_file_reads_multiget << ","
+                << d.kvsep_pair_file_read_bytes_multiget << ","
+                << d.super_block_cache_hit << "," << d.super_block_cache_miss
+                << "," << d.super_block_unusable_too_large << ","
+                << d.super_block_unusable_cross_boundary
+                << "," << usage << "," << pinned << "," << capacity << ","
+                << d.burst_scans << "," << d.burst_entries << "," << d.probe_ops
+                << "," << d.probe_hit << "," << d.probe_incomplete << ","
+                << d.probe_notfound << "," << d.probe_error << "\n";
     last_window_id_ = target;
     window_out_.flush();
   }
@@ -3270,10 +3454,26 @@ class MixGraphCacheSampler {
                << "," << d.block_cache_hit << "," << d.block_cache_miss << ","
                << d.data_hit << "," << d.data_miss << "," << d.data_bytes_insert
                << "," << d.bytes_read << "," << d.bytes_write << ","
-               << d.add_failures << "," << d.burst_scans << ","
-               << d.burst_entries << "," << d.probe_ops << "," << d.probe_hit
-               << "," << d.probe_incomplete << "," << d.probe_notfound << ","
-               << d.probe_error << "\n";
+               << d.add_failures << "," << d.kvsep_leaf_cache_hit << ","
+               << d.kvsep_leaf_cache_miss << "," << d.kvsep_leaf_file_reads << ","
+               << d.kvsep_leaf_file_read_bytes << "," << d.kvsep_value_cache_hit
+               << "," << d.kvsep_value_cache_miss << ","
+               << d.kvsep_value_file_reads << ","
+               << d.kvsep_value_file_read_bytes << "," << d.kvsep_pair_cache_hit
+               << "," << d.kvsep_pair_cache_miss << "," << d.kvsep_pair_file_reads
+               << "," << d.kvsep_pair_file_read_bytes << ","
+               << d.kvsep_pair_file_reads_seek << ","
+               << d.kvsep_pair_file_read_bytes_seek << ","
+               << d.kvsep_pair_file_reads_scan << ","
+               << d.kvsep_pair_file_read_bytes_scan << ","
+               << d.kvsep_pair_file_reads_multiget << ","
+               << d.kvsep_pair_file_read_bytes_multiget << ","
+               << d.super_block_cache_hit << "," << d.super_block_cache_miss
+               << "," << d.super_block_unusable_too_large << ","
+               << d.super_block_unusable_cross_boundary << "," << d.burst_scans
+               << "," << d.burst_entries << "," << d.probe_ops << ","
+               << d.probe_hit << "," << d.probe_incomplete << ","
+               << d.probe_notfound << "," << d.probe_error << "\n";
     stage_out_.flush();
 
     last_stage_id_ = stage;
@@ -6070,12 +6270,22 @@ class Benchmark {
 
       block_based_options.experimental_kvsep_bptree_enable =
           FLAGS_experimental_kvsep_bptree_enable;
+      block_based_options.experimental_kvsep_bptree_pair_blocks =
+          FLAGS_experimental_kvsep_bptree_pair_blocks;
+      block_based_options.experimental_kvsep_bptree_superblock_align_pair_blocks =
+          FLAGS_experimental_kvsep_bptree_superblock_align_pair_blocks;
       block_based_options.experimental_kvsep_bptree_leaf_block_bytes =
           FLAGS_experimental_kvsep_bptree_leaf_block_bytes;
       block_based_options.experimental_kvsep_bptree_value_block_bytes =
           FLAGS_experimental_kvsep_bptree_value_block_bytes;
       block_based_options.experimental_kvsep_bptree_fanout =
           FLAGS_experimental_kvsep_bptree_fanout;
+      block_based_options.experimental_kvsep_bptree_leaf_prefix_compress =
+          FLAGS_experimental_kvsep_bptree_leaf_prefix_compress;
+      block_based_options.experimental_kvsep_bptree_disable_compression =
+          FLAGS_experimental_kvsep_bptree_disable_compression;
+      block_based_options.experimental_kvsep_bptree_multiget_leaf_grouping =
+          FLAGS_experimental_kvsep_bptree_multiget_leaf_grouping;
       block_based_options.whole_key_filtering = FLAGS_whole_key_filtering;
       block_based_options.max_auto_readahead_size =
           FLAGS_max_auto_readahead_size;

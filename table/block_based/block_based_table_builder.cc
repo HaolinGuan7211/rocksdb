@@ -813,12 +813,46 @@ struct BlockBasedTableBuilder::Rep {
   size_t alignment;
   BlockBuilder data_block;
   const bool experimental_kvsep_bptree_enable;
+  const bool kvsep_leaf_prefix_compress;
+  const bool kvsep_pair_blocks;
   const uint64_t kvsep_leaf_block_bytes;
   const uint64_t kvsep_value_block_bytes;
   std::string kvsep_value_block_buf;
-  std::vector<KVSepBptreeValueMapEntry> kvsep_value_map_entries;
+  struct KVSepPendingEntry {
+    std::string ikey;
+    uint32_t value_off = 0;
+    uint32_t value_len = 0;
+  };
+  std::vector<KVSepPendingEntry> kvsep_pending_entries;
+  size_t kvsep_pending_leaf_bytes = 0;
+  std::string kvsep_first_ikey_in_pending_block;
+  // For KV-sep pair blocks (leaf format v3), `kvsep_pending_leaf_bytes` is
+  // intended to approximate the on-disk leaf metadata payload size (keys +
+  // per-entry value offsets/lengths), not the v1/v2 pointer-heavy estimate.
+  // Maintain a tighter estimate to avoid flushing pair blocks too early (which
+  // increases block count and simfs read amplification under cache=0).
+  uint32_t kvsep_pending_leaf_v3_prefix_len = 0;
+  size_t kvsep_pending_leaf_v3_suffix_bytes = 0;
+
+  struct KVSepDataBlockDesc {
+    BlockHandle handle;
+    std::string first_ikey;
+    std::string last_ikey;
+  };
+  // KV-sep leaf blocks: each "leaf" is stored as an index-typed block that
+  // contains internal keys mapped to value pointers. The B+tree internal nodes
+  // then point to these leaf blocks (so a point Get/Seek does not need to read
+  // an additional data block to locate the value pointer).
+  std::vector<KVSepDataBlockDesc> kvsep_data_blocks;
+
+  // B+tree index construction-time config and stats (over leaf blocks).
+  const uint32_t kvsep_index_fanout;
+  uint32_t kvsep_bptree_index_levels = 1;
+  uint64_t kvsep_bptree_index_bytes_written = 0;
   uint64_t kvsep_value_blocks_written = 0;
   uint64_t kvsep_value_bytes_written = 0;
+  uint64_t kvsep_pair_blocks_written = 0;
+  uint64_t kvsep_pair_bytes_written = 0;
   // Buffers uncompressed data blocks to replay later. Needed when
   // compression dictionary is enabled so we can finalize the dictionary before
   // compressing any data blocks.
@@ -1049,9 +1083,13 @@ struct BlockBasedTableBuilder::Rep {
                    persist_user_defined_timestamps),
         experimental_kvsep_bptree_enable(
             table_opt.experimental_kvsep_bptree_enable),
+        kvsep_leaf_prefix_compress(
+            table_opt.experimental_kvsep_bptree_leaf_prefix_compress),
+        kvsep_pair_blocks(table_opt.experimental_kvsep_bptree_pair_blocks),
         kvsep_leaf_block_bytes(table_opt.experimental_kvsep_bptree_leaf_block_bytes),
         kvsep_value_block_bytes(
             table_opt.experimental_kvsep_bptree_value_block_bytes),
+        kvsep_index_fanout(table_opt.experimental_kvsep_bptree_fanout),
         range_del_block(
             1 /* block_restart_interval */, true /* use_delta_encoding */,
             false /* use_value_delta_encoding */,
@@ -1105,6 +1143,8 @@ struct BlockBasedTableBuilder::Rep {
         CompressionOptionsToString(tbo.compression_opts);
     if (experimental_kvsep_bptree_enable) {
       props.user_collected_properties[kKVSepBptreeTablePropertyKey] = "1";
+      props.user_collected_properties[kKVSepBptreeLeafFormatVersionPropertyKey] =
+          kvsep_pair_blocks ? "3" : (kvsep_leaf_prefix_compress ? "2" : "1");
       props.user_collected_properties
           ["rocksdb.experimental.kvsep_bptree.leaf_block_bytes"] =
               std::to_string(kvsep_leaf_block_bytes);
@@ -1112,7 +1152,13 @@ struct BlockBasedTableBuilder::Rep {
           ["rocksdb.experimental.kvsep_bptree.value_block_bytes"] =
               std::to_string(kvsep_value_block_bytes);
       props.user_collected_properties["rocksdb.experimental.kvsep_bptree.note"] =
-          "keys in data blocks, values in kKVSepValue blocks";
+          kvsep_pair_blocks
+              ? "keys+values in coalesced kKVSepPair blocks; internal index points to pair blocks"
+              : "keys in leaf index blocks, values in kKVSepValue blocks";
+      if (kvsep_pair_blocks && !kvsep_leaf_prefix_compress) {
+        SetStatus(Status::NotSupported(
+            "kvsep_bptree pair blocks require kvsep leaf prefix compression"));
+      }
     }
 
     auto* mgr = tbo.moptions.compression_manager.get();
@@ -1463,6 +1509,39 @@ struct BlockBasedTableBuilder::Rep {
   IOStatus io_status;
 };
 
+namespace {
+
+inline uint32_t CommonPrefixLen(const Slice& a, const Slice& b) {
+  const size_t n = std::min(a.size(), b.size());
+  uint32_t i = 0;
+  for (; i < n; ++i) {
+    if (a.data()[i] != b.data()[i]) {
+      break;
+    }
+  }
+  return i;
+}
+
+// Estimated bytes of KV-sep leaf v3 payload (not including outer pair header).
+inline size_t EstimateKVSepLeafV3Bytes(uint32_t prefix_len, uint32_t num_entries,
+                                      size_t suffix_bytes_sum) {
+  // Leaf payload layout (see kvsep_bptree_format.h):
+  //   fixed32 version
+  //   varint32 prefix_len + prefix bytes
+  //   fixed32 num_entries
+  //   (n+1) * fixed32 suffix_offsets
+  //   n * fixed32 value_off
+  //   n * fixed32 value_len
+  //   concatenated suffix bytes
+  const size_t header = 4 + VarintLength(prefix_len) +
+                        static_cast<size_t>(prefix_len) + 4;
+  const size_t offsets = (static_cast<size_t>(num_entries) + 1) * 4;
+  const size_t vals = static_cast<size_t>(num_entries) * 8;
+  return header + offsets + vals + suffix_bytes_sum;
+}
+
+}  // namespace
+
 BlockBasedTableBuilder::BlockBasedTableBuilder(
     const BlockBasedTableOptions& table_options, const TableBuilderOptions& tbo,
     WritableFileWriter* file) {
@@ -1521,11 +1600,7 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
     }
 #endif  // !NDEBUG
 
-    Slice value_for_data_block = value;
-    std::string kvsep_ptr;
     if (r->experimental_kvsep_bptree_enable) {
-      // Flush condition must account for (1) key+pointer leaf block size and
-      // (2) value block capacity.
       for (;;) {
         const size_t value_off = r->kvsep_value_block_buf.size();
         if (UNLIKELY(value_off > std::numeric_limits<uint32_t>::max())) {
@@ -1536,23 +1611,102 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
           r->SetStatus(Status::InvalidArgument("kvsep value too large"));
           return;
         }
-        kvsep_ptr.clear();
-        PutVarint32(&kvsep_ptr, static_cast<uint32_t>(value_off));
-        PutVarint32(&kvsep_ptr, static_cast<uint32_t>(value.size()));
-
-        const bool need_flush =
-            !r->data_block.empty() &&
-            (r->data_block.EstimateSizeAfterKV(ikey, Slice(kvsep_ptr)) >
-                 r->kvsep_leaf_block_bytes ||
-             (value_off + value.size()) > r->kvsep_value_block_bytes);
+        bool need_flush = false;
+        if (r->kvsep_pair_blocks) {
+          // Pair blocks (leaf format v3): estimate leaf metadata size based on
+          // prefix-compressed key suffix bytes + fixed per-entry arrays. The
+          // previous v1/v2 pointer-based estimate overflows early and causes
+          // under-filled pair blocks.
+          const size_t n = r->kvsep_pending_entries.size();
+          uint32_t prefix_len = 0;
+          size_t suffix_bytes_sum = 0;
+          if (n == 0) {
+            // For a single key, prefix is the full key and suffix is empty.
+            prefix_len = static_cast<uint32_t>(ikey.size());
+            suffix_bytes_sum = 0;
+          } else {
+            // Prefix length for a sorted run is monotonically non-increasing as
+            // the last key grows. Be conservative in case of unexpected input.
+            const uint32_t common =
+                CommonPrefixLen(Slice(r->kvsep_first_ikey_in_pending_block), ikey);
+            prefix_len = std::min(r->kvsep_pending_leaf_v3_prefix_len, common);
+            suffix_bytes_sum = r->kvsep_pending_leaf_v3_suffix_bytes;
+            // If prefix shrank, every existing entry's suffix grows by delta.
+            if (prefix_len < r->kvsep_pending_leaf_v3_prefix_len) {
+              const uint32_t delta =
+                  r->kvsep_pending_leaf_v3_prefix_len - prefix_len;
+              suffix_bytes_sum += static_cast<size_t>(delta) * n;
+            }
+            // Add this entry's suffix bytes under the new prefix.
+            suffix_bytes_sum += ikey.size() - prefix_len;
+          }
+          const uint32_t new_n = static_cast<uint32_t>(n + 1);
+          const size_t leaf_bytes_est =
+              EstimateKVSepLeafV3Bytes(prefix_len, new_n, suffix_bytes_sum);
+          need_flush =
+              (n > 0) &&
+              (leaf_bytes_est > r->kvsep_leaf_block_bytes ||
+               (value_off + value.size()) > r->kvsep_value_block_bytes);
+        } else {
+          // Leaf v1/v2: Flush condition must account for (1) key+pointer leaf
+          // block size and (2) value block capacity.
+          const size_t ptr_est =
+              16 /*value block handle*/ +
+              VarintLength(static_cast<uint32_t>(value_off)) +
+              VarintLength(static_cast<uint32_t>(value.size()));
+          const size_t entry_est = ikey.size() + ptr_est + 8 /*overhead*/;
+          need_flush =
+              !r->kvsep_pending_entries.empty() &&
+              ((r->kvsep_pending_leaf_bytes + entry_est) >
+                   r->kvsep_leaf_block_bytes ||
+               (value_off + value.size()) > r->kvsep_value_block_bytes);
+        }
         if (need_flush) {
           Flush(/*first_key_in_next_block=*/&ikey);
           continue;
         }
+        if (r->kvsep_pending_entries.empty()) {
+          r->kvsep_first_ikey_in_pending_block.assign(ikey.data(), ikey.size());
+          r->kvsep_pending_leaf_bytes = 0;
+          r->kvsep_pending_leaf_v3_prefix_len =
+              static_cast<uint32_t>(ikey.size());
+          r->kvsep_pending_leaf_v3_suffix_bytes = 0;
+        }
         if (!value.empty()) {
           r->kvsep_value_block_buf.append(value.data(), value.size());
         }
-        value_for_data_block = Slice(kvsep_ptr);
+        Rep::KVSepPendingEntry e;
+        e.ikey.assign(ikey.data(), ikey.size());
+        e.value_off = static_cast<uint32_t>(value_off);
+        e.value_len = static_cast<uint32_t>(value.size());
+        r->kvsep_pending_entries.push_back(std::move(e));
+        if (r->kvsep_pair_blocks) {
+          const size_t n = r->kvsep_pending_entries.size();
+          const uint32_t common = CommonPrefixLen(
+              Slice(r->kvsep_first_ikey_in_pending_block), Slice(ikey));
+          const uint32_t new_prefix =
+              std::min(r->kvsep_pending_leaf_v3_prefix_len, common);
+          // If prefix shrank, each existing entry's suffix grows by delta.
+          if (new_prefix < r->kvsep_pending_leaf_v3_prefix_len) {
+            const uint32_t delta =
+                r->kvsep_pending_leaf_v3_prefix_len - new_prefix;
+            r->kvsep_pending_leaf_v3_suffix_bytes +=
+                static_cast<size_t>(delta) * (n - 1);
+            r->kvsep_pending_leaf_v3_prefix_len = new_prefix;
+          }
+          r->kvsep_pending_leaf_v3_suffix_bytes += ikey.size() - new_prefix;
+          r->kvsep_pending_leaf_bytes = EstimateKVSepLeafV3Bytes(
+              r->kvsep_pending_leaf_v3_prefix_len,
+              static_cast<uint32_t>(n),
+              r->kvsep_pending_leaf_v3_suffix_bytes);
+        } else {
+          const size_t ptr_est =
+              16 /*value block handle*/ +
+              VarintLength(static_cast<uint32_t>(value_off)) +
+              VarintLength(static_cast<uint32_t>(value.size()));
+          const size_t entry_est = ikey.size() + ptr_est + 8 /*overhead*/;
+          r->kvsep_pending_leaf_bytes += entry_est;
+        }
         break;
       }
     } else {
@@ -1577,14 +1731,18 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
       }
     }
 
-    r->data_block.AddWithLastKey(ikey, value_for_data_block, r->last_ikey);
+    if (!r->experimental_kvsep_bptree_enable) {
+      r->data_block.AddWithLastKey(ikey, value, r->last_ikey);
+    }
     r->last_ikey.assign(ikey.data(), ikey.size());
     assert(!r->last_ikey.empty());
     if (r->state == Rep::State::kBuffered) {
       // Buffered keys will be replayed from data_block_buffers during
       // `Finish()` once compression dictionary has been finalized.
     } else {
-      r->index_builder->OnKeyAdded(ikey, value);
+      if (!r->experimental_kvsep_bptree_enable) {
+        r->index_builder->OnKeyAdded(ikey, value);
+      }
     }
     // TODO offset passed in is not accurate for parallel compression case
     NotifyCollectTableCollectorsOnAdd(ikey, value, r->get_offset(),
@@ -1637,8 +1795,14 @@ void BlockBasedTableBuilder::Flush(const Slice* first_key_in_next_block) {
   if (UNLIKELY(!ok())) {
     return;
   }
-  if (r->data_block.empty()) {
-    return;
+  if (r->experimental_kvsep_bptree_enable) {
+    if (r->kvsep_pending_entries.empty()) {
+      return;
+    }
+  } else {
+    if (r->data_block.empty()) {
+      return;
+    }
   }
 
   if (UNLIKELY(r->experimental_kvsep_bptree_enable &&
@@ -1648,32 +1812,283 @@ void BlockBasedTableBuilder::Flush(const Slice* first_key_in_next_block) {
     return;
   }
 
-  BlockHandle kvsep_value_handle = BlockHandle::NullBlockHandle();
-  if (r->experimental_kvsep_bptree_enable && !r->kvsep_value_block_buf.empty()) {
-    // Value-only blocks are written separately from data blocks so that data
-    // blocks contain only keys + (value_offset,value_length) pointers.
-    Slice uncompressed_value_block(r->kvsep_value_block_buf);
-    CompressionType value_comp_type = kNoCompression;
-    Status compress_status = CompressAndVerifyBlock(
-        uncompressed_value_block, /*is_data_block=*/true,
-        r->data_block_working_area, &r->single_threaded_compressed_output,
-        &value_comp_type);
-    r->SetStatus(compress_status);
+  if (r->experimental_kvsep_bptree_enable) {
+    // KV-separation flush:
+    // Default (leaf v1/v2):
+    //   1) Write the value-only block (kKVSepValue).
+    //   2) Materialize and write the leaf as an index-typed block (kIndex)
+    //      containing internal keys -> (value_off,value_len) with a shared
+    //      value-block handle (v2) or embedded handle (v1 pointer encoding).
+    //
+    // Pair blocks (leaf v3):
+    //   1) Materialize leaf metadata (prefix+suffix+(value_off,value_len)).
+    //   2) Coalesce leaf metadata + value bytes into one block (kKVSepPair).
+    //
+    // This reduces one block read on point lookups by avoiding a second read
+    // for the value-only block.
+    if (UNLIKELY(r->kvsep_pair_blocks && !r->kvsep_leaf_prefix_compress)) {
+      r->SetStatus(Status::NotSupported(
+          "kvsep_bptree pair blocks require kvsep leaf prefix compression"));
+      return;
+    }
+
+    if (r->kvsep_pair_blocks) {
+      const std::string kvsep_first_ikey = r->kvsep_pending_entries.front().ikey;
+      const std::string kvsep_last_ikey = r->kvsep_pending_entries.back().ikey;
+
+      // Leaf V3 payload (prefix-compressed, no value block handle):
+      //   fixed32 version (=3)
+      //   varint32 prefix_len + prefix bytes
+      //   fixed32 num_entries
+      //   (n+1) * fixed32 suffix_offsets
+      //   n * fixed32 value_off
+      //   n * fixed32 value_len
+      //   concatenated suffix bytes
+      const std::string& first_key = r->kvsep_pending_entries.front().ikey;
+      const std::string& last_key = r->kvsep_pending_entries.back().ikey;
+      size_t min_len = std::min(first_key.size(), last_key.size());
+      uint32_t prefix_len = 0;
+      while (prefix_len < min_len && first_key[prefix_len] == last_key[prefix_len]) {
+        ++prefix_len;
+      }
+      Slice prefix(first_key.data(), prefix_len);
+
+      const uint32_t n =
+          static_cast<uint32_t>(r->kvsep_pending_entries.size());
+      std::vector<uint32_t> suffix_offsets;
+      suffix_offsets.reserve(static_cast<size_t>(n) + 1);
+      std::string suffix_bytes;
+      suffix_offsets.push_back(0);
+      for (const auto& e : r->kvsep_pending_entries) {
+        Slice ikey(e.ikey);
+        Slice suffix = ikey;
+        if (suffix.size() >= prefix.size() &&
+            memcmp(suffix.data(), prefix.data(), prefix.size()) == 0) {
+          suffix.remove_prefix(prefix.size());
+        }
+        if (UNLIKELY(suffix_bytes.size() + suffix.size() >
+                     std::numeric_limits<uint32_t>::max())) {
+          r->SetStatus(Status::Corruption("kvsep leaf v3 suffix bytes overflow"));
+          return;
+        }
+        suffix_bytes.append(suffix.data(), suffix.size());
+        suffix_offsets.push_back(
+            static_cast<uint32_t>(suffix_bytes.size()));
+      }
+
+      std::string leaf_buf;
+      leaf_buf.reserve(4 + VarintLength(prefix_len) + prefix_len + 4 +
+                       (static_cast<size_t>(n) + 1) * 4 +
+                       static_cast<size_t>(n) * 4 * 2 + suffix_bytes.size());
+      PutFixed32(&leaf_buf, 3u);
+      PutVarint32(&leaf_buf, prefix_len);
+      leaf_buf.append(prefix.data(), prefix.size());
+      PutFixed32(&leaf_buf, n);
+      for (uint32_t off : suffix_offsets) {
+        PutFixed32(&leaf_buf, off);
+      }
+      for (const auto& e : r->kvsep_pending_entries) {
+        PutFixed32(&leaf_buf, e.value_off);
+      }
+      for (const auto& e : r->kvsep_pending_entries) {
+        PutFixed32(&leaf_buf, e.value_len);
+      }
+      leaf_buf.append(suffix_bytes);
+
+      // Pair V3 block = header + leaf payload + value payload.
+      std::string pair_buf;
+      const uint32_t leaf_bytes = static_cast<uint32_t>(leaf_buf.size());
+      const uint32_t value_bytes =
+          static_cast<uint32_t>(r->kvsep_value_block_buf.size());
+      pair_buf.reserve(12 + leaf_buf.size() + r->kvsep_value_block_buf.size());
+      PutFixed32(&pair_buf, 3u);
+      PutFixed32(&pair_buf, leaf_bytes);
+      PutFixed32(&pair_buf, value_bytes);
+      pair_buf.append(leaf_buf);
+      pair_buf.append(r->kvsep_value_block_buf);
+      Slice uncompressed_pair(pair_buf);
+
+      CompressionType pair_comp_type = kNoCompression;
+      Slice pair_to_write = uncompressed_pair;
+      if (!r->table_options.experimental_kvsep_bptree_disable_compression) {
+        Status pair_compress_status = CompressAndVerifyBlock(
+            uncompressed_pair, /*is_data_block=*/true,
+            r->data_block_working_area, &r->single_threaded_compressed_output,
+            &pair_comp_type);
+        r->SetStatus(pair_compress_status);
+        if (UNLIKELY(!ok())) {
+          return;
+        }
+        if (pair_comp_type != kNoCompression) {
+          pair_to_write = Slice(r->single_threaded_compressed_output);
+        }
+      }
+
+      BlockHandle pair_handle;
+      WriteMaybeCompressedBlock(
+          pair_to_write, pair_comp_type, &pair_handle, BlockType::kKVSepPair,
+          &uncompressed_pair);
+      if (UNLIKELY(!ok())) {
+        return;
+      }
+      r->kvsep_pair_blocks_written++;
+      r->kvsep_pair_bytes_written += pair_to_write.size();
+
+      Rep::KVSepDataBlockDesc d;
+      d.handle = pair_handle;
+      d.first_ikey = kvsep_first_ikey;
+      d.last_ikey = kvsep_last_ikey;
+      r->kvsep_data_blocks.push_back(std::move(d));
+
+      r->kvsep_value_block_buf.clear();
+      r->kvsep_pending_entries.clear();
+      r->kvsep_pending_leaf_bytes = 0;
+      r->kvsep_pending_leaf_v3_prefix_len = 0;
+      r->kvsep_pending_leaf_v3_suffix_bytes = 0;
+      r->kvsep_first_ikey_in_pending_block.clear();
+      r->data_block.Reset();
+      return;
+    }
+
+    BlockHandle kvsep_value_handle = BlockHandle::NullBlockHandle();
+    if (!r->kvsep_value_block_buf.empty()) {
+      Slice uncompressed_value_block(r->kvsep_value_block_buf);
+      CompressionType value_comp_type = kNoCompression;
+      Slice value_to_write = uncompressed_value_block;
+      if (!r->table_options.experimental_kvsep_bptree_disable_compression) {
+        Status compress_status = CompressAndVerifyBlock(
+            uncompressed_value_block, /*is_data_block=*/true,
+            r->data_block_working_area, &r->single_threaded_compressed_output,
+            &value_comp_type);
+        r->SetStatus(compress_status);
+        if (UNLIKELY(!ok())) {
+          return;
+        }
+        if (value_comp_type != kNoCompression) {
+          value_to_write = Slice(r->single_threaded_compressed_output);
+        }
+      }
+      WriteMaybeCompressedBlock(
+          value_to_write,
+          value_comp_type, &kvsep_value_handle, BlockType::kKVSepValue,
+          &uncompressed_value_block);
+      r->single_threaded_compressed_output.Reset();
+      if (UNLIKELY(!ok())) {
+        return;
+      }
+      r->kvsep_value_blocks_written++;
+      r->kvsep_value_bytes_written += uncompressed_value_block.size();
+    }
+
+    const std::string kvsep_first_ikey = r->kvsep_pending_entries.front().ikey;
+    const std::string kvsep_last_ikey = r->kvsep_pending_entries.back().ikey;
+
+    std::string leaf_buf;
+    Slice leaf_contents;
+    if (!r->kvsep_leaf_prefix_compress) {
+      // Leaf V1: standard block KV encoding (full internal key + pointer bytes).
+      // Persist/read/cache it as an index block type.
+      r->data_block.Reset();
+      std::string prev_ikey;
+      std::string ptr_buf;
+      for (const auto& e : r->kvsep_pending_entries) {
+        EncodeKVSepBptreeLeafPointer(kvsep_value_handle, e.value_off, e.value_len,
+                                     &ptr_buf);
+        r->data_block.AddWithLastKey(Slice(e.ikey), Slice(ptr_buf),
+                                     Slice(prev_ikey));
+        prev_ikey = e.ikey;
+      }
+      leaf_contents = r->data_block.Finish();
+    } else {
+      // Leaf V2: prefix-compressed leaf encoding.
+      // Header:
+      //   fixed32 version (=2)
+      //   varint32 prefix_len + prefix bytes
+      //   fixed64 value_block_offset + fixed64 value_block_size
+      //   fixed32 num_entries
+      // Arrays:
+      //   (n+1) * fixed32 suffix_offsets
+      //   n * fixed32 value_off
+      //   n * fixed32 value_len
+      // Payload:
+      //   concatenated suffix bytes
+      const std::string& first_key = r->kvsep_pending_entries.front().ikey;
+      const std::string& last_key = r->kvsep_pending_entries.back().ikey;
+      size_t min_len = std::min(first_key.size(), last_key.size());
+      uint32_t prefix_len = 0;
+      while (prefix_len < min_len && first_key[prefix_len] == last_key[prefix_len]) {
+        ++prefix_len;
+      }
+      Slice prefix(first_key.data(), prefix_len);
+
+      const uint32_t n =
+          static_cast<uint32_t>(r->kvsep_pending_entries.size());
+      std::vector<uint32_t> suffix_offsets;
+      suffix_offsets.reserve(static_cast<size_t>(n) + 1);
+      std::string suffix_bytes;
+      suffix_offsets.push_back(0);
+      for (const auto& e : r->kvsep_pending_entries) {
+        Slice ikey(e.ikey);
+        Slice suffix = ikey;
+        if (suffix.size() >= prefix.size() &&
+            memcmp(suffix.data(), prefix.data(), prefix.size()) == 0) {
+          suffix.remove_prefix(prefix.size());
+        }
+        if (UNLIKELY(suffix_bytes.size() + suffix.size() >
+                     std::numeric_limits<uint32_t>::max())) {
+          r->SetStatus(Status::Corruption("kvsep leaf suffix bytes overflow"));
+          return;
+        }
+        suffix_bytes.append(suffix.data(), suffix.size());
+        suffix_offsets.push_back(
+            static_cast<uint32_t>(suffix_bytes.size()));
+      }
+
+      leaf_buf.reserve(4 + VarintLength(prefix_len) + prefix_len + 8 + 8 + 4 +
+                       (static_cast<size_t>(n) + 1) * 4 +
+                       static_cast<size_t>(n) * 4 * 2 + suffix_bytes.size());
+      PutFixed32(&leaf_buf, 2u);
+      PutVarint32(&leaf_buf, prefix_len);
+      leaf_buf.append(prefix.data(), prefix.size());
+      PutFixed64(&leaf_buf, kvsep_value_handle.offset());
+      PutFixed64(&leaf_buf, kvsep_value_handle.size());
+      PutFixed32(&leaf_buf, n);
+      for (uint32_t off : suffix_offsets) {
+        PutFixed32(&leaf_buf, off);
+      }
+      for (const auto& e : r->kvsep_pending_entries) {
+        PutFixed32(&leaf_buf, e.value_off);
+      }
+      for (const auto& e : r->kvsep_pending_entries) {
+        PutFixed32(&leaf_buf, e.value_len);
+      }
+      leaf_buf.append(suffix_bytes);
+      leaf_contents = Slice(leaf_buf);
+    }
+
+    BlockHandle leaf_handle;
+    // Keep leaf blocks uncompressed for simplicity in this experimental path.
+    WriteMaybeCompressedBlock(leaf_contents, kNoCompression, &leaf_handle,
+                              BlockType::kIndex);
     if (UNLIKELY(!ok())) {
       return;
     }
-    WriteMaybeCompressedBlock(
-        value_comp_type == kNoCompression
-            ? uncompressed_value_block
-            : Slice(r->single_threaded_compressed_output),
-        value_comp_type, &kvsep_value_handle, BlockType::kKVSepValue,
-        &uncompressed_value_block);
-    r->single_threaded_compressed_output.Reset();
-    if (UNLIKELY(!ok())) {
-      return;
-    }
-    r->kvsep_value_blocks_written++;
-    r->kvsep_value_bytes_written += uncompressed_value_block.size();
+    r->kvsep_bptree_index_bytes_written += leaf_handle.size() + kBlockTrailerSize;
+
+    Rep::KVSepDataBlockDesc d;
+    d.handle = leaf_handle;
+    d.first_ikey = kvsep_first_ikey;
+    d.last_ikey = kvsep_last_ikey;
+    r->kvsep_data_blocks.push_back(std::move(d));
+
+    r->kvsep_value_block_buf.clear();
+    r->kvsep_pending_entries.clear();
+    r->kvsep_pending_leaf_bytes = 0;
+    r->kvsep_pending_leaf_v3_prefix_len = 0;
+    r->kvsep_pending_leaf_v3_suffix_bytes = 0;
+    r->kvsep_first_ikey_in_pending_block.clear();
+    r->data_block.Reset();
+    return;
   }
 
   Slice uncompressed_block_data = r->data_block.Finish();
@@ -1774,14 +2189,6 @@ void BlockBasedTableBuilder::Flush(const Slice* first_key_in_next_block) {
     } else {
       EmitBlock(r->data_block.MutableBuffer(), r->last_ikey,
                 first_key_in_next_block);
-    }
-    if (r->experimental_kvsep_bptree_enable) {
-      KVSepBptreeValueMapEntry e;
-      e.data_block_offset = r->pending_handle.offset();
-      e.value_block_offset = kvsep_value_handle.offset();
-      e.value_block_size = kvsep_value_handle.size();
-      r->kvsep_value_map_entries.push_back(e);
-      r->kvsep_value_block_buf.clear();
     }
     r->data_block.Reset();
   }
@@ -2123,6 +2530,9 @@ IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
   //    checksum: uint32
   Rep* r = rep_.get();
   bool is_data_block = block_type == BlockType::kData;
+  const bool is_data_like_block =
+      is_data_block || block_type == BlockType::kKVSepPair ||
+      block_type == BlockType::kKVSepValue;
   // For data block, skip_delta_encoding must be non null
   if (is_data_block) {
     assert(skip_delta_encoding != nullptr);
@@ -2142,7 +2552,8 @@ IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
 
   auto offset = r->get_offset();
   // try to align the data block page to the super alignment size, if enabled
-  if ((r->table_options.super_block_alignment_size != 0) && is_data_block) {
+  if ((r->table_options.super_block_alignment_size != 0) &&
+      is_data_like_block) {
     auto super_block_alignment_mask =
         r->table_options.super_block_alignment_size - 1;
     if ((r->table_options.super_block_alignment_space_overhead_ratio != 0) &&
@@ -2152,6 +2563,13 @@ IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
       auto allowed_max_padding_size =
           r->table_options.super_block_alignment_size /
           r->table_options.super_block_alignment_space_overhead_ratio;
+      // For experimental KV-sep pair blocks, prefer keeping each block within a
+      // single aligned super-block over strict space overhead constraints.
+      // Crossing super-block boundaries can double underlying read ops/bytes
+      // under cache=0 + aligned reads, which dominates in the simfs model.
+      if (block_type == BlockType::kKVSepPair) {
+        allowed_max_padding_size = r->table_options.super_block_alignment_size;
+      }
       // new block would cross the super block boundary
       auto pad_bytes = r->table_options.super_block_alignment_size -
                        (offset & super_block_alignment_mask);
@@ -2247,6 +2665,31 @@ IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
       r->set_offset(r->get_offset() + pad_bytes);
     } else {
       return io_s;
+    }
+  }
+
+  // Experimental: for KV-sep pair blocks, optionally pad the SST so the next
+  // pair block begins at a super-block boundary (e.g. 16KB). This avoids
+  // cross-boundary aligned reads under cache=0 + super-block aligned read
+  // experiments.
+  if (r->experimental_kvsep_bptree_enable && r->kvsep_pair_blocks &&
+      r->table_options.experimental_kvsep_bptree_superblock_align_pair_blocks &&
+      block_type == BlockType::kKVSepPair) {
+    const size_t sb = r->table_options.super_block_alignment_size;
+    if (sb > 0) {
+      const uint64_t off = r->get_offset();
+      const uint64_t rem = off % static_cast<uint64_t>(sb);
+      const size_t pad_bytes =
+          rem == 0 ? 0 : static_cast<size_t>(static_cast<uint64_t>(sb) - rem);
+      if (pad_bytes > 0) {
+        io_s = r->file->Pad(io_options, pad_bytes, kDefaultPageSize);
+        if (LIKELY(io_s.ok())) {
+          r->pre_compression_size += pad_bytes;
+          r->set_offset(r->get_offset() + pad_bytes);
+        } else {
+          return io_s;
+        }
+      }
     }
   }
 
@@ -2432,6 +2875,141 @@ void BlockBasedTableBuilder::WriteIndexBlock(
   if (UNLIKELY(!ok())) {
     return;
   }
+  if (rep_->experimental_kvsep_bptree_enable) {
+    Rep* r = rep_.get();
+    const uint32_t fanout = std::max<uint32_t>(2, r->kvsep_index_fanout);
+    if (UNLIKELY(r->kvsep_data_blocks.empty())) {
+      rep_->SetStatus(Status::Corruption("kvsep_bptree: missing leaf blocks"));
+      return;
+    }
+
+    auto make_sep_key = [&](const Slice& left_last,
+                            const Slice& right_first) -> std::string {
+      Slice left_user = ExtractUserKeyAndStripTimestamp(left_last, r->ts_sz);
+      Slice right_user = ExtractUserKeyAndStripTimestamp(right_first, r->ts_sz);
+      size_t min_len = std::min(left_user.size(), right_user.size());
+      size_t i = 0;
+      while (i < min_len && left_user[i] == right_user[i]) {
+        ++i;
+      }
+      // Choose the shortest prefix of right_user that is > left_user.
+      size_t prefix_len = 0;
+      if (i == min_len) {
+        // One is a prefix of the other; since left_user < right_user, right_user
+        // must be longer.
+        prefix_len = std::min(min_len + 1, right_user.size());
+      } else {
+        prefix_len = i + 1;
+      }
+      Slice prefix(right_user.data(), prefix_len);
+      InternalKey ik(prefix, kMaxSequenceNumber, kValueTypeForSeek);
+      return ik.Encode().ToString();
+    };
+
+    struct NodeDesc {
+      BlockHandle handle;
+      std::string first_ikey;
+      std::string last_ikey;
+    };
+
+    // Internal index levels point to leaf blocks directly.
+    std::vector<NodeDesc> cur_level;
+    cur_level.reserve(r->kvsep_data_blocks.size());
+    for (const auto& leaf : r->kvsep_data_blocks) {
+      NodeDesc nd;
+      nd.handle = leaf.handle;
+      nd.first_ikey = leaf.first_ikey;
+      nd.last_ikey = leaf.last_ikey;
+      cur_level.push_back(std::move(nd));
+    }
+
+    uint32_t levels = 0;
+    // Always build at least one internal index block (root) so the reader can
+    // use IndexBlockIter to descend to leaf blocks.
+    while (true) {
+      ++levels;
+      std::vector<NodeDesc> next_level;
+      next_level.reserve((cur_level.size() + fanout - 1) / fanout);
+      const size_t total_nodes = cur_level.size();
+      for (size_t base = 0; base < total_nodes; base += fanout) {
+        const size_t end = std::min(total_nodes, base + fanout);
+        BlockBuilder internal_index_builder(
+            r->table_options.index_block_restart_interval,
+            /*use_delta_encoding=*/true,
+            /*use_value_delta_encoding=*/false,
+            BlockBasedTableOptions::kDataBlockBinarySearch,
+            /*hash_util_ratio=*/0.75, r->ts_sz,
+            r->persist_user_defined_timestamps);
+
+        for (size_t i = base; i < end; ++i) {
+          std::string key_for_entry;
+          // Match the intent of BlockBasedTableOptions::index_shortening:
+          // - In kNoShortening mode, use the full last key of the block so a
+          //   seek doesn't unnecessarily read the previous block and then
+          //   immediately fall through to the next.
+          // - Otherwise, use a shortened separator key between blocks and a
+          //   full key for the last entry.
+          if (r->table_options.index_shortening ==
+              BlockBasedTableOptions::IndexShorteningMode::kNoShortening) {
+            key_for_entry = cur_level[i].last_ikey;
+          } else if (i + 1 < total_nodes) {
+            key_for_entry = make_sep_key(Slice(cur_level[i].last_ikey),
+                                         Slice(cur_level[i + 1].first_ikey));
+          } else {
+            key_for_entry = cur_level[i].last_ikey;
+          }
+          const bool have_first_key =
+              (r->table_options.index_type ==
+               BlockBasedTableOptions::kBinarySearchWithFirstKey);
+          IndexValue v(cur_level[i].handle,
+                       have_first_key ? Slice(cur_level[i].first_ikey)
+                                      : Slice());
+          std::string encoded_v;
+          v.EncodeTo(&encoded_v, /*have_first_key=*/have_first_key,
+                     /*previous_handle=*/nullptr);
+          internal_index_builder.Add(Slice(key_for_entry), Slice(encoded_v));
+        }
+
+        BlockHandle h;
+        WriteMaybeCompressedBlock(internal_index_builder.Finish(), kNoCompression,
+                                  &h, BlockType::kIndex);
+        if (UNLIKELY(!ok())) {
+          return;
+        }
+        r->kvsep_bptree_index_bytes_written += h.size() + kBlockTrailerSize;
+
+        NodeDesc nd;
+        nd.handle = h;
+        nd.first_ikey = cur_level[base].first_ikey;
+        nd.last_ikey = cur_level[end - 1].last_ikey;
+        next_level.push_back(std::move(nd));
+      }
+      cur_level.swap(next_level);
+      if (cur_level.size() == 1) {
+        break;
+      }
+    }
+
+    assert(cur_level.size() == 1);
+    *index_block_handle = cur_level[0].handle;
+    r->kvsep_bptree_index_levels = levels;
+    r->props.user_collected_properties[kKVSepBptreeTablePropertyKey] = "1";
+    r->props.user_collected_properties[kKVSepBptreeIndexLevelsPropertyKey] =
+        std::to_string(levels);
+    r->props.user_collected_properties["rocksdb.experimental.kvsep_bptree.index_fanout"] =
+        std::to_string(fanout);
+    r->props.user_collected_properties["rocksdb.experimental.kvsep_bptree.index_bytes_written"] =
+        std::to_string(r->kvsep_bptree_index_bytes_written);
+
+    // For old format versions, record index handle in metaindex rather than
+    // footer.
+    if (LIKELY(ok()) && !FormatVersionUsesIndexHandleInFooter(
+                            r->table_options.format_version)) {
+      meta_index_builder->Add(kIndexBlockName, *index_block_handle);
+    }
+    return;
+  }
+
   IndexBuilder::IndexBlocks index_blocks;
   auto index_builder_status = rep_->index_builder->Finish(&index_blocks);
   if (LIKELY(ok()) && !index_builder_status.ok() &&
@@ -2513,8 +3091,12 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
         rep_->table_options.filter_policy != nullptr
             ? rep_->table_options.filter_policy->Name()
             : "";
-    rep_->props.index_size =
-        rep_->index_builder->IndexSize() + kBlockTrailerSize;
+    if (rep_->experimental_kvsep_bptree_enable) {
+      rep_->props.index_size = rep_->kvsep_bptree_index_bytes_written;
+    } else {
+      rep_->props.index_size =
+          rep_->index_builder->IndexSize() + kBlockTrailerSize;
+    }
     rep_->props.comparator_name = rep_->ioptions.user_comparator != nullptr
                                       ? rep_->ioptions.user_comparator->Name()
                                       : "nullptr";
@@ -2545,10 +3127,18 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
       rep_->props.top_level_index_size =
           rep_->p_index_builder_->TopLevelIndexSize(rep_->offset.LoadRelaxed());
     }
-    rep_->props.index_key_is_user_key =
-        !rep_->index_builder->separator_is_key_plus_seq();
-    rep_->props.index_value_is_delta_encoded =
-        rep_->use_delta_encoding_for_index_values;
+    if (rep_->experimental_kvsep_bptree_enable) {
+      // Our experimental B+tree index blocks encode full BlockHandles (not
+      // delta-encoded) because leaf entries can point to data blocks that are
+      // not consecutive on disk (value blocks interleave).
+      rep_->props.index_key_is_user_key = 0;
+      rep_->props.index_value_is_delta_encoded = 0;
+    } else {
+      rep_->props.index_key_is_user_key =
+          !rep_->index_builder->separator_is_key_plus_seq();
+      rep_->props.index_value_is_delta_encoded =
+          rep_->use_delta_encoding_for_index_values;
+    }
     if (rep_->sampled_input_data_bytes.LoadRelaxed() > 0) {
       rep_->props.slow_compression_estimated_data_size = static_cast<uint64_t>(
           static_cast<double>(
@@ -2886,9 +3476,14 @@ Status BlockBasedTableBuilder::Finish() {
     r->props.user_collected_properties
         ["rocksdb.experimental.kvsep_bptree.value_bytes_written"] =
             std::to_string(r->kvsep_value_bytes_written);
-    r->props.user_collected_properties
-        ["rocksdb.experimental.kvsep_bptree.value_map_entries"] =
-            std::to_string(r->kvsep_value_map_entries.size());
+    if (r->kvsep_pair_blocks) {
+      r->props.user_collected_properties
+          ["rocksdb.experimental.kvsep_bptree.pair_blocks_written"] =
+              std::to_string(r->kvsep_pair_blocks_written);
+      r->props.user_collected_properties
+          ["rocksdb.experimental.kvsep_bptree.pair_bytes_written"] =
+              std::to_string(r->kvsep_pair_bytes_written);
+    }
   }
 
   uint64_t last_estimated_tail_size = EstimatedTailSize();
@@ -2907,18 +3502,6 @@ Status BlockBasedTableBuilder::Finish() {
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
-  if (r->experimental_kvsep_bptree_enable) {
-    std::string map_block;
-    EncodeKVSepBptreeValueMap(r->kvsep_value_map_entries,
-                              static_cast<uint32_t>(r->kvsep_value_block_bytes),
-                              &map_block);
-    BlockHandle map_handle;
-    WriteMaybeCompressedBlock(Slice(map_block), kNoCompression, &map_handle,
-                              BlockType::kProperties);
-    if (LIKELY(ok())) {
-      meta_index_builder.Add(kKVSepBptreeValueMapBlockName, map_handle);
-    }
-  }
   WritePropertiesBlock(&meta_index_builder);
   if (LIKELY(ok())) {
     // flush the meta index block

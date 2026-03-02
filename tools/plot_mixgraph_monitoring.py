@@ -158,18 +158,56 @@ def _parse_histogram_percentiles(log_text: str) -> Dict[str, Dict[str, float]]:
     return out
 
 
+def _parse_stats_percentiles(log_text: str) -> Dict[str, Dict[str, float]]:
+    """
+    Parse db_bench "--statistics" percentile lines like:
+      rocksdb.db.get.micros P50 : 807.14 P95 : 7332.37 P99 : 9425.36 ...
+      rocksdb.db.multiget.micros P50 : 10728.70 P95 : 28609.34 P99 : 32305.92 ...
+      rocksdb.db.seek.micros P50 : 804.51 P95 : 7384.94 P99 : 9427.70 ...
+
+    Returns: { "Get": {"p50_us":..., "p95_us":..., "p99_us":...}, ... }
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    # Keep this regex permissive: db_bench output can vary slightly across versions.
+    rx = re.compile(
+        r"^rocksdb\.db\.(get|multiget|seek)\.micros\s+"
+        r"P50\s*:\s*([0-9.]+)\s+"
+        r"P95\s*:\s*([0-9.]+)\s+"
+        r"P99\s*:\s*([0-9.]+)\b"
+    )
+    name_map = {"get": "Get", "multiget": "MultiGet", "seek": "Seek"}
+    for raw in log_text.splitlines():
+        line = raw.strip()
+        m = rx.match(line)
+        if not m:
+            continue
+        op = name_map.get(m.group(1), m.group(1))
+        out[op] = {
+            "p50_us": float(m.group(2)),
+            "p95_us": float(m.group(3)),
+            "p99_us": float(m.group(4)),
+        }
+    return out
+
+
 def _write_op_latency_percentiles(
     log_path: Path, out_csv: Path, out_png: Path, case_prefix: str
 ) -> None:
     if not log_path.exists():
         return
     txt = log_path.read_text(errors="ignore")
-    per_op = _parse_histogram_percentiles(txt)
+    per_op: Dict[str, Dict[str, float]] = {}
+    # Prefer per-op percentiles emitted under "--statistics" if available (these
+    # include MultiGet under mixgraph), otherwise fall back to "--histogram"
+    # "Microseconds per X:" sections.
+    per_op.update(_parse_histogram_percentiles(txt))
+    stats_per_op = _parse_stats_percentiles(txt)
+    per_op.update(stats_per_op)
     if not per_op:
         return
 
     # Prefer the mixgraph-relevant op types if present.
-    preferred = ["Read", "Seek", "Scan", "MultiGet"]
+    preferred = ["Get", "MultiGet", "Seek", "Read", "Scan"]
     ops = [op for op in preferred if op in per_op] + [
         op for op in sorted(per_op.keys()) if op not in preferred
     ]
@@ -345,6 +383,16 @@ def _plot_case(
     probe_notfound: List[int] = []
     probe_error: List[int] = []
     shift_stage: List[int] = []
+    kvsep_leaf_file_reads: List[int] = []
+    kvsep_leaf_file_read_bytes: List[int] = []
+    kvsep_value_file_reads: List[int] = []
+    kvsep_value_file_read_bytes: List[int] = []
+    kvsep_pair_file_reads: List[int] = []
+    kvsep_pair_file_read_bytes: List[int] = []
+    sb_cache_hit: List[int] = []
+    sb_cache_miss: List[int] = []
+    sb_unusable_too_large: List[int] = []
+    sb_unusable_cross_boundary: List[int] = []
 
     for r in mix_w:
         wall_us = _safe_int(r.get("wall_time_us", ""))
@@ -370,6 +418,28 @@ def _plot_case(
         probe_notfound.append(_safe_int(r.get("probe_notfound", "")))
         probe_error.append(_safe_int(r.get("probe_error", "")))
         shift_stage.append(_safe_int(r.get("shift_stage", "")))
+        kvsep_leaf_file_reads.append(_safe_int(r.get("kvsep_leaf_file_reads", "")))
+        kvsep_leaf_file_read_bytes.append(
+            _safe_int(r.get("kvsep_leaf_file_read_bytes", ""))
+        )
+        kvsep_value_file_reads.append(
+            _safe_int(r.get("kvsep_value_file_reads", ""))
+        )
+        kvsep_value_file_read_bytes.append(
+            _safe_int(r.get("kvsep_value_file_read_bytes", ""))
+        )
+        kvsep_pair_file_reads.append(_safe_int(r.get("kvsep_pair_file_reads", "")))
+        kvsep_pair_file_read_bytes.append(
+            _safe_int(r.get("kvsep_pair_file_read_bytes", ""))
+        )
+        sb_cache_hit.append(_safe_int(r.get("super_block_cache_hit", "")))
+        sb_cache_miss.append(_safe_int(r.get("super_block_cache_miss", "")))
+        sb_unusable_too_large.append(
+            _safe_int(r.get("super_block_unusable_too_large", ""))
+        )
+        sb_unusable_cross_boundary.append(
+            _safe_int(r.get("super_block_unusable_cross_boundary", ""))
+        )
 
     # ---- Derived per-window metrics for attribution
     data_access = [h + m for h, m in zip(data_hit, data_miss)]
@@ -480,6 +550,38 @@ def _plot_case(
     fig.savefig(out1b, dpi=160)
     plt.close(fig)
 
+    # ---- Plot 1c: super-block read cache + unusable reasons (optional)
+    if any(sb_cache_hit) or any(sb_cache_miss) or any(sb_unusable_too_large) or any(sb_unusable_cross_boundary):
+        fig = plt.figure(figsize=(14, 8))
+        ax1 = fig.add_subplot(2, 1, 1)
+        ax2 = fig.add_subplot(2, 1, 2, sharex=ax1)
+
+        ax1.plot(t_mix_s, sb_cache_hit, label="super-block cache hit")
+        ax1.plot(t_mix_s, sb_cache_miss, label="super-block cache miss", alpha=0.85)
+        add_event_lines(ax1)
+        ax1.set_ylabel("Count / window")
+        ax1.grid(True, alpha=0.25)
+        ax1.legend(loc="upper right")
+        ax1.set_title(f"{case_prefix}: super-block read cache (window deltas)")
+
+        ax2.plot(t_mix_s, sb_unusable_too_large, label="unusable: block > super-block")
+        ax2.plot(
+            t_mix_s,
+            sb_unusable_cross_boundary,
+            label="unusable: cross super-block boundary",
+            alpha=0.9,
+        )
+        add_event_lines(ax2)
+        ax2.set_ylabel("Count / window")
+        ax2.set_xlabel("Time since mixgraph start (s)")
+        ax2.grid(True, alpha=0.25)
+        ax2.legend(loc="upper right")
+
+        out1c = figures_dir / f"{case_prefix}.super_block_read_cache_timeseries.png"
+        fig.tight_layout()
+        fig.savefig(out1c, dpi=160)
+        plt.close(fig)
+
     # ---- Plot 2: cache usage + bytes insert
     fig = plt.figure(figsize=(14, 8))
     ax1 = fig.add_subplot(2, 1, 1)
@@ -506,6 +608,70 @@ def _plot_case(
     fig.tight_layout()
     fig.savefig(out2, dpi=160)
     plt.close(fig)
+
+    # ---- Plot 2b: KV-sep block IO (leaf/value/pair) if present
+    if any(kvsep_leaf_file_reads) or any(kvsep_value_file_reads) or any(
+        kvsep_pair_file_reads
+    ):
+        fig = plt.figure(figsize=(14, 8))
+        ax1 = fig.add_subplot(2, 1, 1)
+        ax2 = fig.add_subplot(2, 1, 2, sharex=ax1)
+
+        ax1.plot(
+            t_mix_s,
+            kvsep_leaf_file_reads,
+            label="leaf file reads (delta/window)",
+            alpha=0.9,
+        )
+        ax1.plot(
+            t_mix_s,
+            kvsep_value_file_reads,
+            label="value file reads (delta/window)",
+            alpha=0.8,
+        )
+        ax1.plot(
+            t_mix_s,
+            kvsep_pair_file_reads,
+            label="pair file reads (delta/window)",
+            alpha=0.8,
+        )
+        add_event_lines(ax1)
+        ax1.set_ylabel("Reads / window")
+        ax1.grid(True, alpha=0.25)
+        ax1.legend(loc="upper right")
+        ax1.set_title(f"{case_prefix}: kvsep block file reads + events")
+
+        def to_mib(xs: List[int]) -> List[float]:
+            return [x / (1024.0 * 1024.0) for x in xs]
+
+        ax2.plot(
+            t_mix_s,
+            to_mib(kvsep_leaf_file_read_bytes),
+            label="leaf read MiB (delta/window)",
+            alpha=0.9,
+        )
+        ax2.plot(
+            t_mix_s,
+            to_mib(kvsep_value_file_read_bytes),
+            label="value read MiB (delta/window)",
+            alpha=0.8,
+        )
+        ax2.plot(
+            t_mix_s,
+            to_mib(kvsep_pair_file_read_bytes),
+            label="pair read MiB (delta/window)",
+            alpha=0.8,
+        )
+        add_event_lines(ax2)
+        ax2.set_xlabel("Time since mixgraph start (s)")
+        ax2.set_ylabel("MiB / window")
+        ax2.grid(True, alpha=0.25)
+        ax2.legend(loc="upper right")
+
+        out2b = figures_dir / f"{case_prefix}.kvsep_block_io_timeseries.png"
+        fig.tight_layout()
+        fig.savefig(out2b, dpi=160)
+        plt.close(fig)
 
     # ---- Plot 3: burst intensity vs misses
     fig = plt.figure(figsize=(14, 6))

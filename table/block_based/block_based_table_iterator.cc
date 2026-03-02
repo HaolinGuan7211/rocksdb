@@ -361,6 +361,7 @@ void BlockBasedTableIterator::InitDataBlock() {
   BlockHandle data_block_handle;
   bool is_in_cache = false;
   bool use_block_cache_for_lookup = true;
+  const bool kvsep_enabled = table_->get_rep()->experimental_kvsep_bptree_enabled;
 
   if (DoesContainBlockHandles()) {
     data_block_handle = block_handles_->front().handle_;
@@ -382,7 +383,9 @@ void BlockBasedTableIterator::InitDataBlock() {
         lookup_context_.caller == TableReaderCaller::kCompaction;
 
     // Initialize Data Block From CacheableEntry.
-    if (is_in_cache) {
+    // KV-sep leaf blocks are stored/cached as index blocks; avoid attempting to
+    // reuse cached entries that were fetched through the data-block path.
+    if (is_in_cache && !kvsep_enabled) {
       Status s;
       block_iter_.Invalidate(Status::OK());
       table_->NewDataBlockIterator<DataBlockIter>(
@@ -413,12 +416,21 @@ void BlockBasedTableIterator::InitDataBlock() {
           read_options_.async_io);
 
       Status s;
-      table_->NewDataBlockIterator<DataBlockIter>(
-          read_options_, data_block_handle, &block_iter_, BlockType::kData,
-          /*get_context=*/nullptr, &lookup_context_,
-          block_prefetcher_.prefetch_buffer(),
-          /*for_compaction=*/is_for_compaction, /*async_read=*/false, s,
-          use_block_cache_for_lookup);
+      if (kvsep_enabled) {
+        table_->KVSepBptreeNewLeafBlockIterator(
+            read_options_, data_block_handle, &block_iter_,
+            /*get_context=*/nullptr, &lookup_context_,
+            block_prefetcher_.prefetch_buffer(),
+            /*for_compaction=*/is_for_compaction, /*async_read=*/false, s,
+            use_block_cache_for_lookup);
+      } else {
+        table_->NewDataBlockIterator<DataBlockIter>(
+            read_options_, data_block_handle, &block_iter_, BlockType::kData,
+            /*get_context=*/nullptr, &lookup_context_,
+            block_prefetcher_.prefetch_buffer(),
+            /*for_compaction=*/is_for_compaction, /*async_read=*/false, s,
+            use_block_cache_for_lookup);
+      }
     }
     block_iter_points_to_real_block_ = true;
 
@@ -438,6 +450,7 @@ void BlockBasedTableIterator::AsyncInitDataBlock(bool is_first_pass) {
   BlockHandle data_block_handle;
   bool is_for_compaction =
       lookup_context_.caller == TableReaderCaller::kCompaction;
+  const bool kvsep_enabled = table_->get_rep()->experimental_kvsep_bptree_enabled;
   if (is_first_pass) {
     data_block_handle = index_iter_->value().handle;
     if (!block_iter_points_to_real_block_ ||
@@ -473,12 +486,21 @@ void BlockBasedTableIterator::AsyncInitDataBlock(bool is_first_pass) {
           read_options_, readaheadsize_cb, read_options_.async_io);
 
       Status s;
-      table_->NewDataBlockIterator<DataBlockIter>(
-          read_options_, data_block_handle, &block_iter_, BlockType::kData,
-          /*get_context=*/nullptr, &lookup_context_,
-          block_prefetcher_.prefetch_buffer(),
-          /*for_compaction=*/is_for_compaction, /*async_read=*/true, s,
-          /*use_block_cache_for_lookup=*/true);
+      if (kvsep_enabled) {
+        table_->KVSepBptreeNewLeafBlockIterator(
+            read_options_, data_block_handle, &block_iter_,
+            /*get_context=*/nullptr, &lookup_context_,
+            block_prefetcher_.prefetch_buffer(),
+            /*for_compaction=*/is_for_compaction, /*async_read=*/true, s,
+            /*use_block_cache_for_lookup=*/true);
+      } else {
+        table_->NewDataBlockIterator<DataBlockIter>(
+            read_options_, data_block_handle, &block_iter_, BlockType::kData,
+            /*get_context=*/nullptr, &lookup_context_,
+            block_prefetcher_.prefetch_buffer(),
+            /*for_compaction=*/is_for_compaction, /*async_read=*/true, s,
+            /*use_block_cache_for_lookup=*/true);
+      }
 
       if (s.IsTryAgain()) {
         async_read_in_progress_ = true;
@@ -499,18 +521,27 @@ void BlockBasedTableIterator::AsyncInitDataBlock(bool is_first_pass) {
 
     Status s;
     // Initialize Data Block From CacheableEntry.
-    if (is_in_cache) {
+    if (is_in_cache && !kvsep_enabled) {
       block_iter_.Invalidate(Status::OK());
       table_->NewDataBlockIterator<DataBlockIter>(
           read_options_, (block_handles_->front().cachable_entry_).As<Block>(),
           &block_iter_, s);
     } else {
-      table_->NewDataBlockIterator<DataBlockIter>(
-          read_options_, data_block_handle, &block_iter_, BlockType::kData,
-          /*get_context=*/nullptr, &lookup_context_,
-          block_prefetcher_.prefetch_buffer(),
-          /*for_compaction=*/is_for_compaction, /*async_read=*/false, s,
-          /*use_block_cache_for_lookup=*/false);
+      if (kvsep_enabled) {
+        table_->KVSepBptreeNewLeafBlockIterator(
+            read_options_, data_block_handle, &block_iter_,
+            /*get_context=*/nullptr, &lookup_context_,
+            block_prefetcher_.prefetch_buffer(),
+            /*for_compaction=*/is_for_compaction, /*async_read=*/false, s,
+            /*use_block_cache_for_lookup=*/false);
+      } else {
+        table_->NewDataBlockIterator<DataBlockIter>(
+            read_options_, data_block_handle, &block_iter_, BlockType::kData,
+            /*get_context=*/nullptr, &lookup_context_,
+            block_prefetcher_.prefetch_buffer(),
+            /*for_compaction=*/is_for_compaction, /*async_read=*/false, s,
+            /*use_block_cache_for_lookup=*/false);
+      }
     }
   }
   block_iter_points_to_real_block_ = true;

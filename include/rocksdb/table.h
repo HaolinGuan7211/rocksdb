@@ -646,6 +646,34 @@ struct BlockBasedTableOptions {
   // the layout of already-written SSTs.
   bool experimental_kvsep_bptree_enable = false;
 
+  // Experimental: coalesced "pair blocks" for KV-sep B+Tree SSTs.
+  //
+  // When enabled, each KV-sep leaf's key metadata and its corresponding value
+  // bytes are stored together in a single on-disk block ("pair block"), and
+  // the B+Tree index points to that pair block.
+  //
+  // This enables a point lookup (Seek/Get/MultiGet) to fetch both the leaf and
+  // the value bytes with a single block read, reducing underlying I/O count
+  // under NVM-like latencies (cache=0/direct reads).
+  //
+  // This is intended for controlled experiments only and changes the on-disk
+  // format of newly written SSTs (leaf format version 3).
+  bool experimental_kvsep_bptree_pair_blocks = false;
+
+  // Experimental: super-block align KV-sep pair blocks on disk.
+  //
+  // When enabled (and when pair blocks are enabled), pad the SST after each
+  // KV-sep pair block so the next pair block starts at a multiple of
+  // `super_block_alignment_size`.
+  //
+  // Motivation: under cache=0 + super-block aligned reads, a small on-disk block
+  // may straddle a super-block boundary, forcing two aligned reads to satisfy a
+  // single block fetch. Aligning pair blocks avoids cross-boundary reads and
+  // makes super-block read coalescing/cache more effective.
+  //
+  // This only affects newly written KV-sep pair-block SSTs.
+  bool experimental_kvsep_bptree_superblock_align_pair_blocks = false;
+
   // Target uncompressed bytes per leaf block (keys + value pointers).
   uint64_t experimental_kvsep_bptree_leaf_block_bytes = 16 * 1024;
 
@@ -654,6 +682,37 @@ struct BlockBasedTableOptions {
 
   // Target maximum children per internal node (fanout).
   uint32_t experimental_kvsep_bptree_fanout = 64;
+
+  // Experimental: leaf key prefix compression for KV-sep B+Tree SSTs.
+  //
+  // When enabled, each KV-sep leaf block stores a shared key prefix once, and
+  // each entry stores only the remaining key suffix plus (value_off,value_len).
+  // The per-leaf value block handle is also stored once in the leaf header.
+  //
+  // This is intended for controlled experiments only and changes the on-disk
+  // leaf encoding of newly written SSTs.
+  bool experimental_kvsep_bptree_leaf_prefix_compress = false;
+
+  // Experimental: disable compression for KV-sep blocks (leaf/value/pair).
+  //
+  // Rationale: in simulated NVM/direct-IO style experiments, we often configure
+  // super-block aligned reads (e.g. 16KB). When blocks are compressed smaller
+  // than the alignment size, the underlying aligned read still fetches the
+  // whole super-block, but we also pay the CPU cost to decompress. For
+  // KV-sep pair blocks, this can be a net loss under cache=0.
+  //
+  // This option affects only newly written KV-sep tables.
+  bool experimental_kvsep_bptree_disable_compression = false;
+
+  // Experimental: KV-sep leaf v2 MultiGet optimization.
+  //
+  // When enabled and reading KV-sep leaf v2 SSTs, MultiGet will group keys by
+  // leaf BlockHandle and reuse the leaf parsing and per-leaf value-only block
+  // reads across keys in the same leaf.
+  //
+  // Turning this off forces a conservative per-key fallback (Get) path for
+  // leaf v2, which is useful as a baseline for experiments/profiling.
+  bool experimental_kvsep_bptree_multiget_leaf_grouping = true;
 
   // This enum allows trading off increased index size for improved iterator
   // seek performance in some situations, particularly when block cache is

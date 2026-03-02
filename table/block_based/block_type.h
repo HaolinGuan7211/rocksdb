@@ -30,6 +30,8 @@ enum class BlockType : uint8_t {
   kUserDefinedIndex,
   // Experimental: value-only blocks for KV-separation experiments.
   kKVSepValue,
+  // Experimental: coalesced leaf+value pair blocks for KV-separation.
+  kKVSepPair,
   // Note: keep kInvalid the last value when adding new enum values.
   kInvalid
 };

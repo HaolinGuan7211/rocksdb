@@ -57,6 +57,16 @@ void BlockCreateContext::Create(std::unique_ptr<Block_kKVSepValue>* parsed_out,
   parsed_out->reset(new Block_kKVSepValue(std::move(block)));
 }
 
+void BlockCreateContext::Create(std::unique_ptr<Block_kKVSepPair>* parsed_out,
+                                BlockContents&& block) {
+  parsed_out->reset(new Block_kKVSepPair(std::move(block)));
+}
+
+void BlockCreateContext::Create(std::unique_ptr<Block_kKVSepLeaf>* parsed_out,
+                                BlockContents&& block) {
+  parsed_out->reset(new Block_kKVSepLeaf(std::move(block)));
+}
+
 void BlockCreateContext::Create(
     std::unique_ptr<ParsedFullFilterBlock>* parsed_out, BlockContents&& block) {
   parsed_out->reset(new ParsedFullFilterBlock(
@@ -88,6 +98,7 @@ const std::array<const Cache::CacheItemHelper*,
         BlockCacheInterface<Block_kIndex>::GetFullHelper(),
         BlockCacheInterface<Block_kUserDefinedIndex>::GetFullHelper(),
         BlockCacheInterface<Block_kKVSepValue>::GetFullHelper(),
+        BlockCacheInterface<Block_kKVSepPair>::GetFullHelper(),
         nullptr,  // kInvalid
     }};
 
@@ -107,6 +118,7 @@ const std::array<const Cache::CacheItemHelper*,
         BlockCacheInterface<Block_kIndex>::GetBasicHelper(),
         BlockCacheInterface<Block_kUserDefinedIndex>::GetBasicHelper(),
         BlockCacheInterface<Block_kKVSepValue>::GetBasicHelper(),
+        BlockCacheInterface<Block_kKVSepPair>::GetBasicHelper(),
         nullptr,  // kInvalid
     }};
 }  // namespace
