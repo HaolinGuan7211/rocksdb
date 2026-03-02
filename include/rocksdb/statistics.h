@@ -214,6 +214,57 @@ enum Tickers : uint32_t {
   // NUMBER_MULTIGET_KEYS_READ gives the number requested by caller
   NUMBER_MULTIGET_KEYS_FOUND,
 
+  // Experimental KV-sep B+Tree (leaf v2) MultiGet grouping stats.
+  // These are only meaningful when reading KV-sep leaf v2 SSTs.
+  EXPERIMENTAL_KVSEP_BPTREE_MGET_KEYS_GROUPED,
+  EXPERIMENTAL_KVSEP_BPTREE_MGET_LEAF_GROUPS,
+  // Number of "extra" keys that reused an existing leaf group:
+  //   sum(group_size) - num_groups
+  EXPERIMENTAL_KVSEP_BPTREE_MGET_LEAF_REUSE_KEYS,
+  // Number of leaf blocks retrieved (one per processed group).
+  EXPERIMENTAL_KVSEP_BPTREE_MGET_LEAF_BLOCKS,
+  // Number of per-leaf value-only blocks retrieved (0 if leaf has null handle).
+  EXPERIMENTAL_KVSEP_BPTREE_MGET_VALUE_BLOCKS,
+  // Number of per-key fallbacks to Get() for correctness (e.g., merge spill).
+  EXPERIMENTAL_KVSEP_BPTREE_MGET_FALLBACK_GET,
+
+  // Experimental KV-sep block-level monitoring.
+  EXPERIMENTAL_KVSEP_BPTREE_LEAF_CACHE_HIT,
+  EXPERIMENTAL_KVSEP_BPTREE_LEAF_CACHE_MISS,
+  EXPERIMENTAL_KVSEP_BPTREE_LEAF_FILE_READS,
+  EXPERIMENTAL_KVSEP_BPTREE_LEAF_FILE_READ_BYTES,
+
+  EXPERIMENTAL_KVSEP_BPTREE_VALUE_CACHE_HIT,
+  EXPERIMENTAL_KVSEP_BPTREE_VALUE_CACHE_MISS,
+  EXPERIMENTAL_KVSEP_BPTREE_VALUE_FILE_READS,
+  EXPERIMENTAL_KVSEP_BPTREE_VALUE_FILE_READ_BYTES,
+
+  EXPERIMENTAL_KVSEP_BPTREE_PAIR_CACHE_HIT,
+  EXPERIMENTAL_KVSEP_BPTREE_PAIR_CACHE_MISS,
+  EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READS,
+  EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READ_BYTES,
+
+  // Experimental KV-sep pair block read attribution (best-effort).
+  // These counters attempt to attribute KV-sep pair block file reads/bytes to
+  // major call paths (Seek vs Scan/Next vs MultiGet). They intentionally count
+  // only when the pair block was not served from block cache.
+  EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READS_SEEK,
+  EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READ_BYTES_SEEK,
+  EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READS_SCAN,
+  EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READ_BYTES_SCAN,
+  EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READS_MULTIGET,
+  EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READ_BYTES_MULTIGET,
+
+  // Experimental: super-block read coalescing cache effectiveness.
+  // Counts how often a data-like block read is satisfied from the thread-local
+  // aligned super-block cache vs requiring a new super-block read.
+  EXPERIMENTAL_SUPER_BLOCK_READ_CACHE_HIT,
+  EXPERIMENTAL_SUPER_BLOCK_READ_CACHE_MISS,
+  // Experimental: reasons why a block read could not use super-block
+  // coalescing/cache.
+  EXPERIMENTAL_SUPER_BLOCK_READ_UNUSABLE_TOO_LARGE,
+  EXPERIMENTAL_SUPER_BLOCK_READ_UNUSABLE_CROSS_BOUNDARY,
+
   NUMBER_MERGE_FAILURES,
 
   // Record the number of calls to GetUpdatesSince. Useful to keep track of

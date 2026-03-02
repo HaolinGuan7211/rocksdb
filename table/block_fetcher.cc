@@ -10,6 +10,7 @@
 #include "table/block_fetcher.h"
 
 #include <cassert>
+#include <array>
 #include <cinttypes>
 #include <string>
 
@@ -37,6 +38,7 @@ struct SuperBlockReadCache {
   AlignedBuf direct_io_buf;
   std::string buffered;
   bool valid = false;
+  uint64_t last_use = 0;
 
   void Reset() {
     file = nullptr;
@@ -45,10 +47,14 @@ struct SuperBlockReadCache {
     direct_io_buf.reset();
     buffered.clear();
     valid = false;
+    last_use = 0;
   }
 };
 
-thread_local SuperBlockReadCache tls_super_block_cache;
+constexpr size_t kSuperBlockReadCacheSlots = 16;
+thread_local std::array<SuperBlockReadCache, kSuperBlockReadCacheSlots>
+    tls_super_block_caches;
+thread_local uint64_t tls_super_block_cache_clock = 1;
 
 inline bool IsPowerOfTwo(size_t x) { return x != 0 && (x & (x - 1)) == 0; }
 }  // namespace
@@ -278,49 +284,90 @@ void BlockFetcher::ReadBlock(bool retry) {
   bool did_physical_read = false;
   size_t physical_read_bytes = 0;
 
+  // Prefer super-block aligned read coalescing for blocks that are commonly
+  // touched on the read path under cache=0 (data + KV-sep pair/value + index).
+  //
+  // Rationale: KV-sep B+Tree tables can issue multiple index-block reads per
+  // Seek/MultiGet. Under simulated NVM + direct reads, coalescing/aligned
+  // caching for index blocks can reduce physical reads and improve locality.
+  const bool super_block_candidate =
+      block_type_ == BlockType::kData || block_type_ == BlockType::kKVSepPair ||
+      block_type_ == BlockType::kKVSepValue || block_type_ == BlockType::kIndex;
   const bool enable_super_block =
-      enable_super_block_read_coalescing_ &&
-      block_type_ == BlockType::kData && !retry &&
-      super_block_alignment_size_ > 0 && IsPowerOfTwo(super_block_alignment_size_);
+      enable_super_block_read_coalescing_ && super_block_candidate && !retry &&
+      super_block_alignment_size_ > 0 &&
+      IsPowerOfTwo(super_block_alignment_size_);
 
   auto try_super_block_cache = [&]() -> bool {
     if (!enable_super_block) {
       return false;
     }
     const size_t sb = super_block_alignment_size_;
+    if (block_size_with_trailer_ > sb) {
+      RecordTick(ioptions_.stats, EXPERIMENTAL_SUPER_BLOCK_READ_UNUSABLE_TOO_LARGE,
+                 1);
+      return false;
+    }
     const uint64_t base = handle_.offset() & ~(static_cast<uint64_t>(sb) - 1);
     const uint64_t delta = handle_.offset() - base;
     if (delta + block_size_with_trailer_ > sb) {
+      RecordTick(ioptions_.stats,
+                 EXPERIMENTAL_SUPER_BLOCK_READ_UNUSABLE_CROSS_BOUNDARY, 1);
       return false;
     }
 
     // Ensure we have a local buffer to copy into.
     PrepareBufferForBlockFromFile();
 
-    // Cache hit path.
-    if (tls_super_block_cache.valid && tls_super_block_cache.file == file_ &&
-        tls_super_block_cache.base_offset == base &&
-        tls_super_block_cache.bytes >= delta + block_size_with_trailer_) {
+    // Cache hit path (any slot).
+    for (auto& c : tls_super_block_caches) {
+      if (!c.valid || c.file != file_ || c.base_offset != base) {
+        continue;
+      }
+      if (c.bytes < delta + block_size_with_trailer_) {
+        continue;
+      }
       const char* src = nullptr;
       if (file_->use_direct_io()) {
-        src = static_cast<const char*>(tls_super_block_cache.direct_io_buf.get());
+        src = static_cast<const char*>(c.direct_io_buf.get());
       } else {
-        src = tls_super_block_cache.buffered.data();
+        src = c.buffered.data();
       }
       if (src == nullptr) {
-        tls_super_block_cache.Reset();
-        return false;
+        c.Reset();
+        break;
       }
+      c.last_use = tls_super_block_cache_clock++;
+      RecordTick(ioptions_.stats, EXPERIMENTAL_SUPER_BLOCK_READ_CACHE_HIT, 1);
       memcpy(used_buf_, src + delta, block_size_with_trailer_);
       slice_ = Slice(used_buf_, block_size_with_trailer_);
       used_buf_ = const_cast<char*>(slice_.data());
       return true;
     }
 
+    RecordTick(ioptions_.stats, EXPERIMENTAL_SUPER_BLOCK_READ_CACHE_MISS, 1);
+
     // Cache miss: read a whole super block and cache it (best-effort).
-    tls_super_block_cache.Reset();
-    tls_super_block_cache.file = file_;
-    tls_super_block_cache.base_offset = base;
+    // Prefer an unused slot; otherwise evict the least-recently-used.
+    SuperBlockReadCache* victim = nullptr;
+    for (auto& c : tls_super_block_caches) {
+      if (!c.valid) {
+        victim = &c;
+        break;
+      }
+    }
+    if (victim == nullptr) {
+      victim = &tls_super_block_caches[0];
+      for (auto& c : tls_super_block_caches) {
+        if (c.last_use < victim->last_use) {
+          victim = &c;
+        }
+      }
+    }
+    assert(victim != nullptr);
+    victim->Reset();
+    victim->file = file_;
+    victim->base_offset = base;
 
     Slice sb_slice;
     if (file_->use_direct_io()) {
@@ -329,34 +376,35 @@ void BlockFetcher::ReadBlock(bool retry) {
           block_read_cpu_time,
           ioptions_.env ? ioptions_.env->GetSystemClock().get() : nullptr);
       io_status_ = file_->Read(opts, base, sb, &sb_slice, /*scratch=*/nullptr,
-                               &tls_super_block_cache.direct_io_buf, &dbg);
+                               &victim->direct_io_buf, &dbg);
       did_physical_read = true;
       physical_read_bytes = sb_slice.size();
     } else {
-      tls_super_block_cache.buffered.resize(sb);
+      victim->buffered.resize(sb);
       PERF_TIMER_GUARD(block_read_time);
       PERF_CPU_TIMER_GUARD(
           block_read_cpu_time,
           ioptions_.env ? ioptions_.env->GetSystemClock().get() : nullptr);
       io_status_ =
           file_->Read(opts, base, sb, &sb_slice,
-                      /*scratch=*/tls_super_block_cache.buffered.data(),
+                      /*scratch=*/victim->buffered.data(),
                       /*aligned_buf=*/nullptr, &dbg);
       did_physical_read = true;
       physical_read_bytes = sb_slice.size();
     }
     if (!io_status_.ok()) {
-      tls_super_block_cache.Reset();
+      victim->Reset();
       return true;  // handled (error)
     }
     if (sb_slice.size() < delta + block_size_with_trailer_) {
       // Unexpected truncation: fall back to normal read.
-      tls_super_block_cache.Reset();
+      victim->Reset();
       return false;
     }
 
-    tls_super_block_cache.bytes = sb_slice.size();
-    tls_super_block_cache.valid = true;
+    victim->bytes = sb_slice.size();
+    victim->valid = true;
+    victim->last_use = tls_super_block_cache_clock++;
     const char* src = sb_slice.data();
     memcpy(used_buf_, src + delta, block_size_with_trailer_);
     slice_ = Slice(used_buf_, block_size_with_trailer_);

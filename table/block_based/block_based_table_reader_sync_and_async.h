@@ -4,6 +4,9 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <algorithm>
+#include <memory>
+
 #include "util/async_file_reader.h"
 #include "util/coro_utils.h"
 
@@ -310,6 +313,556 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
       /*_get_from_user_specified_snapshot=*/read_options.snapshot != nullptr};
   FullFilterKeysMayMatch(filter, &sst_file_range, prefix_extractor,
                          &metadata_lookup_context, read_options);
+
+  if (!sst_file_range.empty() && rep_->experimental_kvsep_bptree_enabled &&
+      (rep_->kvsep_bptree_leaf_format_version == 2 ||
+       rep_->kvsep_bptree_leaf_format_version == 3)) {
+    const bool kvsep_leaf_v2 = rep_->kvsep_bptree_leaf_format_version == 2;
+    const bool kvsep_pair_v3 = rep_->kvsep_bptree_leaf_format_version == 3;
+
+    // Experimental KV-sep leaf (v2) / pair (v3) uses a custom per-leaf encoding,
+    // so the existing MultiGet path (which assumes standard data blocks) is not
+    // applicable.
+    //
+    // Fast path: group keys by leaf BlockHandle and reuse:
+    //  - leaf block read + parse
+    //  - per-leaf value-only block read
+    //
+    // This is designed to reduce redundant I/O and parsing when many keys fall
+    // into the same leaf.
+
+    if (!rep_->table_options.experimental_kvsep_bptree_multiget_leaf_grouping) {
+      // Baseline / correctness-first path: fall back to per-key Get().
+      for (auto miter = sst_file_range.begin(); miter != sst_file_range.end();
+           ++miter) {
+        if (miter->s == nullptr) {
+          continue;
+        }
+        *(miter->s) = Status::OK();
+        if (miter->get_context == nullptr) {
+          continue;
+        }
+        // FullFilterKeysMayMatch() already ran above.
+        *(miter->s) =
+            Get(read_options, miter->ikey, miter->get_context, prefix_extractor,
+                /*skip_filters=*/true);
+      }
+      CO_RETURN;
+    }
+
+    IndexBlockIter iiter_on_stack;
+    bool need_upper_bound_check = false;
+    if (rep_->index_type == BlockBasedTableOptions::kHashSearch) {
+      need_upper_bound_check = PrefixExtractorChanged(prefix_extractor);
+    }
+    auto iiter = NewIndexIterator(
+        read_options, need_upper_bound_check, &iiter_on_stack,
+        sst_file_range.begin()->get_context, &metadata_lookup_context);
+    std::unique_ptr<InternalIteratorBase<IndexValue>> iiter_unique_ptr;
+    if (iiter != &iiter_on_stack) {
+      iiter_unique_ptr.reset(iiter);
+    }
+
+    struct LeafGroup {
+      BlockHandle leaf;
+      autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE> keys;
+    };
+    autovector<LeafGroup, MultiGetContext::MAX_BATCH_SIZE> groups;
+
+    auto add_to_group = [&](const BlockHandle& leaf, KeyContext* kc) {
+      for (auto& g : groups) {
+        if (g.leaf.offset() == leaf.offset() && g.leaf.size() == leaf.size()) {
+          g.keys.push_back(kc);
+          return;
+        }
+      }
+      LeafGroup ng;
+      ng.leaf = leaf;
+      ng.keys.push_back(kc);
+      groups.push_back(std::move(ng));
+    };
+
+    // 1) Locate leaf handle for each key via the KV-sep B+tree index.
+    for (auto miter = sst_file_range.begin(); miter != sst_file_range.end();
+         ++miter) {
+      if (miter->s == nullptr) {
+        continue;
+      }
+      // Default to OK (not found is not an error).
+      *(miter->s) = Status::OK();
+      if (miter->get_context == nullptr) {
+        continue;
+      }
+
+      iiter->Seek(miter->ikey);
+      if (!iiter->status().ok()) {
+        *(miter->s) = iiter->status();
+        continue;
+      }
+      if (!iiter->Valid()) {
+        continue;
+      }
+      if (UNLIKELY(iiter->value().handle.IsNull())) {
+        *(miter->s) = Status::Corruption(
+            kvsep_pair_v3 ? "kvsep pair v3: null pair handle"
+                          : "kvsep leaf v2: null leaf handle");
+        continue;
+      }
+      if (UNLIKELY(iiter->value().handle.offset() + iiter->value().handle.size() +
+                       BlockBasedTable::kBlockTrailerSize >
+                   rep_->file_size)) {
+        *(miter->s) = Status::Corruption(
+            kvsep_pair_v3 ? "kvsep pair v3: pair handle out of file range"
+                          : "kvsep leaf v2: leaf handle out of file range");
+        continue;
+      }
+      add_to_group(iiter->value().handle, &(*miter));
+    }
+
+    uint64_t grouped_keys = 0;
+    for (const auto& g : groups) {
+      grouped_keys += g.keys.size();
+    }
+    RecordTick(rep_->ioptions.stats, EXPERIMENTAL_KVSEP_BPTREE_MGET_KEYS_GROUPED,
+               grouped_keys);
+    RecordTick(rep_->ioptions.stats, EXPERIMENTAL_KVSEP_BPTREE_MGET_LEAF_GROUPS,
+               groups.size());
+    if (grouped_keys >= groups.size()) {
+      RecordTick(rep_->ioptions.stats,
+                 EXPERIMENTAL_KVSEP_BPTREE_MGET_LEAF_REUSE_KEYS,
+                 grouped_keys - groups.size());
+    }
+
+    // 2) Sort groups by on-disk offset for better locality (small N).
+    std::sort(groups.begin(), groups.end(),
+              [](const LeafGroup& a, const LeafGroup& b) {
+                return a.leaf.offset() < b.leaf.offset();
+              });
+
+    // 2.5) Use a shared prefetch buffer across groups. Since we sort by offset,
+    // these reads are usually sequential and can benefit from readahead.
+    std::unique_ptr<FilePrefetchBuffer> kvsep_prefetch_buffer;
+    CreateExperimentalKVSepPrefetchBufferIfNeeded(
+        rep_, read_options, &kvsep_prefetch_buffer,
+        /*fallback_readahead_bytes=*/256 * 1024, FilePrefetchBufferUsage::kUnknown);
+    FilePrefetchBuffer* const kvsep_fpb = kvsep_prefetch_buffer.get();
+
+    // 3) Process each leaf group.
+    for (auto& g : groups) {
+      RecordTick(rep_->ioptions.stats, EXPERIMENTAL_KVSEP_BPTREE_MGET_LEAF_BLOCKS,
+                 1);
+      BlockCacheLookupContext leaf_lookup_context{
+          TableReaderCaller::kUserMultiGet, tracing_mget_id,
+          /*get_from_user_specified_snapshot=*/read_options.snapshot != nullptr};
+
+      if (kvsep_leaf_v2) {
+        CachableEntry<Block_kKVSepLeaf> leaf_block;
+        Status leaf_status = RetrieveBlock<Block_kKVSepLeaf>(
+            /*prefetch_buffer=*/kvsep_fpb, read_options, g.leaf,
+            rep_->decompressor.get(), &leaf_block,
+            /*get_context=*/g.keys.front()->get_context, &leaf_lookup_context,
+            /*for_compaction=*/false, /*use_cache=*/read_options.fill_cache,
+            /*async_read=*/false,
+            /*use_block_cache_for_lookup=*/true);
+        if (kvsep_fpb) {
+          kvsep_fpb->UpdateReadPattern(g.leaf.offset(),
+                                      BlockBasedTable::BlockSizeWithTrailer(g.leaf),
+                                      read_options.adaptive_readahead);
+        }
+
+        if (read_options.read_tier == kBlockCacheTier &&
+            leaf_status.IsIncomplete()) {
+          for (auto* kc : g.keys) {
+            if (kc->get_context) {
+              kc->get_context->MarkKeyMayExist();
+            }
+            if (kc->s) {
+              *(kc->s) = leaf_status;
+            }
+          }
+          continue;
+        }
+        if (!leaf_status.ok()) {
+          for (auto* kc : g.keys) {
+            if (kc->s) {
+              *(kc->s) = leaf_status;
+            }
+          }
+          continue;
+        }
+        if (UNLIKELY(leaf_block.GetValue() == nullptr)) {
+          Status s = Status::Corruption("kvsep leaf v2: missing leaf block");
+          for (auto* kc : g.keys) {
+            if (kc->s) {
+              *(kc->s) = s;
+            }
+          }
+          continue;
+        }
+        if (UNLIKELY(leaf_block.GetValue()->ContentSlice().size() < 4)) {
+          Status s = Status::Corruption(
+              "kvsep leaf v2: leaf block too small: off=" +
+              std::to_string(g.leaf.offset()) +
+              " size=" + std::to_string(g.leaf.size()) +
+              " block_bytes=" +
+              std::to_string(leaf_block.GetValue()->ContentSlice().size()));
+          for (auto* kc : g.keys) {
+            if (kc->s) {
+              *(kc->s) = s;
+            }
+          }
+          continue;
+        }
+
+        KVSepBptreeLeafV2View leaf_view;
+        Status parse_s =
+            leaf_view.InitFromContents(leaf_block.GetValue()->ContentSlice());
+        if (UNLIKELY(!parse_s.ok())) {
+          for (auto* kc : g.keys) {
+            if (kc->s) {
+              *(kc->s) = parse_s;
+            }
+          }
+          continue;
+        }
+
+        // Load the per-leaf value-only block once.
+        const BlockHandle vb_handle = leaf_view.value_block_handle();
+        CachableEntry<Block_kKVSepValue> kvsep_value_block;
+        Status vb_status = Status::OK();
+        if (!vb_handle.IsNull()) {
+          RecordTick(rep_->ioptions.stats,
+                     EXPERIMENTAL_KVSEP_BPTREE_MGET_VALUE_BLOCKS, 1);
+          vb_status = KVSepBptreeGetValueBlock(read_options, vb_handle,
+                                               &kvsep_value_block,
+                                               &leaf_lookup_context, kvsep_fpb);
+        }
+        if (UNLIKELY(!vb_status.ok())) {
+          for (auto* kc : g.keys) {
+            if (kc->s) {
+              *(kc->s) = vb_status;
+            }
+          }
+          continue;
+        }
+        const Slice vb_contents =
+            kvsep_value_block.GetValue()
+                ? kvsep_value_block.GetValue()->ContentSlice()
+                : Slice();
+
+        // Helper: lower_bound in leaf by internal key comparator.
+        auto lower_bound =
+            [&](const Slice& target, std::string* scratch) -> uint32_t {
+          const size_t prefix_len = leaf_view.prefix().size();
+          uint32_t left = 0;
+          uint32_t right = leaf_view.num_entries();
+          while (left < right) {
+            const uint32_t mid = left + (right - left) / 2;
+            const Slice mid_key = (prefix_len == 0)
+                                      ? leaf_view.SuffixAt(mid)
+                                      : leaf_view.FullKeyAtWithScratchPrefix(
+                                            mid, scratch, prefix_len);
+            const int cmp = rep_->internal_comparator.Compare(mid_key, target);
+            if (cmp < 0) {
+              left = mid + 1;
+            } else {
+              right = mid;
+            }
+          }
+          return left;
+        };
+
+        UserComparatorWrapper ucmp(rep_->internal_comparator.user_comparator());
+
+        // 4) Resolve each key within this leaf.
+        std::string entry_key_scratch;
+        entry_key_scratch.reserve(64);
+        const size_t leaf_prefix_len = leaf_view.prefix().size();
+        if (leaf_prefix_len != 0) {
+          entry_key_scratch.assign(leaf_view.prefix().data(), leaf_prefix_len);
+        }
+        for (auto* kc : g.keys) {
+          if (kc == nullptr || kc->s == nullptr) {
+            continue;
+          }
+          // If an earlier stage already set an error, keep it.
+          if (!kc->s->ok()) {
+            continue;
+          }
+          if (kc->get_context == nullptr) {
+            continue;
+          }
+
+          const Slice& ikey = kc->ikey;
+          const Slice target_user_key = ExtractUserKey(ikey);
+          bool matched = false;
+          bool done = false;
+          if (leaf_prefix_len != 0) {
+            entry_key_scratch.resize(leaf_prefix_len);
+          } else {
+            entry_key_scratch.clear();
+          }
+          const uint32_t pos = lower_bound(ikey, &entry_key_scratch);
+          for (uint32_t i = pos; i < leaf_view.num_entries() && !done; ++i) {
+            const Slice entry_key =
+                (leaf_prefix_len == 0)
+                    ? leaf_view.SuffixAt(i)
+                    : leaf_view.FullKeyAtWithScratchPrefix(i, &entry_key_scratch,
+                                                          leaf_prefix_len);
+
+            // Stop once we've moved past this user key.
+            if (ucmp.CompareWithoutTimestamp(ExtractUserKey(entry_key),
+                                             target_user_key) > 0) {
+              break;
+            }
+
+            ParsedInternalKey parsed_key;
+            Status pik_status =
+                ParseInternalKey(entry_key, &parsed_key, false /* log_err_key */);
+            if (UNLIKELY(!pik_status.ok())) {
+              *(kc->s) = pik_status;
+              done = true;
+              break;
+            }
+
+            Slice value_to_save;
+            const uint32_t value_len = leaf_view.ValueLenAt(i);
+            if (value_len == 0) {
+              value_to_save = Slice();
+            } else {
+              const uint32_t value_off = leaf_view.ValueOffAt(i);
+              if (UNLIKELY(static_cast<size_t>(value_off) +
+                               static_cast<size_t>(value_len) >
+                           vb_contents.size())) {
+                *(kc->s) = Status::Corruption(
+                    "kvsep leaf v2: value pointer out of range");
+                done = true;
+                break;
+              }
+              value_to_save = Slice(vb_contents.data() + value_off, value_len);
+            }
+
+            Status read_status;
+            bool ret = kc->get_context->SaveValue(
+                parsed_key, value_to_save, &matched, &read_status,
+                /*value_pinner=*/nullptr);
+            if (UNLIKELY(!read_status.ok())) {
+              *(kc->s) = read_status;
+              done = true;
+              break;
+            }
+            if (!ret) {
+              done = true;
+              break;
+            }
+          }
+
+          // If SaveValue indicates we still need more operands (e.g. merge) and
+          // they spilled into the next leaf, fall back to Get() for correctness.
+          if (kc->s->ok() && !done &&
+              kc->get_context->State() == GetContext::GetState::kMerge) {
+            RecordTick(rep_->ioptions.stats,
+                       EXPERIMENTAL_KVSEP_BPTREE_MGET_FALLBACK_GET, 1);
+            *(kc->s) =
+                Get(read_options, kc->ikey, kc->get_context, prefix_extractor,
+                    /*skip_filters=*/true);
+          }
+        }
+      } else {
+        assert(kvsep_pair_v3);
+
+        CachableEntry<Block_kKVSepPair> pair_block;
+        Status pair_status = RetrieveBlock<Block_kKVSepPair>(
+            /*prefetch_buffer=*/kvsep_fpb, read_options, g.leaf,
+            rep_->decompressor.get(), &pair_block,
+            /*get_context=*/g.keys.front()->get_context, &leaf_lookup_context,
+            /*for_compaction=*/false, /*use_cache=*/read_options.fill_cache,
+            /*async_read=*/false,
+            /*use_block_cache_for_lookup=*/true);
+        if (kvsep_fpb) {
+          kvsep_fpb->UpdateReadPattern(g.leaf.offset(),
+                                      BlockBasedTable::BlockSizeWithTrailer(g.leaf),
+                                      read_options.adaptive_readahead);
+        }
+        if (pair_status.ok() && !pair_block.IsCached()) {
+          const uint64_t bytes = BlockBasedTable::BlockSizeWithTrailer(g.leaf);
+          RecordTick(rep_->ioptions.stats,
+                     EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READS_MULTIGET, 1);
+          RecordTick(
+              rep_->ioptions.stats,
+              EXPERIMENTAL_KVSEP_BPTREE_PAIR_FILE_READ_BYTES_MULTIGET, bytes);
+        }
+
+        if (read_options.read_tier == kBlockCacheTier &&
+            pair_status.IsIncomplete()) {
+          for (auto* kc : g.keys) {
+            if (kc->get_context) {
+              kc->get_context->MarkKeyMayExist();
+            }
+            if (kc->s) {
+              *(kc->s) = pair_status;
+            }
+          }
+          continue;
+        }
+        if (!pair_status.ok()) {
+          for (auto* kc : g.keys) {
+            if (kc->s) {
+              *(kc->s) = pair_status;
+            }
+          }
+          continue;
+        }
+        if (UNLIKELY(pair_block.GetValue() == nullptr)) {
+          Status s = Status::Corruption("kvsep pair v3: missing pair block");
+          for (auto* kc : g.keys) {
+            if (kc->s) {
+              *(kc->s) = s;
+            }
+          }
+          continue;
+        }
+
+        KVSepBptreePairV3View pair_view;
+        Status parse_pair =
+            pair_view.InitFromContents(pair_block.GetValue()->ContentSlice());
+        if (UNLIKELY(!parse_pair.ok())) {
+          for (auto* kc : g.keys) {
+            if (kc->s) {
+              *(kc->s) = parse_pair;
+            }
+          }
+          continue;
+        }
+        KVSepBptreeLeafV3View leaf_view;
+        Status parse_leaf = leaf_view.InitFromContents(pair_view.leaf_contents());
+        if (UNLIKELY(!parse_leaf.ok())) {
+          for (auto* kc : g.keys) {
+            if (kc->s) {
+              *(kc->s) = parse_leaf;
+            }
+          }
+          continue;
+        }
+
+        const Slice vb_contents = pair_view.value_contents();
+
+        auto lower_bound =
+            [&](const Slice& target, std::string* scratch) -> uint32_t {
+          const size_t prefix_len = leaf_view.prefix().size();
+          uint32_t left = 0;
+          uint32_t right = leaf_view.num_entries();
+          while (left < right) {
+            const uint32_t mid = left + (right - left) / 2;
+            const Slice mid_key = (prefix_len == 0)
+                                      ? leaf_view.SuffixAt(mid)
+                                      : leaf_view.FullKeyAtWithScratchPrefix(
+                                            mid, scratch, prefix_len);
+            const int cmp = rep_->internal_comparator.Compare(mid_key, target);
+            if (cmp < 0) {
+              left = mid + 1;
+            } else {
+              right = mid;
+            }
+          }
+          return left;
+        };
+
+        UserComparatorWrapper ucmp(rep_->internal_comparator.user_comparator());
+
+        std::string entry_key_scratch;
+        entry_key_scratch.reserve(64);
+        const size_t leaf_prefix_len = leaf_view.prefix().size();
+        if (leaf_prefix_len != 0) {
+          entry_key_scratch.assign(leaf_view.prefix().data(), leaf_prefix_len);
+        }
+        for (auto* kc : g.keys) {
+          if (kc == nullptr || kc->s == nullptr) {
+            continue;
+          }
+          if (!kc->s->ok()) {
+            continue;
+          }
+          if (kc->get_context == nullptr) {
+            continue;
+          }
+
+          const Slice& ikey = kc->ikey;
+          const Slice target_user_key = ExtractUserKey(ikey);
+          bool matched = false;
+          bool done = false;
+          if (leaf_prefix_len != 0) {
+            entry_key_scratch.resize(leaf_prefix_len);
+          } else {
+            entry_key_scratch.clear();
+          }
+          const uint32_t pos = lower_bound(ikey, &entry_key_scratch);
+          for (uint32_t i = pos; i < leaf_view.num_entries() && !done; ++i) {
+            const Slice entry_key =
+                (leaf_prefix_len == 0)
+                    ? leaf_view.SuffixAt(i)
+                    : leaf_view.FullKeyAtWithScratchPrefix(i, &entry_key_scratch,
+                                                          leaf_prefix_len);
+            if (ucmp.CompareWithoutTimestamp(ExtractUserKey(entry_key),
+                                             target_user_key) > 0) {
+              break;
+            }
+
+            ParsedInternalKey parsed_key;
+            Status pik_status =
+                ParseInternalKey(entry_key, &parsed_key, false /* log_err_key */);
+            if (UNLIKELY(!pik_status.ok())) {
+              *(kc->s) = pik_status;
+              done = true;
+              break;
+            }
+
+            Slice value_to_save;
+            const uint32_t value_len = leaf_view.ValueLenAt(i);
+            if (value_len == 0) {
+              value_to_save = Slice();
+            } else {
+              const uint32_t value_off = leaf_view.ValueOffAt(i);
+              if (UNLIKELY(static_cast<size_t>(value_off) +
+                               static_cast<size_t>(value_len) >
+                           vb_contents.size())) {
+                *(kc->s) =
+                    Status::Corruption("kvsep pair v3: value pointer out of range");
+                done = true;
+                break;
+              }
+              value_to_save = Slice(vb_contents.data() + value_off, value_len);
+            }
+
+            Status read_status;
+            bool ret = kc->get_context->SaveValue(
+                parsed_key, value_to_save, &matched, &read_status,
+                /*value_pinner=*/nullptr);
+            if (UNLIKELY(!read_status.ok())) {
+              *(kc->s) = read_status;
+              done = true;
+              break;
+            }
+            if (!ret) {
+              done = true;
+              break;
+            }
+          }
+
+          if (kc->s->ok() && !done &&
+              kc->get_context->State() == GetContext::GetState::kMerge) {
+            RecordTick(rep_->ioptions.stats,
+                       EXPERIMENTAL_KVSEP_BPTREE_MGET_FALLBACK_GET, 1);
+            *(kc->s) =
+                Get(read_options, kc->ikey, kc->get_context, prefix_extractor,
+                    /*skip_filters=*/true);
+          }
+        }
+      }
+    }
+
+    CO_RETURN;
+  }
 
   if (!sst_file_range.empty()) {
     IndexBlockIter iiter_on_stack;
@@ -682,13 +1235,11 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
           value_pinner = nullptr;
         }
 
-        BlockHandle kvsep_value_block_handle;
         const bool kvsep_enabled = rep_->experimental_kvsep_bptree_enabled;
-        const bool kvsep_have_value_handle =
-            kvsep_enabled && KVSepBptreeLookupValueHandle(cur_data_block_handle,
-                                                         &kvsep_value_block_handle);
         CachableEntry<Block_kKVSepValue> kvsep_value_block;
         bool kvsep_value_block_loaded = false;
+        BlockHandle kvsep_value_block_loaded_handle =
+            BlockHandle::NullBlockHandle();
 
         bool may_exist = biter->SeekForGet(key);
         if (!may_exist) {
@@ -710,13 +1261,11 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
           }
           Slice value_to_save = biter->value();
           if (kvsep_enabled) {
-            if (UNLIKELY(!kvsep_have_value_handle)) {
-              s = Status::Corruption("kvsep enabled but missing value map entry");
-              break;
-            }
+            BlockHandle kvsep_value_block_handle;
             uint32_t value_off = 0;
             uint32_t value_len = 0;
             Status decode_status = KVSepBptreeDecodePointer(value_to_save,
+                                                           &kvsep_value_block_handle,
                                                            &value_off, &value_len);
             if (UNLIKELY(!decode_status.ok())) {
               s = decode_status;
@@ -725,7 +1274,11 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
             if (value_len == 0) {
               value_to_save = Slice();
             } else {
-              if (!kvsep_value_block_loaded) {
+              if (!kvsep_value_block_loaded ||
+                  kvsep_value_block_loaded_handle.offset() !=
+                      kvsep_value_block_handle.offset() ||
+                  kvsep_value_block_loaded_handle.size() !=
+                      kvsep_value_block_handle.size()) {
                 Status vb_status = KVSepBptreeGetValueBlock(
                     read_options, kvsep_value_block_handle, &kvsep_value_block,
                     lookup_data_block_context);
@@ -734,6 +1287,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
                   break;
                 }
                 kvsep_value_block_loaded = true;
+                kvsep_value_block_loaded_handle = kvsep_value_block_handle;
               }
               if (UNLIKELY(kvsep_value_block.GetValue() == nullptr)) {
                 s = Status::Corruption("kvsep missing value block");

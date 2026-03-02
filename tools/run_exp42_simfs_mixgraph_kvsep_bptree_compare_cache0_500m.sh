@@ -122,6 +122,18 @@ KVSEP_ENABLE="${KVSEP_ENABLE:-1}"
 KVSEP_LEAF_BYTES="${KVSEP_LEAF_BYTES:-16384}"
 KVSEP_VALUE_BYTES="${KVSEP_VALUE_BYTES:-16384}"
 KVSEP_FANOUT="${KVSEP_FANOUT:-64}"
+KVSEP_LEAF_PREFIX_COMPRESS="${KVSEP_LEAF_PREFIX_COMPRESS:-1}"
+KVSEP_PAIR_BLOCKS="${KVSEP_PAIR_BLOCKS:-1}"
+# KV-sep on-disk layout knob: pad after each pair block so the next pair block
+# starts at a super-block boundary (requires clear DB + rebuild).
+KVSEP_ALIGN_PAIR_BLOCKS="${KVSEP_ALIGN_PAIR_BLOCKS:-0}"
+# Under super-block aligned reads (e.g. 16KB), compressing KV-sep pair/value
+# blocks can be counter-productive under cache=0: we still read the full aligned
+# super-block, but also pay decompress CPU. Disable by default for experiments.
+KVSEP_DISABLE_COMPRESSION="${KVSEP_DISABLE_COMPRESSION:-0}"
+# MultiGet implementation knob (runtime). Keeping it explicit makes it easy to
+# compare with/without leaf-handle grouping for locality-heavy multigets.
+KVSEP_MGET_LEAF_GROUPING="${KVSEP_MGET_LEAF_GROUPING:-1}"
 
 mkdir -p "$EXPERIMENT_DIR"
 
@@ -133,6 +145,27 @@ echo "[exp42] target_db_gib=$TARGET_DB_GIB key_size=$KEY_SIZE value_size=$VALUE_
 echo "[exp42] cache_sizes=$CACHE_SIZES threads=$THREADS duration=$MIXGRAPH_DURATION_SECONDS"
 echo "[exp42] tmpfs_redirect=$USE_TMPFS_REDIRECT tmpfs_root=$TMPFS_ROOT"
 echo "[exp42] DB_DIR=$DB_DIR WAL_DIR=$WAL_DIR"
+
+if [[ "$USE_TMPFS_REDIRECT" == "1" ]]; then
+  tmpfs_parent="$(dirname "$TMPFS_ROOT")"
+  if [[ ! -d "$tmpfs_parent" ]]; then
+    echo "[exp42] ERROR: TMPFS_ROOT parent dir missing: $tmpfs_parent" >&2
+    exit 2
+  fi
+  fs_type="$(stat -f -c %T "$tmpfs_parent" 2>/dev/null || echo unknown)"
+  if [[ "$fs_type" != "tmpfs" ]]; then
+    echo "[exp42] WARN: TMPFS_ROOT parent is not tmpfs (fs_type=$fs_type): $tmpfs_parent" >&2
+    echo "[exp42]       This may re-introduce base FS noise into simfs results." >&2
+  fi
+  avail_bytes="$(df -B1 --output=avail "$tmpfs_parent" | tail -n 1 | tr -d ' ')"
+  req_bytes="$(awk -v gib="$TARGET_DB_GIB" 'BEGIN { printf "%.0f", gib*1024*1024*1024*1.25 }')"
+  if [[ -n "$avail_bytes" && "$avail_bytes" -lt "$req_bytes" ]]; then
+    echo "[exp42] ERROR: insufficient tmpfs space under $tmpfs_parent" >&2
+    echo "[exp42]        avail_bytes=$avail_bytes req_bytes~=$req_bytes (target_db_gib=$TARGET_DB_GIB)" >&2
+    echo "[exp42]        Suggest: mount a larger tmpfs and set TMPFS_ROOT accordingly." >&2
+    exit 2
+  fi
+fi
 
 common_simfs_args=(
   --histogram=1
@@ -272,14 +305,33 @@ run_one() {
     bash "$RUNNER"
 
   echo "[exp42][$case_label] post-process: mixgraph monitoring figures"
-  python3 "$ROOT_DIR/tools/plot_mixgraph_monitoring.py" --run_dir "$out_dir"
+  # plot_mixgraph_monitoring expects mix_monitor_window CSVs. When monitoring is
+  # disabled for quick iteration, skip hard-fail and keep the experiment moving.
+  python3 "$ROOT_DIR/tools/plot_mixgraph_monitoring.py" --run_dir "$out_dir" || \
+    echo "[exp42][$case_label] WARN: mixgraph monitoring plots skipped (missing CSVs?)" >&2
   if [[ "$POST_TAIL_PROBE_ENABLE" == "1" ]]; then
     echo "[exp42][$case_label] post-process: tail probe attribution (max_samples=$TAIL_PROBE_MAX_SAMPLES)"
-    python3 "$ROOT_DIR/tools/run_tail_probe_from_run_dir.py" \
-      --run_dir "$out_dir" \
-      --out_subdir tail_probe \
-      --max_samples "$TAIL_PROBE_MAX_SAMPLES" \
-      --duration_override_seconds "$POST_TAIL_PROBE_DURATION_SECONDS"
+    # Tail-probe reruns can fail intermittently (e.g., checksum mismatch surfaced
+    # as corruption). Retry a small number of times so the overall experiment
+    # can proceed and still capture useful samples most of the time.
+    local tail_probe_retries="${POST_TAIL_PROBE_RETRIES:-2}"
+    local attempt=1
+    while true; do
+      if python3 "$ROOT_DIR/tools/run_tail_probe_from_run_dir.py" \
+        --run_dir "$out_dir" \
+        --out_subdir tail_probe \
+        --max_samples "$TAIL_PROBE_MAX_SAMPLES" \
+        --duration_override_seconds "$POST_TAIL_PROBE_DURATION_SECONDS"; then
+        break
+      fi
+      if [[ "$attempt" -ge "$tail_probe_retries" ]]; then
+        echo "[exp42][$case_label] WARN: tail probe failed after ${attempt}/${tail_probe_retries} attempts; continuing." >&2
+        break
+      fi
+      attempt=$((attempt + 1))
+      echo "[exp42][$case_label] WARN: tail probe failed; retrying attempt ${attempt}/${tail_probe_retries}..." >&2
+      sleep 2
+    done
   fi
 }
 
@@ -305,7 +357,12 @@ if case_wanted "kvsep_bptree"; then
     --experimental_kvsep_bptree_enable="$KVSEP_ENABLE" \
     --experimental_kvsep_bptree_leaf_block_bytes="$KVSEP_LEAF_BYTES" \
     --experimental_kvsep_bptree_value_block_bytes="$KVSEP_VALUE_BYTES" \
-    --experimental_kvsep_bptree_fanout="$KVSEP_FANOUT"
+    --experimental_kvsep_bptree_fanout="$KVSEP_FANOUT" \
+    --experimental_kvsep_bptree_leaf_prefix_compress="$KVSEP_LEAF_PREFIX_COMPRESS" \
+    --experimental_kvsep_bptree_disable_compression="$KVSEP_DISABLE_COMPRESSION" \
+    --experimental_kvsep_bptree_pair_blocks="$KVSEP_PAIR_BLOCKS" \
+    --experimental_kvsep_bptree_superblock_align_pair_blocks="$KVSEP_ALIGN_PAIR_BLOCKS" \
+    --experimental_kvsep_bptree_multiget_leaf_grouping="$KVSEP_MGET_LEAF_GROUPING"
 fi
 
 echo "[exp42] done: $EXPERIMENT_DIR"

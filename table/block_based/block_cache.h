@@ -90,6 +90,31 @@ class Block_kKVSepValue : public BlockContents {
   const Slice& ContentSlice() const { return data; }
 };
 
+// Experimental: KV-sep leaf v2 blocks are not standard KV blocks (no restart
+// array / block footer), so they must be cached as raw BlockContents.
+// On-disk, they are still stored as BlockType::kIndex.
+class Block_kKVSepLeaf : public BlockContents {
+ public:
+  static constexpr CacheEntryRole kCacheEntryRole = CacheEntryRole::kIndexBlock;
+  static constexpr BlockType kBlockType = BlockType::kIndex;
+
+  explicit Block_kKVSepLeaf(BlockContents&& other) : BlockContents(std::move(other)) {}
+  const Slice& ContentSlice() const { return data; }
+};
+
+// Experimental: KV-sep pair v3 blocks are custom (not standard Block KV
+// encoding) and contain both leaf metadata and value bytes in one on-disk
+// block. Cache them as raw BlockContents.
+class Block_kKVSepPair : public BlockContents {
+ public:
+  static constexpr CacheEntryRole kCacheEntryRole = CacheEntryRole::kDataBlock;
+  static constexpr BlockType kBlockType = BlockType::kKVSepPair;
+
+  explicit Block_kKVSepPair(BlockContents&& other)
+      : BlockContents(std::move(other)) {}
+  const Slice& ContentSlice() const { return data; }
+};
+
 struct BlockCreateContext : public Cache::CreateContext {
   BlockCreateContext() {}
   BlockCreateContext(const BlockBasedTableOptions* _table_options,
@@ -152,6 +177,10 @@ struct BlockCreateContext : public Cache::CreateContext {
   void Create(std::unique_ptr<Block_kUserDefinedIndex>* parsed_out,
               BlockContents&& block);
   void Create(std::unique_ptr<Block_kKVSepValue>* parsed_out,
+              BlockContents&& block);
+  void Create(std::unique_ptr<Block_kKVSepPair>* parsed_out,
+              BlockContents&& block);
+  void Create(std::unique_ptr<Block_kKVSepLeaf>* parsed_out,
               BlockContents&& block);
   void Create(std::unique_ptr<ParsedFullFilterBlock>* parsed_out,
               BlockContents&& block);

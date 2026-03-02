@@ -139,21 +139,13 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
       return block_iter_.value();
     }
 
-    // KV-separation: block_iter_.value() encodes (value_off, value_len) into
-    // a corresponding value-only block for the current data block.
-    const BlockHandle data_block_handle = index_iter_->value().handle;
+    // KV-separation: block_iter_.value() encodes:
+    //   (value_block_handle, value_off, value_len).
     BlockHandle value_block_handle;
-    if (UNLIKELY(!table_->KVSepBptreeLookupValueHandle(data_block_handle,
-                                                      &value_block_handle))) {
-      kvsep_status_ =
-          Status::Corruption("kvsep missing value block mapping for data block");
-      return Slice();
-    }
-
     uint32_t value_off = 0;
     uint32_t value_len = 0;
     Status decode_status = BlockBasedTable::KVSepBptreeDecodePointer(
-        block_iter_.value(), &value_off, &value_len);
+        block_iter_.value(), &value_block_handle, &value_off, &value_len);
     if (UNLIKELY(!decode_status.ok())) {
       kvsep_status_ = decode_status;
       return Slice();

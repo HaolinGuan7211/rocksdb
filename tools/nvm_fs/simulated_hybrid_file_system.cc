@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -211,17 +212,17 @@ struct XPReadStreamState {
 };
 
 struct XPBufferLineKey {
-  std::string file_name;
+  uint32_t file_id = 0;
   uint64_t line_idx = 0;
   bool operator==(const XPBufferLineKey& rhs) const {
-    return line_idx == rhs.line_idx && file_name == rhs.file_name;
+    return line_idx == rhs.line_idx && file_id == rhs.file_id;
   }
 };
 
 struct XPBufferLineKeyHash {
   size_t operator()(const XPBufferLineKey& k) const {
-    size_t h1 = std::hash<std::string>{}(k.file_name);
-    size_t h2 = std::hash<uint64_t>{}(k.line_idx);
+    const size_t h1 = std::hash<uint32_t>{}(k.file_id);
+    const size_t h2 = std::hash<uint64_t>{}(k.line_idx);
     return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
   }
 };
@@ -231,10 +232,25 @@ struct XPControllerState {
   std::vector<uint64_t> rpq_server_available_ns;
   std::deque<XPWriteQueueEntry> wpq;
   std::deque<uint64_t> rpq_finish_times;
+
+  // XPBuffer: a small fixed-capacity LRU of recently accessed "lines".
+  //
+  // This is on the *simulation* fast path (protected by g_xp_mu). For small
+  // capacities (e.g. 16KB buffer / 256B line = 64 lines), a vector-based LRU
+  // avoids hashing and allocations while preserving exact LRU semantics.
+  bool xp_use_small_lru = false;
+  uint64_t xp_small_capacity_lines = 0;
+  std::vector<XPBufferLineKey> xp_small_lru;
+
+  // Fallback for large capacities.
   std::list<XPBufferLineKey> xp_buffer_lru;
   std::unordered_map<XPBufferLineKey, std::list<XPBufferLineKey>::iterator,
                      XPBufferLineKeyHash>
       xp_buffer_index;
+  bool xp_buffer_reserved = false;
+
+  std::unordered_map<std::string, uint32_t> file_name_to_id;
+  uint32_t next_file_id = 1;
   uint32_t wpq_rr_cursor = 0;
   uint32_t rpq_rr_cursor = 0;
   std::unordered_map<std::string, uint32_t> write_stream_server;
@@ -907,12 +923,85 @@ uint64_t GetXpBufferCapacityLines(const SimulatedStorageModelOptions& options) {
   return std::max<uint64_t>(1, options.xp_buffer_bytes / line_bytes);
 }
 
-void TouchXpBufferLine(XPControllerState* state, const std::string& file_name,
-                       uint64_t line_idx, uint64_t capacity_lines) {
+constexpr uint64_t kXpSmallMaxLines = 4096;
+
+uint32_t GetXpFileId(XPControllerState* state, const std::string& file_name) {
+  if (state == nullptr) {
+    return 0;
+  }
+  auto it = state->file_name_to_id.find(file_name);
+  if (it != state->file_name_to_id.end()) {
+    return it->second;
+  }
+  const uint32_t id = state->next_file_id++;
+  auto inserted = state->file_name_to_id.emplace(file_name, id);
+  return inserted.first->second;
+}
+
+void EnsureXpBufferModeInitialized(XPControllerState* state,
+                                  uint64_t capacity_lines) {
+  if (state == nullptr) {
+    return;
+  }
+  if (state->xp_use_small_lru || state->xp_buffer_reserved ||
+      state->xp_small_capacity_lines != 0) {
+    return;
+  }
+  if (capacity_lines <= kXpSmallMaxLines) {
+    state->xp_use_small_lru = true;
+    state->xp_small_capacity_lines = capacity_lines;
+    state->xp_small_lru.reserve(static_cast<size_t>(capacity_lines));
+  } else {
+    state->xp_use_small_lru = false;
+    state->xp_buffer_index.reserve(static_cast<size_t>(capacity_lines) * 2);
+    state->xp_buffer_reserved = true;
+  }
+}
+
+inline void TouchXpBufferLineSmall(XPControllerState* state,
+                                  const XPBufferLineKey& key) {
+  if (state == nullptr) {
+    return;
+  }
+  const size_t cap = static_cast<size_t>(state->xp_small_capacity_lines);
+  if (cap == 0) {
+    return;
+  }
+  auto& lru = state->xp_small_lru;
+
+  const size_t n = lru.size();
+  for (size_t i = 0; i < n; ++i) {
+    if (lru[i] == key) {
+      if (i > 0) {
+        const XPBufferLineKey tmp = lru[i];
+        std::memmove(&lru[1], &lru[0], i * sizeof(XPBufferLineKey));
+        lru[0] = tmp;
+      }
+      return;
+    }
+  }
+
+  if (n < cap) {
+    lru.push_back(key);
+    if (n > 0) {
+      std::memmove(&lru[1], &lru[0], n * sizeof(XPBufferLineKey));
+    }
+    lru[0] = key;
+    return;
+  }
+
+  if (cap > 1) {
+    std::memmove(&lru[1], &lru[0], (cap - 1) * sizeof(XPBufferLineKey));
+  }
+  lru[0] = key;
+}
+
+inline void TouchXpBufferLineLarge(XPControllerState* state,
+                                  const XPBufferLineKey& key,
+                                  uint64_t capacity_lines) {
   if (state == nullptr || capacity_lines == 0) {
     return;
   }
-  XPBufferLineKey key{file_name, line_idx};
   auto it = state->xp_buffer_index.find(key);
   if (it != state->xp_buffer_index.end()) {
     state->xp_buffer_lru.splice(state->xp_buffer_lru.begin(),
@@ -937,25 +1026,74 @@ void TouchXpBufferRange(XPControllerState* state, const std::string& file_name,
   if (state == nullptr || logical_bytes == 0 || capacity_lines == 0) {
     return;
   }
+  EnsureXpBufferModeInitialized(state, capacity_lines);
+
+  const uint32_t file_id = GetXpFileId(state, file_name);
   const uint64_t first_line = offset / line_bytes;
   const uint64_t line_count = GetLineCount(offset, logical_bytes, line_bytes);
+
+  if (state->xp_use_small_lru) {
+    const size_t cap = static_cast<size_t>(state->xp_small_capacity_lines);
+    if (cap == 0) {
+      return;
+    }
+    // If we touch >= capacity unique lines, the final LRU must contain exactly
+    // the last `cap` lines of the touched range (MRU first). Build it directly.
+    if (line_count >= capacity_lines) {
+      state->xp_small_lru.clear();
+      state->xp_small_lru.resize(cap);
+      const uint64_t start =
+          first_line + (line_count - capacity_lines);
+      for (size_t i = 0; i < cap; ++i) {
+        state->xp_small_lru[i] = XPBufferLineKey{
+            file_id, start + (capacity_lines - 1 - static_cast<uint64_t>(i))};
+      }
+      return;
+    }
+    for (uint64_t i = 0; i < line_count; ++i) {
+      TouchXpBufferLineSmall(state, XPBufferLineKey{file_id, first_line + i});
+    }
+    return;
+  }
+
+  if (!state->xp_buffer_reserved) {
+    state->xp_buffer_index.reserve(static_cast<size_t>(capacity_lines) * 2);
+    state->xp_buffer_reserved = true;
+  }
   for (uint64_t i = 0; i < line_count; ++i) {
-    TouchXpBufferLine(state, file_name, first_line + i, capacity_lines);
+    TouchXpBufferLineLarge(state, XPBufferLineKey{file_id, first_line + i},
+                           capacity_lines);
   }
 }
 
-uint64_t CountXpBufferHits(const XPControllerState* state,
+uint64_t CountXpBufferHits(XPControllerState* state,
                            const std::string& file_name, uint64_t offset,
-                           uint64_t logical_bytes, uint64_t line_bytes) {
+                           uint64_t logical_bytes, uint64_t line_bytes,
+                           uint64_t capacity_lines) {
   if (state == nullptr || logical_bytes == 0) {
     return 0;
   }
+  EnsureXpBufferModeInitialized(state, capacity_lines);
+
+  const uint32_t file_id = GetXpFileId(state, file_name);
   const uint64_t first_line = offset / line_bytes;
   const uint64_t line_count = GetLineCount(offset, logical_bytes, line_bytes);
+
+  if (state->xp_use_small_lru) {
+    const uint64_t end = first_line + line_count;
+    uint64_t hits = 0;
+    for (const auto& e : state->xp_small_lru) {
+      if (e.file_id == file_id && e.line_idx >= first_line && e.line_idx < end) {
+        ++hits;
+      }
+    }
+    return hits;
+  }
+
   uint64_t hits = 0;
   for (uint64_t i = 0; i < line_count; ++i) {
-    XPBufferLineKey key{file_name, first_line + i};
-    if (state->xp_buffer_index.find(key) != state->xp_buffer_index.end()) {
+    if (state->xp_buffer_index.find(XPBufferLineKey{file_id, first_line + i}) !=
+        state->xp_buffer_index.end()) {
       ++hits;
     }
   }
@@ -1170,7 +1308,7 @@ void SimulateXpReadQueueServe(
         if (options.xp_enable_prefetch) {
           hit_lines =
               CountXpBufferHits(&state, file_name, offset, logical_bytes,
-                                line_bytes);
+                                line_bytes, xp_buffer_capacity_lines);
         }
         prefetch_hit = hit_lines > 0;
         const uint64_t miss_lines =

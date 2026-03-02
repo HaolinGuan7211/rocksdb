@@ -16,6 +16,7 @@
 #include "options/options_helper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
+#include "rocksdb/cache.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/db.h"
 #include "rocksdb/file_system.h"
@@ -1921,6 +1922,64 @@ std::vector<bool> IOUringFlags() {
 #else
   return {false};
 #endif
+}
+
+TEST(BlockBasedTableKVSepBptreeTest, LeafInIndex_NoDataBlockReadsForEmptyValues) {
+  const std::string kDBName =
+      test::PerThreadDBPath("kvsep_bptree_leaf_in_index_empty_values");
+
+  Options options;
+  options.create_if_missing = true;
+  options.compression = kNoCompression;
+  options.statistics = CreateDBStatistics();
+
+  BlockBasedTableOptions table_options;
+  table_options.experimental_kvsep_bptree_enable = true;
+  table_options.filter_policy = nullptr;
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.block_cache = NewLRUCache(64 * 1024 * 1024);
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  DestroyDB(kDBName, options).PermitUncheckedError();
+
+  DB* db_raw = nullptr;
+  ASSERT_OK(DB::Open(options, kDBName, &db_raw));
+  std::unique_ptr<DB> db(db_raw);
+
+  WriteOptions wo;
+  wo.disableWAL = true;
+  for (int i = 0; i < 2000; ++i) {
+    ASSERT_OK(db->Put(wo, "key" + std::to_string(i), "" /* empty value */));
+  }
+  ASSERT_OK(db->Flush(FlushOptions()));
+  db.reset();
+
+  Options reopen_opts = options;
+  reopen_opts.statistics = CreateDBStatistics();
+  {
+    BlockBasedTableOptions reopen_table_opts = table_options;
+    reopen_table_opts.block_cache = NewLRUCache(64 * 1024 * 1024);
+    reopen_opts.table_factory.reset(NewBlockBasedTableFactory(reopen_table_opts));
+  }
+
+  DB* db2_raw = nullptr;
+  ASSERT_OK(DB::Open(reopen_opts, kDBName, &db2_raw));
+  std::unique_ptr<DB> db2(db2_raw);
+
+  reopen_opts.statistics->setTickerCount(BLOCK_CACHE_DATA_MISS, 0);
+  reopen_opts.statistics->setTickerCount(BLOCK_CACHE_INDEX_MISS, 0);
+
+  std::string value_out;
+  ASSERT_OK(db2->Get(ReadOptions(), "key123", &value_out));
+  ASSERT_EQ(value_out, "");
+
+  const uint64_t data_miss =
+      reopen_opts.statistics->getTickerCount(BLOCK_CACHE_DATA_MISS);
+  const uint64_t index_miss =
+      reopen_opts.statistics->getTickerCount(BLOCK_CACHE_INDEX_MISS);
+
+  ASSERT_EQ(data_miss, 0);
+  ASSERT_GT(index_miss, 0);
 }
 
 INSTANTIATE_TEST_CASE_P(

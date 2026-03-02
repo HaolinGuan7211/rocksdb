@@ -56,6 +56,7 @@ struct BlockBasedTableOptions;
 struct EnvOptions;
 struct ReadOptions;
 class GetContext;
+class KVSepBptreeLeafV2TableIterator;
 
 using KVPairBlock = std::vector<std::pair<std::string, std::string>>;
 
@@ -347,6 +348,9 @@ class BlockBasedTable : public TableReader {
 
   friend class UncompressionDictReader;
   friend class BlockBasedTableIterator;
+  friend class KVSepBptreeLeafV2TableIterator;
+  friend class KVSepBptreePairV3TableIterator;
+  friend class KVSepBptreeIndexReader;
 
  protected:
   Rep* rep_;
@@ -361,15 +365,23 @@ class BlockBasedTable : public TableReader {
   friend class BlockBasedTableReaderTestVerifyChecksum_ChecksumMismatch_Test;
   BlockCacheTracer* const block_cache_tracer_;
 
-  bool KVSepBptreeLookupValueHandle(const BlockHandle& data_block_handle,
-                                    BlockHandle* value_block_handle) const;
   Status KVSepBptreeGetValueBlock(const ReadOptions& ro,
                                   const BlockHandle& value_block_handle,
                                   CachableEntry<Block_kKVSepValue>* value_block,
-                                  BlockCacheLookupContext* lookup_context) const;
+                                  BlockCacheLookupContext* lookup_context,
+                                  FilePrefetchBuffer* prefetch_buffer = nullptr) const;
   static Status KVSepBptreeDecodePointer(const Slice& ptr,
+                                        BlockHandle* value_block_handle,
                                         uint32_t* value_off,
                                         uint32_t* value_len);
+  // Load a KV-sep leaf block (stored/cached as an index block) and initialize a
+  // DataBlockIter over it (leaf encoding is "key -> pointer bytes").
+  DataBlockIter* KVSepBptreeNewLeafBlockIterator(
+      const ReadOptions& ro, const BlockHandle& leaf_handle,
+      DataBlockIter* input_iter, GetContext* get_context,
+      BlockCacheLookupContext* lookup_context,
+      FilePrefetchBuffer* prefetch_buffer, bool for_compaction, bool async_read,
+      Status& s, bool use_block_cache_for_lookup) const;
 
   void UpdateCacheHitMetrics(BlockType block_type, GetContext* get_context,
                              size_t usage) const;
@@ -661,8 +673,8 @@ struct BlockBasedTable::Rep {
   SeqnoToTimeMapping seqno_to_time_mapping;
   BlockHandle index_handle;
   bool experimental_kvsep_bptree_enabled = false;
-  uint32_t kvsep_value_block_bytes_hint = 0;
-  std::vector<KVSepBptreeValueMapEntry> kvsep_value_map_entries;
+  uint32_t kvsep_bptree_index_levels = 1;
+  uint32_t kvsep_bptree_leaf_format_version = 1;
   BlockBasedTableOptions::IndexType index_type;
   bool whole_key_filtering;
   bool prefix_filtering;
