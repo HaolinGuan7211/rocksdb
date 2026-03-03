@@ -1640,32 +1640,6 @@ DEFINE_bool(simulate_xp_use_dimm_device_model, false,
             "accounting, instead of purely scaling device service time by "
             "service units * simulate_xp_latency_ns.");
 
-DEFINE_bool(simulate_xp_monitor_enable, false,
-            "Enable simulated (XP/DIMM) filesystem latency monitor. When "
-            "enabled, the simulated filesystem wrapper will emit time-series "
-            "CSV rows for per-window max latency and tmpfs-vs-base traffic.");
-DEFINE_uint64(simulate_xp_monitor_window_us, 1000000,
-              "Time window size in microseconds for simulated filesystem "
-              "latency monitor (e.g., 1000000 for 1s).");
-DEFINE_uint64(simulate_xp_monitor_stage_seconds, 0,
-              "Optional stage window size in seconds for simulated filesystem "
-              "latency monitor. 0 disables stage aggregation output.");
-DEFINE_bool(simulate_xp_monitor_max_read, true,
-            "If true, track per-window max latency for Read/MultiRead ops in "
-            "the simulated filesystem monitor.");
-DEFINE_bool(simulate_xp_monitor_max_open, true,
-            "If true, track per-window max latency for New*File/Reopen/Reuse "
-            "ops in the simulated filesystem monitor.");
-DEFINE_bool(simulate_xp_monitor_max_prefetch, true,
-            "If true, track per-window max latency for Prefetch ops in the "
-            "simulated filesystem monitor.");
-DEFINE_string(simulate_xp_monitor_window_csv, "",
-              "If non-empty, write simulated filesystem per-window monitor "
-              "CSV to this path.");
-DEFINE_string(simulate_xp_monitor_stage_csv, "",
-              "If non-empty and --simulate_xp_monitor_stage_seconds>0, write "
-              "simulated filesystem per-stage monitor CSV to this path.");
-
 DEFINE_uint64(simulate_dimm_fixed_read_overhead_ns, 1080,
               "Single-DIMM NVM: fixed host-side read overhead in ns.");
 DEFINE_uint64(simulate_dimm_fixed_write_overhead_ns, 0,
