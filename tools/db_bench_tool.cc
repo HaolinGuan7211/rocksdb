@@ -1553,6 +1553,17 @@ DEFINE_bool(simulate_xp_busy_wait, false,
             "SleepForMicroseconds. This is useful for DRAM/NVM-scale latency "
             "experiments where OS sleeps can overshoot by microseconds and "
             "artificially inflate iowait / hide CPU-side costs.");
+DEFINE_bool(simulate_xp_bypass_base_io, false,
+            "Best-effort diagnostic knob: when --simulate_xp_nvm or "
+            "--simulate_dimm_nvm is enabled, attempt to bypass the underlying "
+            "filesystem Read/MultiRead cost by serving reads from an mmap-backed "
+            "view of the file. Intended to isolate simulator-injected delay "
+            "vs base/OS floor. Falls back to base IO if mmap is unavailable.");
+DEFINE_bool(simulate_xp_mmap_base_io, false,
+            "If true, use an mmap-backed read fast path for simulated files "
+            "even when not bypassing simulated delay. This reduces syscall/FS "
+            "noise (closer to DAX-like behavior) while still applying simulated "
+            "device latency. Falls back to base IO if mmap is unavailable.");
 DEFINE_bool(simulate_xp_use_dimm_device_model, false,
             "If true, XP read path uses DIMM-style fixed overhead + bandwidth "
             "transfer time (simulate_dimm_*) in addition to XPBuffer hit/miss "
@@ -10458,6 +10469,8 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
     model_options.target_levels = std::move(xp_target_levels);
     model_options.stats_file = FLAGS_simulate_xp_stats_file;
     model_options.xp_busy_wait = FLAGS_simulate_xp_busy_wait;
+    model_options.xp_bypass_base_io = FLAGS_simulate_xp_bypass_base_io;
+    model_options.xp_mmap_base_io = FLAGS_simulate_xp_mmap_base_io;
     model_options.xp_use_dimm_device_model = FLAGS_simulate_xp_use_dimm_device_model;
     model_options.monitor_enable = FLAGS_simulate_xp_monitor_enable;
     model_options.monitor_window_us = FLAGS_simulate_xp_monitor_window_us;

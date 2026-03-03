@@ -70,6 +70,10 @@ struct SimulatedStorageModelOptions {
   // If true, bypass base filesystem IO in wrappers and only keep simulated
   // latency / queue behavior. Useful for pure model profiling.
   bool xp_bypass_base_io = false;
+  // If true, attempt to use an mmap-backed read fast path for simulated files
+  // (SSTs under SimFS control) to reduce syscall/FS overhead while still
+  // applying simulated device latency / queue behavior.
+  bool xp_mmap_base_io = false;
   // If true, simulated delays use busy-spinning instead of sleeping.
   // This is useful for DRAM/NVM-scale experiments where OS sleeps can
   // overshoot by microseconds and incorrectly inflate "iowait" while hiding
@@ -192,6 +196,29 @@ void ClearSimulatedFsThreadTagForCurrentThread();
 void RegisterSimulatedFsFileLevel(const std::string& file_name, int level);
 void UnregisterSimulatedFsFileLevel(const std::string& file_name);
 void ClearSimulatedFsFileLevels();
+
+// Returns the cumulative simulated delay (in nanoseconds) that has been
+// injected on the current thread by SimulatedHybridFileSystem since thread
+// start (best-effort). This is useful for separating "simulated device time"
+// from "RocksDB CPU time" in tail probes, especially when busy-wait is used.
+uint64_t GetSimulatedFsInjectedDelayNsForCurrentThread();
+// Wall-clock time spent in the underlying filesystem read calls (ns) on the
+// current thread. This excludes simulated injected delays and is useful for
+// quantifying "base FS noise" that remains even when modeling fast NVM.
+uint64_t GetSimulatedFsBaseReadNsForCurrentThread();
+// Wall-clock time spent waiting inside SimFS delay injection on the current
+// thread (ns). This measures the *actual* time spent in Sleep/BusySpin and
+// therefore includes OS scheduling overshoot (preemption).
+uint64_t GetSimulatedFsActualInjectedWaitNsForCurrentThread();
+// Wall-clock time spent inside SimFS RAF Read/MultiRead/Prefetch wrappers on
+// the current thread (ns). This includes injected waits, base reads, and
+// simulator bookkeeping/lock contention.
+uint64_t GetSimulatedFsReadWallNsForCurrentThread();
+// Portion of GetSimulatedFsActualInjectedWaitNsForCurrentThread() that exceeds
+// the intended injected delay (ns). This is a direct measure of scheduling
+// overshoot and can explain large tail spikes that do not show up in the
+// intended injected delay counter.
+uint64_t GetSimulatedFsInjectedWaitOvershootNsForCurrentThread();
 
 // A FileSystem simulates hybrid file system by ingesting latency and limit
 // IOPs.
@@ -323,6 +350,11 @@ class SimulatedHybridRaf : public FSRandomAccessFileOwnerWrapper {
                      std::string file_name,
                      bool is_tmpfs,
                      bool should_simulate,
+                     uint32_t xp_file_id,
+                     uint32_t dimm_file_id,
+                     const char* mmap_base,
+                     size_t mmap_len,
+                     int mmap_fd,
                      const SimulatedStorageModelOptions& model_options,
                      std::shared_ptr<SimulatedStorageModelStats> stats,
                      std::shared_ptr<SimulatedFsLatencyMonitor> monitor)
@@ -331,11 +363,16 @@ class SimulatedHybridRaf : public FSRandomAccessFileOwnerWrapper {
         file_name_(std::move(file_name)),
         is_tmpfs_(is_tmpfs),
         should_simulate_(should_simulate),
+        xp_file_id_(xp_file_id),
+        dimm_file_id_(dimm_file_id),
+        mmap_base_(mmap_base),
+        mmap_len_(mmap_len),
+        mmap_fd_(mmap_fd),
         model_options_(model_options),
         stats_(std::move(stats)),
         monitor_(std::move(monitor)) {}
 
-  ~SimulatedHybridRaf() override {}
+  ~SimulatedHybridRaf() override;
 
   IOStatus Read(uint64_t offset, size_t n, const IOOptions& options,
                 Slice* result, char* scratch,
@@ -352,6 +389,16 @@ class SimulatedHybridRaf : public FSRandomAccessFileOwnerWrapper {
   std::string file_name_;
   bool is_tmpfs_;
   bool should_simulate_;
+  // Stable per-file ids assigned at open time, used to avoid per-read string
+  // hashing/allocations in the simulation fast path.
+  uint32_t xp_file_id_ = 0;
+  uint32_t dimm_file_id_ = 0;
+  // Optional mmap-backed read path for xp_bypass_base_io experiments. When
+  // set, reads can return a Slice pointing directly into mapped file memory,
+  // avoiding syscall/FS overhead while keeping correctness.
+  const char* mmap_base_ = nullptr;
+  size_t mmap_len_ = 0;
+  int mmap_fd_ = -1;
   SimulatedStorageModelOptions model_options_;
   std::shared_ptr<SimulatedStorageModelStats> stats_;
   std::shared_ptr<SimulatedFsLatencyMonitor> monitor_;

@@ -10,6 +10,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <chrono>
+#include <cstring>
+#include <fcntl.h>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -17,8 +19,11 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
+#include <unistd.h>
 #include <vector>
 
 #include "rocksdb/rate_limiter.h"
@@ -28,6 +33,32 @@ namespace ROCKSDB_NAMESPACE {
 
 const int64_t kUsPerSec = 1000000;
 const int64_t kDummyBytesPerUs = 1024;
+
+thread_local uint64_t g_simulated_fs_injected_delay_ns = 0;
+thread_local uint64_t g_simulated_fs_base_read_ns = 0;
+thread_local uint64_t g_simulated_fs_actual_injected_wait_ns = 0;
+thread_local uint64_t g_simulated_fs_injected_wait_overshoot_ns = 0;
+thread_local uint64_t g_simulated_fs_read_wall_ns = 0;
+
+uint64_t GetSimulatedFsInjectedDelayNsForCurrentThread() {
+  return g_simulated_fs_injected_delay_ns;
+}
+
+uint64_t GetSimulatedFsBaseReadNsForCurrentThread() {
+  return g_simulated_fs_base_read_ns;
+}
+
+uint64_t GetSimulatedFsActualInjectedWaitNsForCurrentThread() {
+  return g_simulated_fs_actual_injected_wait_ns;
+}
+
+uint64_t GetSimulatedFsReadWallNsForCurrentThread() {
+  return g_simulated_fs_read_wall_ns;
+}
+
+uint64_t GetSimulatedFsInjectedWaitOvershootNsForCurrentThread() {
+  return g_simulated_fs_injected_wait_overshoot_ns;
+}
 
 namespace {
 // From bytes to read/write, calculate service time needed by an HDD.
@@ -177,18 +208,42 @@ void WaitForNanoseconds(uint64_t delay_ns, bool busy_wait) {
   if (delay_ns == 0) {
     return;
   }
+  const uint64_t intended_delay_ns = delay_ns;
+  g_simulated_fs_injected_delay_ns += delay_ns;
+  const auto clock = Env::Default()->GetSystemClock();
+  const uint64_t wait_start_ns = clock->NowNanos();
   if (busy_wait) {
     BusySpinForNanoseconds(delay_ns);
-    return;
-  }
-  if (delay_ns >= 1000) {
-    Env::Default()->SleepForMicroseconds(static_cast<int>(delay_ns / 1000));
-    delay_ns %= 1000;
-    if (delay_ns == 0) {
-      return;
+  } else {
+    if (delay_ns >= 1000) {
+      Env::Default()->SleepForMicroseconds(static_cast<int>(delay_ns / 1000));
+      delay_ns %= 1000;
+      if (delay_ns != 0) {
+        BusySpinForNanoseconds(delay_ns);
+      }
+    } else {
+      BusySpinForNanoseconds(delay_ns);
     }
   }
-  BusySpinForNanoseconds(delay_ns);
+  const uint64_t wait_end_ns = clock->NowNanos();
+  if (wait_end_ns >= wait_start_ns) {
+    const uint64_t waited_ns = wait_end_ns - wait_start_ns;
+    g_simulated_fs_actual_injected_wait_ns += waited_ns;
+    if (waited_ns > intended_delay_ns) {
+      g_simulated_fs_injected_wait_overshoot_ns +=
+          (waited_ns - intended_delay_ns);
+    }
+  }
+}
+
+// When bypassing base IO (virtual-time mode), we still want to record the
+// intended injected delay so Gate2/Gate3 attribution remains meaningful.
+// This helper accounts "expected" delay without sleeping/spinning.
+void AccountInjectedDelayOnly(uint64_t delay_ns) {
+  if (delay_ns == 0) {
+    return;
+  }
+  g_simulated_fs_injected_delay_ns += delay_ns;
 }
 
 uint64_t NowNanos() { return Env::Default()->GetSystemClock()->NowNanos(); }
@@ -219,21 +274,35 @@ struct XPWriteQueueEntry {
 
 struct XPReadStreamState {
   bool has_last = false;
+  uint32_t last_file_id = 0;
   uint64_t last_end = 0;
 };
 
+// XP stream keying:
+// The simulation tracks per-stream sequentiality to decide DRAM latency and
+// random bandwidth scaling. A previous implementation tracked sequentiality per
+// (file, stream) via a hash map keyed by string/packed keys. For large DBs this
+// can create huge maps (file_count * stream_count) and lead to allocator/rehash
+// stalls under the global simulator lock, producing synchronous tail noise.
+//
+// We instead map stream tags to small integer ids and maintain *one* stream
+// state per stream id, tracking the last (file_id, last_end) tuple. This is a
+// good approximation for our workloads while keeping the hot path allocation-
+// free and bounded.
+using XPStreamId = uint32_t;
+
 struct XPBufferLineKey {
-  std::string file_name;
+  uint32_t file_id = 0;
   uint64_t line_idx = 0;
   bool operator==(const XPBufferLineKey& rhs) const {
-    return line_idx == rhs.line_idx && file_name == rhs.file_name;
+    return line_idx == rhs.line_idx && file_id == rhs.file_id;
   }
 };
 
 struct XPBufferLineKeyHash {
   size_t operator()(const XPBufferLineKey& k) const {
-    size_t h1 = std::hash<std::string>{}(k.file_name);
-    size_t h2 = std::hash<uint64_t>{}(k.line_idx);
+    const size_t h1 = std::hash<uint32_t>{}(k.file_id);
+    const size_t h2 = std::hash<uint64_t>{}(k.line_idx);
     return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
   }
 };
@@ -243,20 +312,38 @@ struct XPControllerState {
   std::vector<uint64_t> rpq_server_available_ns;
   std::deque<XPWriteQueueEntry> wpq;
   std::deque<uint64_t> rpq_finish_times;
+
+  // XPBuffer: a small fixed-capacity LRU of recently accessed "lines".
+  //
+  // This is on the *simulation* fast path (protected by g_xp_mu). For small
+  // capacities (e.g. 16KB buffer / 256B line = 64 lines), a vector-based LRU
+  // avoids hashing and allocations while preserving exact LRU semantics.
+  bool xp_use_small_lru = false;
+  uint64_t xp_small_capacity_lines = 0;
+  std::vector<XPBufferLineKey> xp_small_lru;
+
+  // Fallback for large capacities.
   std::list<XPBufferLineKey> xp_buffer_lru;
   std::unordered_map<XPBufferLineKey, std::list<XPBufferLineKey>::iterator,
                      XPBufferLineKeyHash>
       xp_buffer_index;
+  bool xp_buffer_reserved = false;
+
+  std::unordered_map<std::string, uint32_t> file_name_to_id;
+  uint32_t next_file_id = 1;
   uint32_t wpq_rr_cursor = 0;
   uint32_t rpq_rr_cursor = 0;
-  std::unordered_map<std::string, uint32_t> write_stream_server;
-  std::unordered_map<std::string, XPReadStreamState> read_stream_states;
+  std::unordered_map<uint32_t, uint32_t> write_stream_server_by_file_id;
+  std::unordered_map<uint64_t, XPStreamId> stream_tag_to_id;
+  XPStreamId next_stream_id = 1;
+  std::vector<XPReadStreamState> read_stream_states_by_id;
 };
 
 std::mutex g_xp_mu;
 std::unordered_map<uintptr_t, XPControllerState> g_xp_states;
 struct DimmStreamState {
   bool has_last = false;
+  uint32_t last_file_id = 0;
   uint64_t last_end = 0;
 };
 
@@ -267,8 +354,12 @@ struct DimmControllerState {
   std::deque<uint64_t> write_finish_times;
   uint32_t read_rr_cursor = 0;
   uint32_t write_rr_cursor = 0;
-  std::unordered_map<std::string, DimmStreamState> read_stream_states;
-  std::unordered_map<std::string, DimmStreamState> write_stream_states;
+  std::unordered_map<std::string, uint32_t> file_name_to_id;
+  uint32_t next_file_id = 1;
+  std::unordered_map<uint64_t, uint32_t> stream_tag_to_id;
+  uint32_t next_stream_id = 1;
+  std::vector<DimmStreamState> read_stream_states_by_id;
+  std::vector<DimmStreamState> write_stream_states_by_id;
 };
 
 std::mutex g_dimm_mu;
@@ -919,12 +1010,133 @@ uint64_t GetXpBufferCapacityLines(const SimulatedStorageModelOptions& options) {
   return std::max<uint64_t>(1, options.xp_buffer_bytes / line_bytes);
 }
 
-void TouchXpBufferLine(XPControllerState* state, const std::string& file_name,
-                       uint64_t line_idx, uint64_t capacity_lines) {
+constexpr uint64_t kXpSmallMaxLines = 4096;
+
+uint32_t GetXpFileId(XPControllerState* state, const std::string& file_name) {
+  if (state == nullptr) {
+    return 0;
+  }
+  auto it = state->file_name_to_id.find(file_name);
+  if (it != state->file_name_to_id.end()) {
+    return it->second;
+  }
+  const uint32_t id = state->next_file_id++;
+  auto inserted = state->file_name_to_id.emplace(file_name, id);
+  return inserted.first->second;
+}
+
+XPStreamId GetOrAssignXpStreamId(XPControllerState* state, uint64_t tag) {
+  if (state == nullptr) {
+    return 0;
+  }
+  auto it = state->stream_tag_to_id.find(tag);
+  if (it != state->stream_tag_to_id.end()) {
+    return it->second;
+  }
+  const XPStreamId id = state->next_stream_id++;
+  state->stream_tag_to_id.emplace(tag, id);
+  if (state->read_stream_states_by_id.size() <= static_cast<size_t>(id)) {
+    state->read_stream_states_by_id.resize(static_cast<size_t>(id) + 1);
+  }
+  return id;
+}
+
+uint32_t GetOrAssignDimmStreamId(DimmControllerState* state, uint64_t tag) {
+  if (state == nullptr) {
+    return 0;
+  }
+  auto it = state->stream_tag_to_id.find(tag);
+  if (it != state->stream_tag_to_id.end()) {
+    return it->second;
+  }
+  const uint32_t id = state->next_stream_id++;
+  state->stream_tag_to_id.emplace(tag, id);
+  if (state->read_stream_states_by_id.size() <= static_cast<size_t>(id)) {
+    state->read_stream_states_by_id.resize(static_cast<size_t>(id) + 1);
+  }
+  if (state->write_stream_states_by_id.size() <= static_cast<size_t>(id)) {
+    state->write_stream_states_by_id.resize(static_cast<size_t>(id) + 1);
+  }
+  return id;
+}
+
+uint32_t GetDimmFileId(DimmControllerState* state, const std::string& file_name) {
+  if (state == nullptr) {
+    return 0;
+  }
+  auto it = state->file_name_to_id.find(file_name);
+  if (it != state->file_name_to_id.end()) {
+    return it->second;
+  }
+  const uint32_t id = state->next_file_id++;
+  auto inserted = state->file_name_to_id.emplace(file_name, id);
+  return inserted.first->second;
+}
+
+void EnsureXpBufferModeInitialized(XPControllerState* state,
+                                  uint64_t capacity_lines) {
+  if (state == nullptr) {
+    return;
+  }
+  if (state->xp_use_small_lru || state->xp_buffer_reserved ||
+      state->xp_small_capacity_lines != 0) {
+    return;
+  }
+  if (capacity_lines <= kXpSmallMaxLines) {
+    state->xp_use_small_lru = true;
+    state->xp_small_capacity_lines = capacity_lines;
+    state->xp_small_lru.reserve(static_cast<size_t>(capacity_lines));
+  } else {
+    state->xp_use_small_lru = false;
+    state->xp_buffer_index.reserve(static_cast<size_t>(capacity_lines) * 2);
+    state->xp_buffer_reserved = true;
+  }
+}
+
+inline void TouchXpBufferLineSmall(XPControllerState* state,
+                                  const XPBufferLineKey& key) {
+  if (state == nullptr) {
+    return;
+  }
+  const size_t cap = static_cast<size_t>(state->xp_small_capacity_lines);
+  if (cap == 0) {
+    return;
+  }
+  auto& lru = state->xp_small_lru;
+
+  const size_t n = lru.size();
+  for (size_t i = 0; i < n; ++i) {
+    if (lru[i] == key) {
+      if (i > 0) {
+        const XPBufferLineKey tmp = lru[i];
+        std::memmove(&lru[1], &lru[0], i * sizeof(XPBufferLineKey));
+        lru[0] = tmp;
+      }
+      return;
+    }
+  }
+
+  if (n < cap) {
+    lru.push_back(key);
+    if (n > 0) {
+      std::memmove(&lru[1], &lru[0], n * sizeof(XPBufferLineKey));
+    }
+    lru[0] = key;
+    return;
+  }
+
+  if (cap > 1) {
+    std::memmove(&lru[1], &lru[0], (cap - 1) * sizeof(XPBufferLineKey));
+  }
+  lru[0] = key;
+}
+
+inline void TouchXpBufferLineLarge(XPControllerState* state,
+                                  const XPBufferLineKey& key,
+                                  uint64_t capacity_lines) {
   if (state == nullptr || capacity_lines == 0) {
     return;
   }
-  XPBufferLineKey key{file_name, line_idx};
   auto it = state->xp_buffer_index.find(key);
   if (it != state->xp_buffer_index.end()) {
     state->xp_buffer_lru.splice(state->xp_buffer_lru.begin(),
@@ -943,35 +1155,105 @@ void TouchXpBufferLine(XPControllerState* state, const std::string& file_name,
   }
 }
 
-void TouchXpBufferRange(XPControllerState* state, const std::string& file_name,
+void TouchXpBufferRangeById(XPControllerState* state, uint32_t file_id,
+                            uint64_t offset, uint64_t logical_bytes,
+                            uint64_t line_bytes, uint64_t capacity_lines) {
+  if (state == nullptr || logical_bytes == 0 || capacity_lines == 0) {
+    return;
+  }
+  EnsureXpBufferModeInitialized(state, capacity_lines);
+
+  const uint64_t first_line = offset / line_bytes;
+  const uint64_t line_count = GetLineCount(offset, logical_bytes, line_bytes);
+
+  if (state->xp_use_small_lru) {
+    const size_t cap = static_cast<size_t>(state->xp_small_capacity_lines);
+    if (cap == 0) {
+      return;
+    }
+    // If we touch >= capacity unique lines, the final LRU must contain exactly
+    // the last `cap` lines of the touched range (MRU first). Build it directly.
+    if (line_count >= capacity_lines) {
+      state->xp_small_lru.clear();
+      state->xp_small_lru.resize(cap);
+      const uint64_t start =
+          first_line + (line_count - capacity_lines);
+      for (size_t i = 0; i < cap; ++i) {
+        state->xp_small_lru[i] = XPBufferLineKey{
+            file_id, start + (capacity_lines - 1 - static_cast<uint64_t>(i))};
+      }
+      return;
+    }
+    for (uint64_t i = 0; i < line_count; ++i) {
+      TouchXpBufferLineSmall(state, XPBufferLineKey{file_id, first_line + i});
+    }
+    return;
+  }
+
+  if (!state->xp_buffer_reserved) {
+    state->xp_buffer_index.reserve(static_cast<size_t>(capacity_lines) * 2);
+    state->xp_buffer_reserved = true;
+  }
+  for (uint64_t i = 0; i < line_count; ++i) {
+    TouchXpBufferLineLarge(state, XPBufferLineKey{file_id, first_line + i},
+                           capacity_lines);
+  }
+}
+
+[[maybe_unused]] void TouchXpBufferRange(XPControllerState* state,
+                        const std::string& file_name,
                         uint64_t offset, uint64_t logical_bytes,
                         uint64_t line_bytes, uint64_t capacity_lines) {
   if (state == nullptr || logical_bytes == 0 || capacity_lines == 0) {
     return;
   }
-  const uint64_t first_line = offset / line_bytes;
-  const uint64_t line_count = GetLineCount(offset, logical_bytes, line_bytes);
-  for (uint64_t i = 0; i < line_count; ++i) {
-    TouchXpBufferLine(state, file_name, first_line + i, capacity_lines);
-  }
+  const uint32_t file_id = GetXpFileId(state, file_name);
+  TouchXpBufferRangeById(state, file_id, offset, logical_bytes, line_bytes,
+                         capacity_lines);
 }
 
-uint64_t CountXpBufferHits(const XPControllerState* state,
-                           const std::string& file_name, uint64_t offset,
-                           uint64_t logical_bytes, uint64_t line_bytes) {
+uint64_t CountXpBufferHitsById(XPControllerState* state, uint32_t file_id,
+                               uint64_t offset, uint64_t logical_bytes,
+                               uint64_t line_bytes, uint64_t capacity_lines) {
   if (state == nullptr || logical_bytes == 0) {
     return 0;
   }
+  EnsureXpBufferModeInitialized(state, capacity_lines);
+
   const uint64_t first_line = offset / line_bytes;
   const uint64_t line_count = GetLineCount(offset, logical_bytes, line_bytes);
+
+  if (state->xp_use_small_lru) {
+    const uint64_t end = first_line + line_count;
+    uint64_t hits = 0;
+    for (const auto& e : state->xp_small_lru) {
+      if (e.file_id == file_id && e.line_idx >= first_line && e.line_idx < end) {
+        ++hits;
+      }
+    }
+    return hits;
+  }
+
   uint64_t hits = 0;
   for (uint64_t i = 0; i < line_count; ++i) {
-    XPBufferLineKey key{file_name, first_line + i};
-    if (state->xp_buffer_index.find(key) != state->xp_buffer_index.end()) {
+    if (state->xp_buffer_index.find(XPBufferLineKey{file_id, first_line + i}) !=
+        state->xp_buffer_index.end()) {
       ++hits;
     }
   }
   return hits;
+}
+
+[[maybe_unused]] uint64_t CountXpBufferHits(XPControllerState* state,
+                           const std::string& file_name, uint64_t offset,
+                           uint64_t logical_bytes, uint64_t line_bytes,
+                           uint64_t capacity_lines) {
+  if (state == nullptr || logical_bytes == 0) {
+    return 0;
+  }
+  const uint32_t file_id = GetXpFileId(state, file_name);
+  return CountXpBufferHitsById(state, file_id, offset, logical_bytes, line_bytes,
+                               capacity_lines);
 }
 
 void SimulateXpWriteQueueSubmission(
@@ -1005,6 +1287,7 @@ void SimulateXpWriteQueueSubmission(
           GetSimNowNs(instance_id, options.xp_bypass_base_io,
                       options.xp_forced_tag_init_stagger_ns);
       iteration_now_ns = now_ns;
+      const uint32_t file_id = GetXpFileId(&state, file_name);
       EnsureServerAvailability(&state.wpq_server_available_ns, wpq_parallelism,
                                now_ns);
       PurgeFinishedWPQ(&state, now_ns);
@@ -1042,8 +1325,8 @@ void SimulateXpWriteQueueSubmission(
               state.wpq_server_available_ns[tail.server_idx] = tail.finish_ns;
             }
             if (options.xp_share_buffer_between_rw) {
-              TouchXpBufferRange(&state, file_name, merged_start, merged_logical,
-                                 line_bytes, xp_buffer_capacity_lines);
+              TouchXpBufferRangeById(&state, file_id, merged_start, merged_logical,
+                                     line_bytes, xp_buffer_capacity_lines);
             }
             stats->media_write_bytes.fetch_add(delta_media);
             stats->simulated_write_media_delay_ns.fetch_add(delta_service);
@@ -1061,8 +1344,8 @@ void SimulateXpWriteQueueSubmission(
               GetXpServiceNs(options, logical_bytes, /*is_write=*/true);
           uint32_t server_idx = 0;
           uint64_t server_available_ns = 0;
-          auto sid_it = state.write_stream_server.find(file_name);
-          if (sid_it != state.write_stream_server.end() &&
+          auto sid_it = state.write_stream_server_by_file_id.find(file_id);
+          if (sid_it != state.write_stream_server_by_file_id.end() &&
               !state.wpq_server_available_ns.empty()) {
             server_idx =
                 sid_it->second % static_cast<uint32_t>(state.wpq_server_available_ns.size());
@@ -1077,14 +1360,14 @@ void SimulateXpWriteQueueSubmission(
                   (server_idx + 1) %
                   static_cast<uint32_t>(state.wpq_server_available_ns.size());
             }
-            state.write_stream_server[file_name] = server_idx;
+            state.write_stream_server_by_file_id[file_id] = server_idx;
           }
           const uint64_t start_ns = std::max(now_ns, server_available_ns);
           const uint64_t finish_ns = start_ns + service_ns;
           state.wpq_server_available_ns[server_idx] = finish_ns;
           if (options.xp_share_buffer_between_rw) {
-            TouchXpBufferRange(&state, file_name, req_start, logical_bytes,
-                               line_bytes, xp_buffer_capacity_lines);
+            TouchXpBufferRangeById(&state, file_id, req_start, logical_bytes,
+                                   line_bytes, xp_buffer_capacity_lines);
           }
           state.wpq.push_back(XPWriteQueueEntry{
               file_name, req_start, req_end, finish_ns, media_bytes, service_ns,
@@ -1111,7 +1394,9 @@ void SimulateXpWriteQueueSubmission(
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + waited_for_queue_ns +
                           submit_latency_ns);
-      if (!options.xp_bypass_base_io) {
+      if (options.xp_bypass_base_io) {
+        AccountInjectedDelayOnly(submit_latency_ns);
+      } else {
         WaitForNanoseconds(submit_latency_ns, options.xp_busy_wait);
       }
       return;
@@ -1119,7 +1404,9 @@ void SimulateXpWriteQueueSubmission(
     if (queue_wait_ns > 0) {
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + queue_wait_ns);
-      if (!options.xp_bypass_base_io) {
+      if (options.xp_bypass_base_io) {
+        AccountInjectedDelayOnly(queue_wait_ns);
+      } else {
         WaitForNanoseconds(queue_wait_ns, options.xp_busy_wait);
       }
       waited_for_queue_ns += queue_wait_ns;
@@ -1128,11 +1415,16 @@ void SimulateXpWriteQueueSubmission(
 }
 
 void SimulateXpReadQueueServe(
-    const std::string& file_name, uint64_t offset, uint64_t logical_bytes,
+    uint32_t file_id, uint64_t offset, uint64_t logical_bytes,
     const SimulatedStorageModelOptions& options,
     const std::shared_ptr<SimulatedStorageModelStats>& stats) {
   if (logical_bytes == 0 || stats == nullptr) {
     return;
+  }
+  if (file_id == 0) {
+    // File id should be assigned at file-open time. Keep a safe non-zero id to
+    // avoid pathological keying behavior if callers forget to pass it.
+    file_id = 1;
   }
 
   const uint64_t rpq_depth = std::max<uint64_t>(1, options.xp_rpq_depth);
@@ -1141,6 +1433,7 @@ void SimulateXpReadQueueServe(
   const uint64_t line_bytes = std::max<uint64_t>(1, options.xp_line_bytes);
   const uint64_t xp_buffer_capacity_lines = GetXpBufferCapacityLines(options);
   const uintptr_t instance_id = GetInstanceId(stats);
+  const uint64_t stream_tag = GetThreadStreamTag();
   while (true) {
     uint64_t wait_for_depth_ns = 0;
     uint64_t iteration_now_ns = 0;
@@ -1170,11 +1463,14 @@ void SimulateXpReadQueueServe(
         const uint64_t min_finish_ns = MinFinishTime(state.rpq_finish_times);
         wait_for_depth_ns = min_finish_ns > now_ns ? min_finish_ns - now_ns : 0;
       } else {
-        const std::string stream_key =
-            file_name + "#" + std::to_string(GetThreadStreamTag());
-        XPReadStreamState& stream = state.read_stream_states[stream_key];
+        const XPStreamId stream_id = GetOrAssignXpStreamId(&state, stream_tag);
+        if (state.read_stream_states_by_id.size() <= static_cast<size_t>(stream_id)) {
+          state.read_stream_states_by_id.resize(static_cast<size_t>(stream_id) + 1);
+        }
+        XPReadStreamState& stream = state.read_stream_states_by_id[stream_id];
         const uint64_t end = GetSaturatedEnd(offset, logical_bytes);
-        const bool sequential = stream.has_last && offset == stream.last_end;
+        const bool same_file = stream.has_last && stream.last_file_id == file_id;
+        const bool sequential = same_file && offset == stream.last_end;
         const bool first_read = !stream.has_last;
         const bool is_random = stream.has_last && !sequential;
         const bool seq_for_dram = first_read || sequential;
@@ -1183,8 +1479,8 @@ void SimulateXpReadQueueServe(
             GetLineCount(offset, logical_bytes, line_bytes);
         if (options.xp_enable_prefetch) {
           hit_lines =
-              CountXpBufferHits(&state, file_name, offset, logical_bytes,
-                                line_bytes);
+              CountXpBufferHitsById(&state, file_id, offset, logical_bytes,
+                                    line_bytes, xp_buffer_capacity_lines);
         }
         prefetch_hit = hit_lines > 0;
         const uint64_t miss_lines =
@@ -1238,16 +1534,17 @@ void SimulateXpReadQueueServe(
 
         if (options.xp_enable_prefetch) {
           // Read miss refill / cache residency.
-          TouchXpBufferRange(&state, file_name, offset, logical_bytes, line_bytes,
-                             xp_buffer_capacity_lines);
+          TouchXpBufferRangeById(&state, file_id, offset, logical_bytes,
+                                 line_bytes, xp_buffer_capacity_lines);
         }
         stream.has_last = true;
+        stream.last_file_id = file_id;
         stream.last_end = end;
         if (options.xp_enable_prefetch) {
           // Sequential prefetch for the next XPBuffer window.
           if (first_read || sequential) {
-            TouchXpBufferRange(&state, file_name, end, options.xp_buffer_bytes,
-                               line_bytes, xp_buffer_capacity_lines);
+            TouchXpBufferRangeById(&state, file_id, end, options.xp_buffer_bytes,
+                                   line_bytes, xp_buffer_capacity_lines);
           }
         }
 
@@ -1272,7 +1569,9 @@ void SimulateXpReadQueueServe(
     if (scheduled) {
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + total_delay_ns);
-      if (!options.xp_bypass_base_io) {
+      if (options.xp_bypass_base_io) {
+        AccountInjectedDelayOnly(total_delay_ns);
+      } else {
         WaitForNanoseconds(total_delay_ns, options.xp_busy_wait);
       }
       return;
@@ -1280,7 +1579,9 @@ void SimulateXpReadQueueServe(
     if (wait_for_depth_ns > 0) {
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + wait_for_depth_ns);
-      if (!options.xp_bypass_base_io) {
+      if (options.xp_bypass_base_io) {
+        AccountInjectedDelayOnly(wait_for_depth_ns);
+      } else {
         WaitForNanoseconds(wait_for_depth_ns, options.xp_busy_wait);
       }
     }
@@ -1288,11 +1589,14 @@ void SimulateXpReadQueueServe(
 }
 
 void SimulateDimmReadQueueServe(
-    const std::string& file_name, uint64_t offset, uint64_t logical_bytes,
+    uint32_t file_id, uint64_t offset, uint64_t logical_bytes,
     const SimulatedStorageModelOptions& options,
     const std::shared_ptr<SimulatedStorageModelStats>& stats) {
   if (logical_bytes == 0 || stats == nullptr) {
     return;
+  }
+  if (file_id == 0) {
+    file_id = 1;
   }
 
   const uint64_t fixed_overhead_ns = options.dimm_fixed_read_overhead_ns;
@@ -1303,13 +1607,16 @@ void SimulateDimmReadQueueServe(
                     options.xp_forced_tag_init_stagger_ns);
     AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                     begin_ns + fixed_overhead_ns);
-    if (!options.xp_bypass_base_io) {
+    if (options.xp_bypass_base_io) {
+      AccountInjectedDelayOnly(fixed_overhead_ns);
+    } else {
       WaitForNanoseconds(fixed_overhead_ns, options.xp_busy_wait);
     }
   }
   stats->simulated_read_fixed_delay_ns.fetch_add(fixed_overhead_ns);
 
   const uint64_t rpq_depth = std::max<uint64_t>(1, options.xp_rpq_depth);
+  const uint64_t stream_tag = GetThreadStreamTag();
   while (true) {
     uint64_t wait_for_depth_ns = 0;
     uint64_t iteration_now_ns = 0;
@@ -1334,13 +1641,17 @@ void SimulateDimmReadQueueServe(
         const uint64_t min_finish_ns = MinFinishTime(state.read_finish_times);
         wait_for_depth_ns = min_finish_ns > now_ns ? min_finish_ns - now_ns : 0;
       } else {
-        const std::string stream_key =
-            file_name + "#" + std::to_string(GetThreadStreamTag());
-        DimmStreamState& stream = state.read_stream_states[stream_key];
+        const uint32_t stream_id = GetOrAssignDimmStreamId(&state, stream_tag);
+        if (state.read_stream_states_by_id.size() <= static_cast<size_t>(stream_id)) {
+          state.read_stream_states_by_id.resize(static_cast<size_t>(stream_id) + 1);
+        }
+        DimmStreamState& stream = state.read_stream_states_by_id[stream_id];
         const uint64_t end = GetSaturatedEnd(offset, logical_bytes);
-        const bool sequential = stream.has_last && offset == stream.last_end;
+        const bool same_file = stream.has_last && stream.last_file_id == file_id;
+        const bool sequential = same_file && offset == stream.last_end;
         const bool is_random = stream.has_last && !sequential;
         stream.has_last = true;
+        stream.last_file_id = file_id;
         stream.last_end = end;
 
         media_bytes = GetDimmEffectiveMediaBytes(options, logical_bytes, is_random);
@@ -1380,7 +1691,9 @@ void SimulateDimmReadQueueServe(
       const uint64_t device_delay_ns = queue_delay_ns + transfer_delay_ns;
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + device_delay_ns);
-      if (!options.xp_bypass_base_io) {
+      if (options.xp_bypass_base_io) {
+        AccountInjectedDelayOnly(device_delay_ns);
+      } else {
         WaitForNanoseconds(device_delay_ns, options.xp_busy_wait);
       }
       return;
@@ -1388,7 +1701,9 @@ void SimulateDimmReadQueueServe(
     if (wait_for_depth_ns > 0) {
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + wait_for_depth_ns);
-      if (!options.xp_bypass_base_io) {
+      if (options.xp_bypass_base_io) {
+        AccountInjectedDelayOnly(wait_for_depth_ns);
+      } else {
         WaitForNanoseconds(wait_for_depth_ns, options.xp_busy_wait);
       }
     }
@@ -1411,13 +1726,16 @@ void SimulateDimmWriteQueueServe(
                     options.xp_forced_tag_init_stagger_ns);
     AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                     begin_ns + fixed_overhead_ns);
-    if (!options.xp_bypass_base_io) {
+    if (options.xp_bypass_base_io) {
+      AccountInjectedDelayOnly(fixed_overhead_ns);
+    } else {
       WaitForNanoseconds(fixed_overhead_ns, options.xp_busy_wait);
     }
   }
   stats->simulated_write_fixed_delay_ns.fetch_add(fixed_overhead_ns);
 
   const uint64_t wpq_depth = std::max<uint64_t>(1, options.xp_wpq_depth);
+  const uint64_t stream_tag = GetThreadStreamTag();
   while (true) {
     uint64_t wait_for_depth_ns = 0;
     uint64_t iteration_now_ns = 0;
@@ -1442,13 +1760,18 @@ void SimulateDimmWriteQueueServe(
         const uint64_t min_finish_ns = MinFinishTime(state.write_finish_times);
         wait_for_depth_ns = min_finish_ns > now_ns ? min_finish_ns - now_ns : 0;
       } else {
-        const std::string stream_key =
-            file_name + "#" + std::to_string(GetThreadStreamTag());
-        DimmStreamState& stream = state.write_stream_states[stream_key];
+        const uint32_t file_id = GetDimmFileId(&state, file_name);
+        const uint32_t stream_id = GetOrAssignDimmStreamId(&state, stream_tag);
+        if (state.write_stream_states_by_id.size() <= static_cast<size_t>(stream_id)) {
+          state.write_stream_states_by_id.resize(static_cast<size_t>(stream_id) + 1);
+        }
+        DimmStreamState& stream = state.write_stream_states_by_id[stream_id];
         const uint64_t end = GetSaturatedEnd(offset, logical_bytes);
-        const bool sequential = stream.has_last && offset == stream.last_end;
+        const bool same_file = stream.has_last && stream.last_file_id == file_id;
+        const bool sequential = same_file && offset == stream.last_end;
         const bool is_random = stream.has_last && !sequential;
         stream.has_last = true;
+        stream.last_file_id = file_id;
         stream.last_end = end;
 
         media_bytes = GetDimmEffectiveMediaBytes(options, logical_bytes, is_random);
@@ -1488,7 +1811,9 @@ void SimulateDimmWriteQueueServe(
       const uint64_t device_delay_ns = queue_delay_ns + transfer_delay_ns;
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + device_delay_ns);
-      if (!options.xp_bypass_base_io) {
+      if (options.xp_bypass_base_io) {
+        AccountInjectedDelayOnly(device_delay_ns);
+      } else {
         WaitForNanoseconds(device_delay_ns, options.xp_busy_wait);
       }
       return;
@@ -1496,7 +1821,9 @@ void SimulateDimmWriteQueueServe(
     if (wait_for_depth_ns > 0) {
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + wait_for_depth_ns);
-      if (!options.xp_bypass_base_io) {
+      if (options.xp_bypass_base_io) {
+        AccountInjectedDelayOnly(wait_for_depth_ns);
+      } else {
         WaitForNanoseconds(wait_for_depth_ns, options.xp_busy_wait);
       }
     }
@@ -1762,6 +2089,7 @@ void SimulatedHybridFileSystem::MaybeWriteModelStats() const {
       << model_options_.xp_forced_tag_init_stagger_ns << "\n";
   out << "xp_bypass_base_io=" << (model_options_.xp_bypass_base_io ? 1 : 0)
       << "\n";
+  out << "xp_mmap_base_io=" << (model_options_.xp_mmap_base_io ? 1 : 0) << "\n";
   out << "xp_busy_wait=" << (model_options_.xp_busy_wait ? 1 : 0) << "\n";
   out << "xp_use_dimm_device_model="
       << (model_options_.xp_use_dimm_device_model ? 1 : 0) << "\n";
@@ -2024,8 +2352,52 @@ IOStatus SimulatedHybridFileSystem::NewRandomAccessFile(
                              end_us >= start_us ? end_us - start_us : 0);
   }
   if (s.ok() && should_simulate) {
+    uint32_t xp_file_id = 0;
+    uint32_t dimm_file_id = 0;
+    const char* mmap_base = nullptr;
+    size_t mmap_len = 0;
+    int mmap_fd = -1;
+    if (model_options_.use_xp_model) {
+      const uintptr_t instance_id = GetInstanceId(stats_);
+      std::lock_guard<std::mutex> lk(g_xp_mu);
+      XPControllerState& state = g_xp_states[instance_id];
+      xp_file_id = GetXpFileId(&state, fname);
+    }
+    if (model_options_.use_dimm_model) {
+      const uintptr_t instance_id = GetInstanceId(stats_);
+      std::lock_guard<std::mutex> lk(g_dimm_mu);
+      DimmControllerState& state = g_dimm_states[instance_id];
+      dimm_file_id = GetDimmFileId(&state, fname);
+    }
+
+    // Best-effort: mmap the file when bypassing base IO (virtual-time mode) or
+    // when mmap-base-IO is enabled (DAX-like mode). This allows reads to be
+    // served from mapped memory and reduces syscall/FS overhead. Falls back to
+    // base IO when mmap is unavailable.
+    if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
+        (model_options_.xp_bypass_base_io || model_options_.xp_mmap_base_io)) {
+      const int fd = ::open(real_path.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd >= 0) {
+        struct stat st;
+        if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+          void* p = ::mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ,
+                           MAP_PRIVATE, fd, /*offset=*/0);
+          if (p != MAP_FAILED) {
+            mmap_base = reinterpret_cast<const char*>(p);
+            mmap_len = static_cast<size_t>(st.st_size);
+            mmap_fd = fd;
+          } else {
+            ::close(fd);
+          }
+        } else {
+          ::close(fd);
+        }
+      }
+    }
     result->reset(new SimulatedHybridRaf(std::move(*result), rate_limiter_,
                                          fname, is_tmpfs, should_simulate,
+                                         xp_file_id, dimm_file_id, mmap_base,
+                                         mmap_len, mmap_fd,
                                          model_options_, stats_,
                                          latency_monitor_));
   }
@@ -2511,35 +2883,75 @@ IOStatus SimulatedHybridFileSystem::DeleteFile(const std::string& fname,
   return final_status;
 }
 
+SimulatedHybridRaf::~SimulatedHybridRaf() {
+  if (mmap_base_ != nullptr && mmap_len_ > 0) {
+    ::munmap(const_cast<char*>(mmap_base_), mmap_len_);
+    mmap_base_ = nullptr;
+    mmap_len_ = 0;
+  }
+  if (mmap_fd_ >= 0) {
+    ::close(mmap_fd_);
+    mmap_fd_ = -1;
+  }
+}
+
 IOStatus SimulatedHybridRaf::Read(uint64_t offset, size_t n,
                                   const IOOptions& options, Slice* result,
                                   char* scratch, IODebugContext* dbg) const {
+  const uint64_t wrapper_start_ns = NowNanos();
   const uint64_t start_us = NowMicros();
   if (should_simulate_) {
     SimulateIOWait(offset, static_cast<uint64_t>(n));
     if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
-        model_options_.xp_bypass_base_io) {
-      *result = Slice(scratch, n);
-      const uint64_t end_us = NowMicros();
-      if (stats_ != nullptr) {
-        if (is_tmpfs_) {
-          stats_->tmpfs_read_ops.fetch_add(1);
-          stats_->tmpfs_read_bytes.fetch_add(static_cast<uint64_t>(n));
+        (model_options_.xp_bypass_base_io || model_options_.xp_mmap_base_io)) {
+      if (mmap_base_ != nullptr && offset + n <= mmap_len_) {
+        // Preserve RocksDB block-cache behavior by returning data in `scratch`
+        // when possible. Returning a Slice that points into mmapped memory can
+        // cause some callers to treat the data as "already in memory" and skip
+        // caching, which is not desirable for the bypass-base-IO judge
+        // experiment.
+        if (scratch != nullptr) {
+          std::memcpy(scratch, mmap_base_ + offset, n);
+          *result = Slice(scratch, n);
         } else {
-          stats_->base_read_ops.fetch_add(1);
-          stats_->base_read_bytes.fetch_add(static_cast<uint64_t>(n));
+          *result = Slice(mmap_base_ + offset, n);
         }
+        const uint64_t end_us = NowMicros();
+        const uint64_t wrapper_end_ns = NowNanos();
+        if (wrapper_end_ns >= wrapper_start_ns) {
+          g_simulated_fs_read_wall_ns += (wrapper_end_ns - wrapper_start_ns);
+        }
+        if (stats_ != nullptr) {
+          if (is_tmpfs_) {
+            stats_->tmpfs_read_ops.fetch_add(1);
+            stats_->tmpfs_read_bytes.fetch_add(static_cast<uint64_t>(n));
+          } else {
+            stats_->base_read_ops.fetch_add(1);
+            stats_->base_read_bytes.fetch_add(static_cast<uint64_t>(n));
+          }
+        }
+        if (monitor_ != nullptr) {
+          monitor_->Record(SimFsMonitorOp::kRead, is_tmpfs_,
+                           static_cast<uint64_t>(n),
+                           end_us >= start_us ? end_us - start_us : 0);
+        }
+        return IOStatus::OK();
       }
-      if (monitor_ != nullptr) {
-        monitor_->Record(SimFsMonitorOp::kRead, is_tmpfs_,
-                         static_cast<uint64_t>(n),
-                         end_us >= start_us ? end_us - start_us : 0);
-      }
-      return IOStatus::OK();
+      // Fallback: mmap unavailable/out-of-range. Do base read to keep data
+      // correctness even when mmap-base-IO is requested.
     }
   }
+  const uint64_t base_start_ns = NowNanos();
   IOStatus s = target()->Read(offset, n, options, result, scratch, dbg);
+  const uint64_t base_end_ns = NowNanos();
+  if (base_end_ns >= base_start_ns) {
+    g_simulated_fs_base_read_ns += (base_end_ns - base_start_ns);
+  }
   const uint64_t end_us = NowMicros();
+  const uint64_t wrapper_end_ns = NowNanos();
+  if (wrapper_end_ns >= wrapper_start_ns) {
+    g_simulated_fs_read_wall_ns += (wrapper_end_ns - wrapper_start_ns);
+  }
   if (stats_ != nullptr) {
     if (is_tmpfs_) {
       stats_->tmpfs_read_ops.fetch_add(1);
@@ -2560,6 +2972,7 @@ IOStatus SimulatedHybridRaf::Read(uint64_t offset, size_t n,
 IOStatus SimulatedHybridRaf::MultiRead(FSReadRequest* reqs, size_t num_reqs,
                                        const IOOptions& options,
                                        IODebugContext* dbg) {
+  const uint64_t wrapper_start_ns = NowNanos();
   const uint64_t start_us = NowMicros();
   uint64_t total_bytes = 0;
   if (should_simulate_) {
@@ -2567,14 +2980,28 @@ IOStatus SimulatedHybridRaf::MultiRead(FSReadRequest* reqs, size_t num_reqs,
       SimulateIOWait(reqs[i].offset, static_cast<uint64_t>(reqs[i].len));
       total_bytes += static_cast<uint64_t>(reqs[i].len);
       if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
-          model_options_.xp_bypass_base_io) {
+          (model_options_.xp_bypass_base_io || model_options_.xp_mmap_base_io)) {
+        if (mmap_base_ == nullptr ||
+            reqs[i].offset + reqs[i].len > mmap_len_) {
+          // Mmap path unavailable/out-of-range: fall back to base MultiRead.
+          goto base_multiread;
+        }
+        if (reqs[i].scratch != nullptr) {
+          std::memcpy(reqs[i].scratch, mmap_base_ + reqs[i].offset, reqs[i].len);
+          reqs[i].result = Slice(reqs[i].scratch, reqs[i].len);
+        } else {
+          reqs[i].result = Slice(mmap_base_ + reqs[i].offset, reqs[i].len);
+        }
         reqs[i].status = IOStatus::OK();
-        reqs[i].result = Slice(reqs[i].scratch, reqs[i].len);
       }
     }
     if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
-        model_options_.xp_bypass_base_io) {
+        (model_options_.xp_bypass_base_io || model_options_.xp_mmap_base_io)) {
       const uint64_t end_us = NowMicros();
+      const uint64_t wrapper_end_ns = NowNanos();
+      if (wrapper_end_ns >= wrapper_start_ns) {
+        g_simulated_fs_read_wall_ns += (wrapper_end_ns - wrapper_start_ns);
+      }
       if (stats_ != nullptr) {
         if (is_tmpfs_) {
           stats_->tmpfs_read_ops.fetch_add(num_reqs);
@@ -2591,7 +3018,13 @@ IOStatus SimulatedHybridRaf::MultiRead(FSReadRequest* reqs, size_t num_reqs,
       return IOStatus::OK();
     }
   }
+base_multiread:
+  const uint64_t base_start_ns = NowNanos();
   IOStatus s = target()->MultiRead(reqs, num_reqs, options, dbg);
+  const uint64_t base_end_ns = NowNanos();
+  if (base_end_ns >= base_start_ns) {
+    g_simulated_fs_base_read_ns += (base_end_ns - base_start_ns);
+  }
   // Best-effort bytes accounting for non-simulated path.
   if (total_bytes == 0) {
     for (size_t i = 0; i < num_reqs; ++i) {
@@ -2599,6 +3032,10 @@ IOStatus SimulatedHybridRaf::MultiRead(FSReadRequest* reqs, size_t num_reqs,
     }
   }
   const uint64_t end_us = NowMicros();
+  const uint64_t wrapper_end_ns = NowNanos();
+  if (wrapper_end_ns >= wrapper_start_ns) {
+    g_simulated_fs_read_wall_ns += (wrapper_end_ns - wrapper_start_ns);
+  }
   if (stats_ != nullptr) {
     if (is_tmpfs_) {
       stats_->tmpfs_read_ops.fetch_add(num_reqs);
@@ -2618,12 +3055,17 @@ IOStatus SimulatedHybridRaf::MultiRead(FSReadRequest* reqs, size_t num_reqs,
 IOStatus SimulatedHybridRaf::Prefetch(uint64_t offset, size_t n,
                                       const IOOptions& options,
                                       IODebugContext* dbg) {
+  const uint64_t wrapper_start_ns = NowNanos();
   const uint64_t start_us = NowMicros();
   if (should_simulate_) {
     SimulateIOWait(offset, static_cast<uint64_t>(n));
     if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
         model_options_.xp_bypass_base_io) {
       const uint64_t end_us = NowMicros();
+      const uint64_t wrapper_end_ns = NowNanos();
+      if (wrapper_end_ns >= wrapper_start_ns) {
+        g_simulated_fs_read_wall_ns += (wrapper_end_ns - wrapper_start_ns);
+      }
       if (stats_ != nullptr) {
         if (is_tmpfs_) {
           stats_->tmpfs_prefetch_ops.fetch_add(1);
@@ -2643,6 +3085,10 @@ IOStatus SimulatedHybridRaf::Prefetch(uint64_t offset, size_t n,
   }
   IOStatus s = target()->Prefetch(offset, n, options, dbg);
   const uint64_t end_us = NowMicros();
+  const uint64_t wrapper_end_ns = NowNanos();
+  if (wrapper_end_ns >= wrapper_start_ns) {
+    g_simulated_fs_read_wall_ns += (wrapper_end_ns - wrapper_start_ns);
+  }
   if (stats_ != nullptr) {
     if (is_tmpfs_) {
       stats_->tmpfs_prefetch_ops.fetch_add(1);
@@ -2667,13 +3113,13 @@ void SimulatedHybridRaf::SimulateIOWait(uint64_t offset,
   }
 
   if (model_options_.use_dimm_model) {
-    SimulateDimmReadQueueServe(file_name_, offset, logical_bytes, model_options_,
-                               stats_);
+    SimulateDimmReadQueueServe(dimm_file_id_, offset, logical_bytes,
+                               model_options_, stats_);
     return;
   }
 
   if (model_options_.use_xp_model) {
-    SimulateXpReadQueueServe(file_name_, offset, logical_bytes, model_options_,
+    SimulateXpReadQueueServe(xp_file_id_, offset, logical_bytes, model_options_,
                              stats_);
     return;
   }
@@ -2730,16 +3176,10 @@ IOStatus SimulatedWritableFile::Append(const Slice& data, const IOOptions& ioo,
     const uint64_t logical = static_cast<uint64_t>(data.size());
     SimulateDimmWrite(append_file_offset_, logical);
     append_file_offset_ = GetSaturatedEnd(append_file_offset_, logical);
-    if (model_options_.xp_bypass_base_io) {
-      return IOStatus::OK();
-    }
   } else if (model_options_.use_xp_model) {
     const uint64_t logical = static_cast<uint64_t>(data.size());
     SimulateXPWrite(append_file_offset_, logical);
     append_file_offset_ = GetSaturatedEnd(append_file_offset_, logical);
-    if (model_options_.xp_bypass_base_io) {
-      return IOStatus::OK();
-    }
   } else if (use_direct_io()) {
     const uint64_t logical = static_cast<uint64_t>(data.size());
     SimulateIOWait(logical, logical);
@@ -2756,16 +3196,10 @@ IOStatus SimulatedWritableFile::Append(
     const uint64_t logical = static_cast<uint64_t>(data.size());
     SimulateDimmWrite(append_file_offset_, logical);
     append_file_offset_ = GetSaturatedEnd(append_file_offset_, logical);
-    if (model_options_.xp_bypass_base_io) {
-      return IOStatus::OK();
-    }
   } else if (model_options_.use_xp_model) {
     const uint64_t logical = static_cast<uint64_t>(data.size());
     SimulateXPWrite(append_file_offset_, logical);
     append_file_offset_ = GetSaturatedEnd(append_file_offset_, logical);
-    if (model_options_.xp_bypass_base_io) {
-      return IOStatus::OK();
-    }
   } else if (use_direct_io()) {
     const uint64_t logical = static_cast<uint64_t>(data.size());
     SimulateIOWait(logical, logical);
@@ -2784,17 +3218,11 @@ IOStatus SimulatedWritableFile::PositionedAppend(const Slice& data,
     SimulateDimmWrite(offset, logical);
     append_file_offset_ =
         std::max<uint64_t>(append_file_offset_, GetSaturatedEnd(offset, logical));
-    if (model_options_.xp_bypass_base_io) {
-      return IOStatus::OK();
-    }
   } else if (model_options_.use_xp_model) {
     const uint64_t logical = static_cast<uint64_t>(data.size());
     SimulateXPWrite(offset, logical);
     append_file_offset_ =
         std::max<uint64_t>(append_file_offset_, GetSaturatedEnd(offset, logical));
-    if (model_options_.xp_bypass_base_io) {
-      return IOStatus::OK();
-    }
   } else if (use_direct_io()) {
     const uint64_t logical = static_cast<uint64_t>(data.size());
     SimulateIOWait(logical, logical);
@@ -2812,17 +3240,11 @@ IOStatus SimulatedWritableFile::PositionedAppend(
     SimulateDimmWrite(offset, logical);
     append_file_offset_ =
         std::max<uint64_t>(append_file_offset_, GetSaturatedEnd(offset, logical));
-    if (model_options_.xp_bypass_base_io) {
-      return IOStatus::OK();
-    }
   } else if (model_options_.use_xp_model) {
     const uint64_t logical = static_cast<uint64_t>(data.size());
     SimulateXPWrite(offset, logical);
     append_file_offset_ =
         std::max<uint64_t>(append_file_offset_, GetSaturatedEnd(offset, logical));
-    if (model_options_.xp_bypass_base_io) {
-      return IOStatus::OK();
-    }
   } else if (use_direct_io()) {
     const uint64_t logical = static_cast<uint64_t>(data.size());
     SimulateIOWait(logical, logical);
@@ -2836,10 +3258,6 @@ IOStatus SimulatedWritableFile::PositionedAppend(
 
 IOStatus SimulatedWritableFile::Sync(const IOOptions& options,
                                      IODebugContext* dbg) {
-  if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
-      model_options_.xp_bypass_base_io) {
-    return IOStatus::OK();
-  }
   if (!model_options_.use_xp_model && unsynced_bytes > 0) {
     const uint64_t logical = static_cast<uint64_t>(unsynced_bytes);
     SimulateIOWait(logical, logical);
@@ -2850,10 +3268,6 @@ IOStatus SimulatedWritableFile::Sync(const IOOptions& options,
 
 IOStatus SimulatedWritableFile::Close(const IOOptions& options,
                                       IODebugContext* dbg) {
-  if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
-      model_options_.xp_bypass_base_io) {
-    return IOStatus::OK();
-  }
   return target()->Close(options, dbg);
 }
 }  // namespace ROCKSDB_NAMESPACE
