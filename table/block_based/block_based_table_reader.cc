@@ -1103,10 +1103,32 @@ class KVSepBptreeLeafV2TableIterator final : public InternalIteratorBase<Slice> 
   uint32_t LowerBoundInLeaf(const Slice& target) const {
     uint32_t left = 0;
     uint32_t right = leaf_view_.num_entries();
+    const bool bytewise =
+        KVSepBptreeIsBytewiseComparator(icomp_.user_comparator());
+    const size_t prefix_len = leaf_view_.prefix().size();
+    if (prefix_len > 0) {
+      // Prepare scratch with the prefix once so we can avoid clearing and
+      // re-appending it for every comparison.
+      key_compare_scratch_.assign(leaf_view_.prefix().data(), prefix_len);
+    }
     while (left < right) {
       const uint32_t mid = left + (right - left) / 2;
-      const Slice mid_key = leaf_view_.FullKeyAt(mid, &key_compare_scratch_);
-      const int cmp = icomp_.Compare(mid_key, target);
+      const Slice mid_suffix = leaf_view_.SuffixAt(mid);
+      int cmp = 0;
+      if (prefix_len == 0) {
+        cmp = icomp_.Compare(mid_suffix, target);
+      } else if (bytewise) {
+        // Avoid materializing the full key when we can compare as
+        // {prefix,suffix} directly under bytewise comparator semantics.
+        cmp = KVSepBptreeCompareInternalKeyBytewise(leaf_view_.prefix(),
+                                                    mid_suffix, target);
+      } else {
+        // Fallback: materialize a contiguous key to respect arbitrary user
+        // comparator semantics.
+        const Slice mid_key = leaf_view_.FullKeyAtWithScratchPrefix(
+            mid, &key_compare_scratch_, prefix_len);
+        cmp = icomp_.Compare(mid_key, target);
+      }
       if (cmp < 0) {
         left = mid + 1;
       } else {
@@ -1626,21 +1648,25 @@ class KVSepBptreePairV3TableIterator final : public InternalIteratorBase<Slice> 
   uint32_t LowerBoundInLeaf(const Slice& target) const {
     uint32_t left = 0;
     uint32_t right = leaf_view_.num_entries();
+    const bool bytewise =
+        KVSepBptreeIsBytewiseComparator(icomp_.user_comparator());
     while (left < right) {
       const uint32_t mid = left + (right - left) / 2;
-      Slice mid_key;
+      const Slice suffix = leaf_view_.SuffixAt(mid);
+      int cmp = 0;
       if (scratch_prefix_len_ == 0) {
-        mid_key = leaf_view_.SuffixAt(mid);
+        cmp = icomp_.Compare(suffix, target);
+      } else if (bytewise) {
+        cmp = KVSepBptreeCompareInternalKeyBytewise(leaf_view_.prefix(), suffix,
+                                                    target);
       } else {
-        const Slice suffix = leaf_view_.SuffixAt(mid);
         key_compare_scratch_.resize(scratch_prefix_len_ + suffix.size());
         if (!suffix.empty()) {
           memcpy(&key_compare_scratch_[scratch_prefix_len_], suffix.data(),
                  suffix.size());
         }
-        mid_key = Slice(key_compare_scratch_);
+        cmp = icomp_.Compare(Slice(key_compare_scratch_), target);
       }
-      const int cmp = icomp_.Compare(mid_key, target);
       if (cmp < 0) {
         left = mid + 1;
       } else {
@@ -4443,88 +4469,186 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
             break;
           }
 
-          // Lower bound in leaf.
           const size_t prefix_len = leaf_view.prefix().size();
-          std::string mid_key_scratch;
-          std::string entry_key_scratch;
-          if (prefix_len > 0) {
-            mid_key_scratch.assign(leaf_view.prefix().data(), prefix_len);
-            entry_key_scratch.assign(leaf_view.prefix().data(), prefix_len);
-          }
-          auto full_key_at = [&](uint32_t idx, std::string* scratch) -> Slice {
-            if (prefix_len == 0) {
-              return leaf_view.SuffixAt(idx);
-            }
-            const Slice suffix = leaf_view.SuffixAt(idx);
-            scratch->resize(prefix_len + suffix.size());
-            if (!suffix.empty()) {
-              memcpy(&(*scratch)[prefix_len], suffix.data(), suffix.size());
-            }
-            return Slice(*scratch);
-          };
-          uint32_t left = 0;
-          uint32_t right = leaf_view.num_entries();
-          while (left < right) {
-            const uint32_t mid = left + (right - left) / 2;
-            const Slice mid_key = full_key_at(mid, &mid_key_scratch);
-            const int cmp = rep_->internal_comparator.Compare(mid_key, key);
-            if (cmp < 0) {
-              left = mid + 1;
-            } else {
-              right = mid;
-            }
-          }
-
           const Slice target_user_key = ExtractUserKey(key);
           const Slice value_block_contents = pair_view.value_contents();
-          for (uint32_t i = left; i < leaf_view.num_entries(); ++i) {
-            const Slice entry_key = full_key_at(i, &entry_key_scratch);
-            // If we've passed the user key, stop scanning this leaf.
-            if (UserComparatorWrapper(rep_->internal_comparator.user_comparator())
-                    .CompareWithoutTimestamp(ExtractUserKey(entry_key),
-                                             target_user_key) > 0) {
-              break;
-            }
 
-            ParsedInternalKey parsed_key;
-            Status pik_status = ParseInternalKey(
-                entry_key, &parsed_key, false /* log_err_key */);
-            if (UNLIKELY(!pik_status.ok())) {
-              s = pik_status;
-              break;
-            }
+          // Fast path: for bytewise comparator w/o timestamps, avoid materializing
+          // full internal keys in the leaf binary search and version scan.
+          const bool fast_bytewise =
+              (ts_sz == 0) &&
+              KVSepBptreeIsBytewiseComparator(
+                  rep_->internal_comparator.user_comparator());
 
-            Slice value_to_save;
-            const uint32_t value_len = leaf_view.ValueLenAt(i);
-            if (value_len == 0) {
-              value_to_save = Slice();
-            } else {
-              const uint32_t value_off = leaf_view.ValueOffAt(i);
-              if (UNLIKELY(static_cast<size_t>(value_off) +
-                               static_cast<size_t>(value_len) >
-                           value_block_contents.size())) {
-                s = Status::Corruption("kvsep pair v3: value pointer out of range");
+          uint32_t left = 0;
+          uint32_t right = leaf_view.num_entries();
+          if (fast_bytewise) {
+            while (left < right) {
+              const uint32_t mid = left + (right - left) / 2;
+              const int cmp = KVSepBptreeCompareInternalKeyBytewise(
+                  leaf_view.prefix(), leaf_view.SuffixAt(mid), key);
+              if (cmp < 0) {
+                left = mid + 1;
+              } else {
+                right = mid;
+              }
+            }
+          } else {
+            // Fallback: materialize full keys for comparator correctness.
+            std::string mid_key_scratch;
+            if (prefix_len > 0) {
+              mid_key_scratch.assign(leaf_view.prefix().data(), prefix_len);
+            }
+            auto full_key_at = [&](uint32_t idx, std::string* scratch) -> Slice {
+              if (prefix_len == 0) {
+                return leaf_view.SuffixAt(idx);
+              }
+              const Slice suffix = leaf_view.SuffixAt(idx);
+              scratch->resize(prefix_len + suffix.size());
+              if (!suffix.empty()) {
+                memcpy(&(*scratch)[prefix_len], suffix.data(), suffix.size());
+              }
+              return Slice(*scratch);
+            };
+            while (left < right) {
+              const uint32_t mid = left + (right - left) / 2;
+              const Slice mid_key = full_key_at(mid, &mid_key_scratch);
+              const int cmp = rep_->internal_comparator.Compare(mid_key, key);
+              if (cmp < 0) {
+                left = mid + 1;
+              } else {
+                right = mid;
+              }
+            }
+          }
+
+          if (fast_bytewise) {
+            for (uint32_t i = left; i < leaf_view.num_entries(); ++i) {
+              const Slice suffix = leaf_view.SuffixAt(i);
+              const int uk_cmp = KVSepBptreeCompareUserKeyBytewise(
+                  leaf_view.prefix(), suffix, target_user_key);
+              if (uk_cmp > 0) {
                 break;
               }
-              value_to_save =
-                  Slice(value_block_contents.data() + value_off, value_len);
-            }
-
-            Status read_status;
-            bool ret =
-                get_context->SaveValue(parsed_key, value_to_save, &matched,
-                                       &read_status, /*value_pinner=*/nullptr);
-            if (UNLIKELY(!read_status.ok())) {
-              s = read_status;
-              break;
-            }
-            if (!ret) {
-              if (get_context->State() == GetContext::GetState::kFound) {
-                does_referenced_key_exist = true;
-                referenced_data_size = entry_key.size() + value_to_save.size();
+              if (uk_cmp < 0) {
+                continue;
               }
-              done = true;
-              break;
+
+              uint64_t footer = 0;
+              if (UNLIKELY(!KVSepBptreeDecodeInternalKeyFooter(
+                      leaf_view.prefix(), suffix, &footer))) {
+                s = Status::Corruption("kvsep pair v3: bad internal key footer");
+                break;
+              }
+
+              ParsedInternalKey parsed_key;
+              parsed_key.user_key = target_user_key;
+              parsed_key.sequence = footer >> 8;
+              parsed_key.type = static_cast<ValueType>(footer & 0xff);
+
+              Slice value_to_save;
+              const uint32_t value_len = leaf_view.ValueLenAt(i);
+              if (value_len == 0) {
+                value_to_save = Slice();
+              } else {
+                const uint32_t value_off = leaf_view.ValueOffAt(i);
+                if (UNLIKELY(static_cast<size_t>(value_off) +
+                                 static_cast<size_t>(value_len) >
+                             value_block_contents.size())) {
+                  s = Status::Corruption(
+                      "kvsep pair v3: value pointer out of range");
+                  break;
+                }
+                value_to_save =
+                    Slice(value_block_contents.data() + value_off, value_len);
+              }
+
+              Status read_status;
+              bool ret = get_context->SaveValue(parsed_key, value_to_save,
+                                                &matched, &read_status,
+                                                /*value_pinner=*/nullptr);
+              if (UNLIKELY(!read_status.ok())) {
+                s = read_status;
+                break;
+              }
+              if (!ret) {
+                if (get_context->State() == GetContext::GetState::kFound) {
+                  does_referenced_key_exist = true;
+                  referenced_data_size =
+                      target_user_key.size() + value_to_save.size();
+                }
+                done = true;
+                break;
+              }
+            }
+          } else {
+            // Fallback: materialize full keys and parse them.
+            std::string entry_key_scratch;
+            if (prefix_len > 0) {
+              entry_key_scratch.assign(leaf_view.prefix().data(), prefix_len);
+            }
+            auto full_key_at = [&](uint32_t idx, std::string* scratch) -> Slice {
+              if (prefix_len == 0) {
+                return leaf_view.SuffixAt(idx);
+              }
+              const Slice suffix = leaf_view.SuffixAt(idx);
+              scratch->resize(prefix_len + suffix.size());
+              if (!suffix.empty()) {
+                memcpy(&(*scratch)[prefix_len], suffix.data(), suffix.size());
+              }
+              return Slice(*scratch);
+            };
+            for (uint32_t i = left; i < leaf_view.num_entries(); ++i) {
+              const Slice entry_key = full_key_at(i, &entry_key_scratch);
+              // If we've passed the user key, stop scanning this leaf.
+              if (UserComparatorWrapper(rep_->internal_comparator.user_comparator())
+                      .CompareWithoutTimestamp(ExtractUserKey(entry_key),
+                                               target_user_key) > 0) {
+                break;
+              }
+
+              ParsedInternalKey parsed_key;
+              Status pik_status = ParseInternalKey(
+                  entry_key, &parsed_key, false /* log_err_key */);
+              if (UNLIKELY(!pik_status.ok())) {
+                s = pik_status;
+                break;
+              }
+
+              Slice value_to_save;
+              const uint32_t value_len = leaf_view.ValueLenAt(i);
+              if (value_len == 0) {
+                value_to_save = Slice();
+              } else {
+                const uint32_t value_off = leaf_view.ValueOffAt(i);
+                if (UNLIKELY(static_cast<size_t>(value_off) +
+                                 static_cast<size_t>(value_len) >
+                             value_block_contents.size())) {
+                  s = Status::Corruption(
+                      "kvsep pair v3: value pointer out of range");
+                  break;
+                }
+                value_to_save =
+                    Slice(value_block_contents.data() + value_off, value_len);
+              }
+
+              Status read_status;
+              bool ret = get_context->SaveValue(parsed_key, value_to_save,
+                                                &matched, &read_status,
+                                                /*value_pinner=*/nullptr);
+              if (UNLIKELY(!read_status.ok())) {
+                s = read_status;
+                break;
+              }
+              if (!ret) {
+                if (get_context->State() == GetContext::GetState::kFound) {
+                  does_referenced_key_exist = true;
+                  referenced_data_size =
+                      entry_key.size() + value_to_save.size();
+                }
+                done = true;
+                break;
+              }
             }
           }
           if (!s.ok()) {

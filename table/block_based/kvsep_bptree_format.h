@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "rocksdb/comparator.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
@@ -13,6 +14,115 @@
 #include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+inline bool KVSepBptreeIsBytewiseComparator(const Comparator* ucmp) {
+  return ucmp != nullptr && ucmp == BytewiseComparator();
+}
+
+// Helper: decode the last 8 bytes (seqno+type footer) of an internal key stored
+// as `prefix || suffix`, without materializing a contiguous buffer.
+//
+// Returns false if the concatenated key is too small.
+inline bool KVSepBptreeDecodeInternalKeyFooter(const Slice& prefix,
+                                               const Slice& suffix,
+                                               uint64_t* footer_out) {
+  if (footer_out == nullptr) {
+    return false;
+  }
+  const size_t total = prefix.size() + suffix.size();
+  if (total < 8) {
+    return false;
+  }
+  char tmp[8];
+  if (suffix.size() >= 8) {
+    memcpy(tmp, suffix.data() + (suffix.size() - 8), 8);
+  } else {
+    const size_t need_from_prefix = 8 - suffix.size();
+    if (prefix.size() < need_from_prefix) {
+      return false;
+    }
+    memcpy(tmp, prefix.data() + (prefix.size() - need_from_prefix),
+           need_from_prefix);
+    memcpy(tmp + need_from_prefix, suffix.data(), suffix.size());
+  }
+  *footer_out = DecodeFixed64(tmp);
+  return true;
+}
+
+// Compare only the user-key portion (internal key excluding the trailing
+// 8-byte seqno/type footer) against `target_user_key`, assuming bytewise
+// comparator semantics.
+//
+// Returns -1 / 0 / +1 in the same sense as Comparator::Compare.
+inline int KVSepBptreeCompareUserKeyBytewise(const Slice& prefix,
+                                             const Slice& suffix,
+                                             const Slice& target_user_key) {
+  const size_t total = prefix.size() + suffix.size();
+  // Treat malformed keys as "smaller" to keep callers safe; they will likely
+  // surface corruption elsewhere.
+  if (total < 8) {
+    return -1;
+  }
+  const size_t user_len = total - 8;
+  const size_t other_len = target_user_key.size();
+  const size_t min_len = std::min(user_len, other_len);
+
+  const size_t prefix_part = std::min(prefix.size(), min_len);
+  if (prefix_part > 0) {
+    const int c = memcmp(prefix.data(), target_user_key.data(), prefix_part);
+    if (c != 0) {
+      return c < 0 ? -1 : 1;
+    }
+  }
+  const size_t remain = min_len - prefix_part;
+  if (remain > 0) {
+    const int c =
+        memcmp(suffix.data(), target_user_key.data() + prefix_part, remain);
+    if (c != 0) {
+      return c < 0 ? -1 : 1;
+    }
+  }
+  if (user_len < other_len) {
+    return -1;
+  }
+  if (user_len > other_len) {
+    return 1;
+  }
+  return 0;
+}
+
+// Compare an internal key stored as `prefix || suffix` with a contiguous
+// internal key `target_internal_key`, assuming the user comparator is bytewise.
+//
+// This matches InternalKeyComparator ordering:
+//   - increasing user key (bytewise)
+//   - decreasing seqno/type footer (numeric, little endian in encoding)
+inline int KVSepBptreeCompareInternalKeyBytewise(
+    const Slice& prefix, const Slice& suffix, const Slice& target_internal_key) {
+  if (target_internal_key.size() < 8) {
+    return 1;
+  }
+  const Slice target_user_key(target_internal_key.data(),
+                              target_internal_key.size() - 8);
+  int r = KVSepBptreeCompareUserKeyBytewise(prefix, suffix, target_user_key);
+  if (r != 0) {
+    return r;
+  }
+
+  uint64_t entry_footer = 0;
+  if (!KVSepBptreeDecodeInternalKeyFooter(prefix, suffix, &entry_footer)) {
+    return -1;
+  }
+  const uint64_t target_footer =
+      DecodeFixed64(target_internal_key.data() + target_internal_key.size() - 8);
+  if (entry_footer > target_footer) {
+    return -1;
+  }
+  if (entry_footer < target_footer) {
+    return 1;
+  }
+  return 0;
+}
 
 // Table property key indicating this SST uses KV-separation encoding.
 inline constexpr const char kKVSepBptreeTablePropertyKey[] =

@@ -747,6 +747,12 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
 
         const Slice vb_contents = pair_view.value_contents();
 
+        UserComparatorWrapper ucmp(rep_->internal_comparator.user_comparator());
+        const size_t ts_sz = rep_->internal_comparator.user_comparator()->timestamp_size();
+        const bool fast_bytewise =
+            (ts_sz == 0) &&
+            KVSepBptreeIsBytewiseComparator(rep_->internal_comparator.user_comparator());
+
         auto lower_bound =
             [&](const Slice& target, std::string* scratch) -> uint32_t {
           const size_t prefix_len = leaf_view.prefix().size();
@@ -754,11 +760,17 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
           uint32_t right = leaf_view.num_entries();
           while (left < right) {
             const uint32_t mid = left + (right - left) / 2;
-            const Slice mid_key = (prefix_len == 0)
-                                      ? leaf_view.SuffixAt(mid)
-                                      : leaf_view.FullKeyAtWithScratchPrefix(
-                                            mid, scratch, prefix_len);
-            const int cmp = rep_->internal_comparator.Compare(mid_key, target);
+            int cmp = 0;
+            if (fast_bytewise) {
+              cmp = KVSepBptreeCompareInternalKeyBytewise(
+                  leaf_view.prefix(), leaf_view.SuffixAt(mid), target);
+            } else {
+              const Slice mid_key = (prefix_len == 0)
+                                        ? leaf_view.SuffixAt(mid)
+                                        : leaf_view.FullKeyAtWithScratchPrefix(
+                                              mid, scratch, prefix_len);
+              cmp = rep_->internal_comparator.Compare(mid_key, target);
+            }
             if (cmp < 0) {
               left = mid + 1;
             } else {
@@ -767,8 +779,6 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
           }
           return left;
         };
-
-        UserComparatorWrapper ucmp(rep_->internal_comparator.user_comparator());
 
         std::string entry_key_scratch;
         entry_key_scratch.reserve(64);
@@ -798,23 +808,46 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
           }
           const uint32_t pos = lower_bound(ikey, &entry_key_scratch);
           for (uint32_t i = pos; i < leaf_view.num_entries() && !done; ++i) {
-            const Slice entry_key =
-                (leaf_prefix_len == 0)
-                    ? leaf_view.SuffixAt(i)
-                    : leaf_view.FullKeyAtWithScratchPrefix(i, &entry_key_scratch,
-                                                          leaf_prefix_len);
-            if (ucmp.CompareWithoutTimestamp(ExtractUserKey(entry_key),
-                                             target_user_key) > 0) {
-              break;
-            }
-
+            const Slice suffix = leaf_view.SuffixAt(i);
             ParsedInternalKey parsed_key;
-            Status pik_status =
-                ParseInternalKey(entry_key, &parsed_key, false /* log_err_key */);
-            if (UNLIKELY(!pik_status.ok())) {
-              *(kc->s) = pik_status;
-              done = true;
-              break;
+            if (fast_bytewise) {
+              const int uk_cmp = KVSepBptreeCompareUserKeyBytewise(
+                  leaf_view.prefix(), suffix, target_user_key);
+              if (uk_cmp > 0) {
+                break;
+              }
+              if (uk_cmp < 0) {
+                continue;
+              }
+              uint64_t footer = 0;
+              if (UNLIKELY(!KVSepBptreeDecodeInternalKeyFooter(
+                      leaf_view.prefix(), suffix, &footer))) {
+                *(kc->s) =
+                    Status::Corruption("kvsep pair v3: bad internal key footer");
+                done = true;
+                break;
+              }
+              parsed_key.user_key = target_user_key;
+              parsed_key.sequence = footer >> 8;
+              parsed_key.type = static_cast<ValueType>(footer & 0xff);
+            } else {
+              const Slice entry_key =
+                  (leaf_prefix_len == 0)
+                      ? suffix
+                      : leaf_view.FullKeyAtWithScratchPrefix(i, &entry_key_scratch,
+                                                            leaf_prefix_len);
+              if (ucmp.CompareWithoutTimestamp(ExtractUserKey(entry_key),
+                                               target_user_key) > 0) {
+                break;
+              }
+              Status pik_status =
+                  ParseInternalKey(entry_key, &parsed_key,
+                                   false /* log_err_key */);
+              if (UNLIKELY(!pik_status.ok())) {
+                *(kc->s) = pik_status;
+                done = true;
+                break;
+              }
             }
 
             Slice value_to_save;
