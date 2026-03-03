@@ -1636,12 +1636,38 @@ DEFINE_int64(
     tail_probe_threshold_us, 0,
     "Tail latency threshold in microseconds. Tail samples are captured only "
     "for seek ops with latency >= this threshold. <=0 disables tail probe.");
+DEFINE_string(
+    tail_probe_op, "seek",
+    "Tail probe operation selector. Supported values: seek, read, all. "
+    "When set to read, tail samples are captured for kRead ops (Get/MultiGet) "
+    "with latency >= --tail_probe_threshold_us.");
 DEFINE_uint64(tail_probe_max_samples, 20000,
               "Maximum tail samples to write per db_bench process.");
 DEFINE_string(tail_probe_case_label, "",
               "Optional case label attached to each tail sample row.");
 DEFINE_string(tail_probe_scenario, "",
               "Optional scenario name attached to each tail sample row.");
+
+DEFINE_string(sample_probe_output, "",
+              "If non-empty, append periodically-sampled perf deltas to "
+              "this CSV file. The CSV format matches --tail_probe_output.");
+DEFINE_string(
+    sample_probe_op, "seek",
+    "Sample probe operation selector. Supported values: seek, read, all. "
+    "When set to read, sample rows are recorded for kRead ops (Get/MultiGet). "
+    "Sampling is periodic by op count, controlled by "
+    "--sample_probe_interval_ops.");
+DEFINE_int64(
+    sample_probe_interval_ops, 0,
+    "Record one sample every N selected ops per thread. Samples use per-op "
+    "PerfContext/IOStatsContext deltas (like tail probe), but selection is "
+    "periodic rather than latency-threshold-based. <=0 disables sampling.");
+DEFINE_uint64(sample_probe_max_samples, 20000,
+              "Maximum sampled rows to write per db_bench process.");
+DEFINE_string(sample_probe_case_label, "",
+              "Optional case label attached to each sampled row.");
+DEFINE_string(sample_probe_scenario, "",
+              "Optional scenario name attached to each sampled row.");
 
 DEFINE_uint64(soft_pending_compaction_bytes_limit, 64ull * 1024 * 1024 * 1024,
               "Slowdown writes if pending compaction bytes exceed this number");
@@ -1941,6 +1967,14 @@ DEFINE_int64(keys_per_prefix, 0,
              "control average number of keys generated per prefix, 0 means no "
              "special handling of the prefix, i.e. use the prefix comes with "
              "the generated random number.");
+DEFINE_bool(cpu_heavy_keygen, false,
+            "If true, generate keys with a long shared prefix and place the "
+            "numeric key id as a big-endian uint64 suffix. This increases "
+            "comparator CPU cost (memcmp scans deeper) and can help amplify "
+            "CPU-bound behavior on fast storage models. Requires key_size>=8.");
+DEFINE_int32(cpu_heavy_keygen_fill_byte, 0,
+             "When --cpu_heavy_keygen is enabled, fill the shared key prefix "
+             "bytes with this byte value (0-255).");
 DEFINE_bool(total_order_seek, false,
             "Enable total order seek regardless of index format.");
 DEFINE_bool(prefix_same_as_start, false,
@@ -2481,12 +2515,29 @@ struct TailProbeSnapshot {
   uint64_t bloom_memtable_miss_count = 0;
   uint64_t bloom_sst_hit_count = 0;
   uint64_t bloom_sst_miss_count = 0;
+  uint64_t bloom_filter_maymatch_nanos = 0;
 
   uint64_t io_bytes_read = 0;
   uint64_t io_read_nanos = 0;
   uint64_t io_cpu_read_nanos = 0;
   uint64_t io_bytes_written = 0;
   uint64_t io_write_nanos = 0;
+
+  // SimFS: cumulative injected delay on this thread (ns). This accounts for
+  // the simulated delay we *intend* to inject (not OS sleep overshoot).
+  uint64_t simfs_injected_delay_ns = 0;
+  // SimFS: wall time spent inside underlying filesystem Read/MultiRead calls
+  // on this thread (ns). Useful for quantifying remaining base-FS noise.
+  uint64_t simfs_base_read_ns = 0;
+  // SimFS: actual wall time spent inside injected waits (busy-spin/sleep).
+  // This includes OS preemption overshoot.
+  uint64_t simfs_actual_injected_wait_ns = 0;
+  // SimFS: overshoot portion of simfs_actual_injected_wait_ns beyond intended
+  // injected delay (ns). Direct measure of scheduling noise during waits.
+  uint64_t simfs_injected_wait_overshoot_ns = 0;
+  // SimFS: wall time spent inside SimFS RAF Read/MultiRead/Prefetch wrappers
+  // (ns). Includes injected wait, base read, and simulator bookkeeping.
+  uint64_t simfs_read_wall_ns = 0;
 };
 
 static inline uint64_t SafeDelta(uint64_t current, uint64_t previous) {
@@ -2537,6 +2588,7 @@ static TailProbeSnapshot CaptureTailProbeSnapshot() {
     out.bloom_memtable_miss_count = perf->bloom_memtable_miss_count;
     out.bloom_sst_hit_count = perf->bloom_sst_hit_count;
     out.bloom_sst_miss_count = perf->bloom_sst_miss_count;
+    out.bloom_filter_maymatch_nanos = perf->bloom_filter_maymatch_nanos;
   }
   if (io != nullptr) {
     out.io_bytes_read = io->bytes_read;
@@ -2545,6 +2597,13 @@ static TailProbeSnapshot CaptureTailProbeSnapshot() {
     out.io_bytes_written = io->bytes_written;
     out.io_write_nanos = io->write_nanos;
   }
+  out.simfs_injected_delay_ns = GetSimulatedFsInjectedDelayNsForCurrentThread();
+  out.simfs_base_read_ns = GetSimulatedFsBaseReadNsForCurrentThread();
+  out.simfs_actual_injected_wait_ns =
+      GetSimulatedFsActualInjectedWaitNsForCurrentThread();
+  out.simfs_injected_wait_overshoot_ns =
+      GetSimulatedFsInjectedWaitOvershootNsForCurrentThread();
+  out.simfs_read_wall_ns = GetSimulatedFsReadWallNsForCurrentThread();
   return out;
 }
 
@@ -2607,6 +2666,9 @@ static TailProbeSnapshot DeltaTailProbeSnapshot(const TailProbeSnapshot& current
       SafeDelta(current.bloom_sst_hit_count, prev.bloom_sst_hit_count);
   delta.bloom_sst_miss_count =
       SafeDelta(current.bloom_sst_miss_count, prev.bloom_sst_miss_count);
+  delta.bloom_filter_maymatch_nanos =
+      SafeDelta(current.bloom_filter_maymatch_nanos,
+                prev.bloom_filter_maymatch_nanos);
 
   delta.io_bytes_read = SafeDelta(current.io_bytes_read, prev.io_bytes_read);
   delta.io_read_nanos = SafeDelta(current.io_read_nanos, prev.io_read_nanos);
@@ -2615,6 +2677,17 @@ static TailProbeSnapshot DeltaTailProbeSnapshot(const TailProbeSnapshot& current
   delta.io_bytes_written =
       SafeDelta(current.io_bytes_written, prev.io_bytes_written);
   delta.io_write_nanos = SafeDelta(current.io_write_nanos, prev.io_write_nanos);
+  delta.simfs_injected_delay_ns =
+      SafeDelta(current.simfs_injected_delay_ns, prev.simfs_injected_delay_ns);
+  delta.simfs_base_read_ns =
+      SafeDelta(current.simfs_base_read_ns, prev.simfs_base_read_ns);
+  delta.simfs_actual_injected_wait_ns = SafeDelta(
+      current.simfs_actual_injected_wait_ns, prev.simfs_actual_injected_wait_ns);
+  delta.simfs_injected_wait_overshoot_ns = SafeDelta(
+      current.simfs_injected_wait_overshoot_ns,
+      prev.simfs_injected_wait_overshoot_ns);
+  delta.simfs_read_wall_ns =
+      SafeDelta(current.simfs_read_wall_ns, prev.simfs_read_wall_ns);
   return delta;
 }
 
@@ -2712,11 +2785,17 @@ class TailProbeWriter {
     append_u64(&row, delta.bloom_memtable_miss_count);
     append_u64(&row, delta.bloom_sst_hit_count);
     append_u64(&row, delta.bloom_sst_miss_count);
+    append_u64(&row, delta.bloom_filter_maymatch_nanos);
     append_u64(&row, delta.io_bytes_read);
     append_u64(&row, delta.io_read_nanos);
     append_u64(&row, delta.io_cpu_read_nanos);
     append_u64(&row, delta.io_bytes_written);
-    row.append(std::to_string(delta.io_write_nanos));
+    append_u64(&row, delta.io_write_nanos);
+    append_u64(&row, delta.simfs_base_read_ns);
+    append_u64(&row, delta.simfs_actual_injected_wait_ns);
+    append_u64(&row, delta.simfs_injected_wait_overshoot_ns);
+    append_u64(&row, delta.simfs_read_wall_ns);
+    row.append(std::to_string(delta.simfs_injected_delay_ns));
     row.push_back('\n');
     std::fwrite(row.data(), 1, row.size(), file_);
     std::fflush(file_);
@@ -2744,8 +2823,14 @@ class TailProbeWriter {
         "delta_get_cpu_nanos,delta_iter_read_bytes,delta_iter_seek_count,"
         "delta_bloom_memtable_hit_count,delta_bloom_memtable_miss_count,"
         "delta_bloom_sst_hit_count,delta_bloom_sst_miss_count,"
+        "delta_bloom_filter_maymatch_nanos,"
         "delta_io_bytes_read,delta_io_read_nanos,delta_io_cpu_read_nanos,"
-        "delta_io_bytes_written,delta_io_write_nanos\n";
+        "delta_io_bytes_written,delta_io_write_nanos,"
+        "delta_simfs_base_read_ns,"
+        "delta_simfs_actual_injected_wait_ns,"
+        "delta_simfs_injected_wait_overshoot_ns,"
+        "delta_simfs_read_wall_ns,"
+        "delta_simfs_injected_delay_ns\n";
     std::fputs(header, file_);
     std::fflush(file_);
   }
@@ -2788,6 +2873,49 @@ static inline bool SupportsTailSeekProbe(const Slice& bench_name) {
          bench_name == "seekrandomwhilemerging" || bench_name == "readwhilewriting";
 }
 
+static inline bool SupportsTailProbe(const Slice& bench_name) {
+  // Tail probe can be useful for both seek and read (Get/MultiGet) paths.
+  // Keep it opt-in via flags; only enable for commonly used read/seek benches.
+  return SupportsTailSeekProbe(bench_name) || bench_name == "readrandom" ||
+         bench_name == "readrandomfast" || bench_name == "readmissing" ||
+         bench_name == "multireadrandom";
+}
+
+static inline bool SupportsSampleProbe(const Slice& bench_name) {
+  // Sample probe uses the same underlying CSV format and perf deltas as tail
+  // probe, but is selected periodically rather than by tail threshold.
+  return SupportsTailProbe(bench_name);
+}
+
+static inline bool TailProbeOpEnabled(enum OperationType op_type) {
+  const std::string& sel = FLAGS_tail_probe_op;
+  if (sel == "seek") {
+    return op_type == kSeek;
+  }
+  if (sel == "read") {
+    return op_type == kRead;
+  }
+  if (sel == "all") {
+    return op_type == kSeek || op_type == kRead;
+  }
+  // Be strict: unknown selector disables sampling rather than surprising.
+  return false;
+}
+
+static inline bool SampleProbeOpEnabled(enum OperationType op_type) {
+  const std::string& sel = FLAGS_sample_probe_op;
+  if (sel == "seek") {
+    return op_type == kSeek;
+  }
+  if (sel == "read") {
+    return op_type == kRead;
+  }
+  if (sel == "all") {
+    return op_type == kSeek || op_type == kRead;
+  }
+  return false;
+}
+
 class CombinedStats;
 class Stats {
  private:
@@ -2816,6 +2944,14 @@ class Stats {
   std::shared_ptr<TailProbeWriter> tail_probe_writer_;
   bool tail_probe_snapshot_initialized_ = false;
   TailProbeSnapshot tail_probe_prev_snapshot_;
+  bool sample_probe_enabled_ = false;
+  uint64_t sample_probe_interval_ops_ = 0;
+  std::string sample_probe_case_label_;
+  std::string sample_probe_scenario_;
+  std::shared_ptr<TailProbeWriter> sample_probe_writer_;
+  bool sample_probe_snapshot_initialized_ = false;
+  TailProbeSnapshot sample_probe_prev_snapshot_;
+  uint64_t sample_probe_ops_ = 0;
   friend class CombinedStats;
 
  public:
@@ -2839,6 +2975,20 @@ class Stats {
     tail_probe_snapshot_initialized_ = false;
   }
 
+  void ConfigureSampleProbe(std::shared_ptr<TailProbeWriter> writer,
+                            uint64_t interval_ops,
+                            const std::string& case_label,
+                            const std::string& scenario) {
+    sample_probe_writer_ = std::move(writer);
+    sample_probe_enabled_ = (sample_probe_writer_ != nullptr) &&
+                            sample_probe_writer_->Enabled() &&
+                            interval_ops > 0;
+    sample_probe_interval_ops_ = interval_ops;
+    sample_probe_case_label_ = case_label;
+    sample_probe_scenario_ = scenario;
+    sample_probe_snapshot_initialized_ = false;
+    sample_probe_ops_ = 0;
+  }
   void Start(int id) {
     id_ = id;
     next_report_ = FLAGS_stats_interval ? FLAGS_stats_interval : 100;
@@ -2859,6 +3009,12 @@ class Stats {
     if (tail_probe_enabled_) {
       tail_probe_prev_snapshot_ = CaptureTailProbeSnapshot();
       tail_probe_snapshot_initialized_ = true;
+    }
+    sample_probe_snapshot_initialized_ = false;
+    sample_probe_ops_ = 0;
+    if (sample_probe_enabled_) {
+      sample_probe_prev_snapshot_ = CaptureTailProbeSnapshot();
+      sample_probe_snapshot_initialized_ = true;
     }
   }
 
@@ -2950,7 +3106,8 @@ class Stats {
     }
     uint64_t now = 0;
     uint64_t micros = 0;
-    const bool need_latency = FLAGS_histogram || tail_probe_enabled_;
+    const bool need_latency =
+        FLAGS_histogram || tail_probe_enabled_ || sample_probe_enabled_;
     if (need_latency) {
       now = clock_->NowMicros();
       micros = now - last_op_finish_;
@@ -2970,24 +3127,48 @@ class Stats {
       }
     }
 
-    if (tail_probe_enabled_) {
+    if (tail_probe_enabled_ || sample_probe_enabled_) {
       TailProbeSnapshot current = CaptureTailProbeSnapshot();
-      if (tail_probe_snapshot_initialized_ &&
-          op_type == kSeek && micros >= tail_probe_threshold_us_ &&
-          tail_probe_writer_ != nullptr) {
-        TailProbeSnapshot delta =
-            DeltaTailProbeSnapshot(current, tail_probe_prev_snapshot_);
-        const std::string& case_label =
-            tail_probe_case_label_.empty() ? std::string("NA")
-                                           : tail_probe_case_label_;
-        const std::string& scenario =
-            tail_probe_scenario_.empty() ? std::string("seek")
-                                         : tail_probe_scenario_;
-        tail_probe_writer_->Record(now, id_, micros, case_label, scenario,
-                                   delta);
+      if (tail_probe_enabled_) {
+        if (tail_probe_snapshot_initialized_ && TailProbeOpEnabled(op_type) &&
+            micros >= tail_probe_threshold_us_ && tail_probe_writer_ != nullptr) {
+          TailProbeSnapshot delta =
+              DeltaTailProbeSnapshot(current, tail_probe_prev_snapshot_);
+          const std::string& case_label =
+              tail_probe_case_label_.empty() ? std::string("NA")
+                                             : tail_probe_case_label_;
+          const std::string& scenario =
+              tail_probe_scenario_.empty() ? std::string("tail")
+                                           : tail_probe_scenario_;
+          tail_probe_writer_->Record(now, id_, micros, case_label, scenario,
+                                     delta);
+        }
+        tail_probe_prev_snapshot_ = current;
+        tail_probe_snapshot_initialized_ = true;
       }
-      tail_probe_prev_snapshot_ = current;
-      tail_probe_snapshot_initialized_ = true;
+      if (sample_probe_enabled_) {
+        if (SampleProbeOpEnabled(op_type)) {
+          ++sample_probe_ops_;
+          const bool do_sample =
+              sample_probe_interval_ops_ > 0 &&
+              (sample_probe_ops_ % sample_probe_interval_ops_ == 0);
+          if (do_sample && sample_probe_snapshot_initialized_ &&
+              sample_probe_writer_ != nullptr) {
+            TailProbeSnapshot delta =
+                DeltaTailProbeSnapshot(current, sample_probe_prev_snapshot_);
+            const std::string& case_label =
+                sample_probe_case_label_.empty() ? std::string("NA")
+                                                 : sample_probe_case_label_;
+            const std::string& scenario =
+                sample_probe_scenario_.empty() ? std::string("sample")
+                                               : sample_probe_scenario_;
+            sample_probe_writer_->Record(now, id_, micros, case_label, scenario,
+                                         delta);
+          }
+        }
+        sample_probe_prev_snapshot_ = current;
+        sample_probe_snapshot_initialized_ = true;
+      }
     }
 
     done_ += num_ops;
@@ -3352,6 +3533,11 @@ struct SharedState {
   std::string tail_probe_case_label;
   std::string tail_probe_scenario;
   std::shared_ptr<TailProbeWriter> tail_probe_writer;
+  bool sample_probe_enabled = false;
+  uint64_t sample_probe_interval_ops = 0;
+  std::string sample_probe_case_label;
+  std::string sample_probe_scenario;
+  std::shared_ptr<TailProbeWriter> sample_probe_writer;
 
   SharedState() : cv(&mu), perf_level(FLAGS_perf_level) {}
 };
@@ -4043,6 +4229,12 @@ class Benchmark {
       fprintf(stderr, "prefix size is larger than key size");
       db_bench_exit(1);
     }
+    if (FLAGS_cpu_heavy_keygen && FLAGS_key_size < 8) {
+      fprintf(stderr,
+              "--cpu_heavy_keygen requires --key_size >= 8 (got %d)\n",
+              FLAGS_key_size);
+      db_bench_exit(1);
+    }
 
     std::vector<std::string> files;
     FLAGS_env->GetChildren(FLAGS_db, &files);
@@ -4132,6 +4324,24 @@ class Benchmark {
       return;
     }
     char* start = const_cast<char*>(key->data());
+    if (FLAGS_cpu_heavy_keygen && key_size_ >= 8) {
+      // CPU-heavy key format:
+      // - [ shared_prefix (key_size_-8 bytes) ] [ uint64_be(v) ]
+      // This preserves key order by v (lexicographically) while increasing the
+      // bytes compared by the default bytewise comparator.
+      const unsigned char fill =
+          static_cast<unsigned char>(FLAGS_cpu_heavy_keygen_fill_byte & 0xFF);
+      std::memset(start, static_cast<int>(fill), key_size_);
+      char* pos = start + (key_size_ - 8);
+      if (port::kLittleEndian) {
+        for (int i = 0; i < 8; ++i) {
+          pos[i] = (v >> ((8 - i - 1) << 3)) & 0xFF;
+        }
+      } else {
+        memcpy(pos, static_cast<void*>(&v), 8);
+      }
+      return;
+    }
     char* pos = start;
     if (keys_per_prefix_ > 0) {
       int64_t num_prefix = num_keys / keys_per_prefix_;
@@ -4764,6 +4974,10 @@ class Benchmark {
                                      shared->tail_probe_threshold_us,
                                      shared->tail_probe_case_label,
                                      shared->tail_probe_scenario);
+    thread->stats.ConfigureSampleProbe(shared->sample_probe_writer,
+                                       shared->sample_probe_interval_ops,
+                                       shared->sample_probe_case_label,
+                                       shared->sample_probe_scenario);
     thread->stats.Start(thread->tid);
     (arg->bm->*(arg->method))(thread);
     if (shared->perf_level > ROCKSDB_NAMESPACE::PerfLevel::kDisable) {
@@ -4786,7 +5000,10 @@ class Benchmark {
     SharedState shared;
     const bool tail_probe_requested = !FLAGS_tail_probe_output.empty() &&
                                       FLAGS_tail_probe_threshold_us > 0 &&
-                                      SupportsTailSeekProbe(name);
+                                      SupportsTailProbe(name);
+    const bool sample_probe_requested = !FLAGS_sample_probe_output.empty() &&
+                                        FLAGS_sample_probe_interval_ops > 0 &&
+                                        SupportsSampleProbe(name);
     shared.total = n;
     shared.num_initialized = 0;
     shared.num_done = 0;
@@ -4806,6 +5023,25 @@ class Benchmark {
       if (shared.tail_probe_enabled &&
           shared.perf_level < ROCKSDB_NAMESPACE::PerfLevel::kEnableTime) {
         shared.perf_level = ROCKSDB_NAMESPACE::PerfLevel::kEnableTime;
+      }
+    }
+    if (sample_probe_requested) {
+      shared.sample_probe_writer = std::make_shared<TailProbeWriter>(
+          FLAGS_sample_probe_output, FLAGS_sample_probe_max_samples);
+      shared.sample_probe_enabled =
+          shared.sample_probe_writer != nullptr &&
+          shared.sample_probe_writer->Enabled();
+      shared.sample_probe_interval_ops =
+          static_cast<uint64_t>(FLAGS_sample_probe_interval_ops);
+      shared.sample_probe_case_label = FLAGS_sample_probe_case_label;
+      shared.sample_probe_scenario =
+          FLAGS_sample_probe_scenario.empty() ? name.ToString()
+                                              : FLAGS_sample_probe_scenario;
+      if (shared.sample_probe_enabled &&
+          shared.perf_level <
+              ROCKSDB_NAMESPACE::PerfLevel::kEnableTimeExceptForMutex) {
+        shared.perf_level =
+            ROCKSDB_NAMESPACE::PerfLevel::kEnableTimeExceptForMutex;
       }
     }
     if (FLAGS_benchmark_write_rate_limit > 0) {
