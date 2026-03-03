@@ -1528,6 +1528,26 @@ DEFINE_string(simulate_xp_levels, "",
               "Example: \"0,1\". Empty means all levels.");
 DEFINE_string(simulate_xp_stats_file, "",
               "Optional output path to dump simulated storage model stats.");
+DEFINE_bool(simulate_xp_monitor_enable, false,
+            "If true, enable SimFS latency monitor output (CSV).");
+DEFINE_uint64(simulate_xp_monitor_window_us, 1000000,
+              "SimFS latency monitor: fixed aggregation window size in "
+              "microseconds.");
+DEFINE_uint64(simulate_xp_monitor_stage_seconds, 0,
+              "SimFS latency monitor: optional stage window in seconds. 0 "
+              "disables stage aggregation output.");
+DEFINE_bool(simulate_xp_monitor_max_read, true,
+            "SimFS latency monitor: track per-window max read latency.");
+DEFINE_bool(simulate_xp_monitor_max_open, true,
+            "SimFS latency monitor: track per-window max open latency.");
+DEFINE_bool(simulate_xp_monitor_max_prefetch, true,
+            "SimFS latency monitor: track per-window max prefetch latency.");
+DEFINE_string(simulate_xp_monitor_window_csv, "",
+              "SimFS latency monitor: output CSV path for per-window stats. "
+              "Empty disables writing.");
+DEFINE_string(simulate_xp_monitor_stage_csv, "",
+              "SimFS latency monitor: output CSV path for per-stage stats. "
+              "Empty disables writing.");
 DEFINE_bool(simulate_xp_busy_wait, false,
             "If true, simulated XP/DIMM delays use busy-spinning instead of "
             "SleepForMicroseconds. This is useful for DRAM/NVM-scale latency "
