@@ -37,6 +37,17 @@ TARGET_DB_GIB="${TARGET_DB_GIB:-0.10}"
 KEY_SIZE="${KEY_SIZE:-16}"
 VALUE_SIZE="${VALUE_SIZE:-1024}"
 COMPRESSION_TYPE="${COMPRESSION_TYPE:-lz4}"
+COMPRESSION_RATIO="${COMPRESSION_RATIO:-0.10}"
+
+# Optional CPU-heavy key generator. Useful for amplifying CPU-side costs (e.g.,
+# comparator / iterator search) under fast storage models.
+CPU_HEAVY_KEYGEN="${CPU_HEAVY_KEYGEN:-0}"
+CPU_HEAVY_KEYGEN_FILL_BYTE="${CPU_HEAVY_KEYGEN_FILL_BYTE:-0}"
+
+# Bloom/filter knobs (disabled by default to preserve prior experiment behavior).
+# Set BLOOM_BITS=10 (or similar) to enable bloom filters for paper-style
+# filter-check attribution experiments.
+BLOOM_BITS="${BLOOM_BITS:--1}"
 
 THREADS="${THREADS:-4}"
 FILL_THREADS="${FILL_THREADS:-$THREADS}"
@@ -102,6 +113,12 @@ SIMFS_MONITOR_MAX_PREFETCH="${SIMFS_MONITOR_MAX_PREFETCH:-1}"
 POST_TAIL_PROBE_ENABLE="${POST_TAIL_PROBE_ENABLE:-1}"
 TAIL_PROBE_MAX_SAMPLES="${TAIL_PROBE_MAX_SAMPLES:-20000}"
 POST_TAIL_PROBE_DURATION_SECONDS="${POST_TAIL_PROBE_DURATION_SECONDS:-180}"
+# Which ops to attribute in post tail-probe reruns.
+# - seek: original tail seek breakdown
+# - read: Get/MultiGet tail breakdown (useful for bloom/filter CPU attribution)
+POST_TAIL_PROBE_OPS="${POST_TAIL_PROBE_OPS:-seek,read}"
+POST_TAIL_PROBE_MIN_THRESHOLD_US="${POST_TAIL_PROBE_MIN_THRESHOLD_US:-2000}"
+POST_TAIL_PROBE_P99_MULTIPLIER="${POST_TAIL_PROBE_P99_MULTIPLIER:-1.0}"
 
 # Which cases to run: "baseline,kvsep_bptree" (default) or a subset.
 RUN_CASES="${RUN_CASES:-baseline,kvsep_bptree}"
@@ -116,6 +133,10 @@ USE_TMPFS_REDIRECT="${USE_TMPFS_REDIRECT:-1}"
 TMPFS_ROOT="${TMPFS_ROOT:-/dev/shm/nvm_tmpfs_root.exp42_simfs}"
 
 SUPER_BLOCK_BYTES="${SUPER_BLOCK_BYTES:-16384}"
+
+# SimFS behavior knobs.
+XP_LATENCY_NS="${XP_LATENCY_NS:-75}"
+SIMULATE_XP_MMAP_BASE_IO="${SIMULATE_XP_MMAP_BASE_IO:-1}"
 
 # KV-SEP knobs (format construction-time).
 KVSEP_ENABLE="${KVSEP_ENABLE:-1}"
@@ -133,6 +154,29 @@ echo "[exp42] target_db_gib=$TARGET_DB_GIB key_size=$KEY_SIZE value_size=$VALUE_
 echo "[exp42] cache_sizes=$CACHE_SIZES threads=$THREADS duration=$MIXGRAPH_DURATION_SECONDS"
 echo "[exp42] tmpfs_redirect=$USE_TMPFS_REDIRECT tmpfs_root=$TMPFS_ROOT"
 echo "[exp42] DB_DIR=$DB_DIR WAL_DIR=$WAL_DIR"
+echo "[exp42] compression_ratio=$COMPRESSION_RATIO xp_latency_ns=$XP_LATENCY_NS mmap_base_io=$SIMULATE_XP_MMAP_BASE_IO"
+
+if [[ "$USE_TMPFS_REDIRECT" == "1" ]]; then
+  tmpfs_parent="$(dirname "$TMPFS_ROOT")"
+  if [[ ! -d "$tmpfs_parent" ]]; then
+    echo "[exp42] ERROR: TMPFS_ROOT parent dir missing: $tmpfs_parent" >&2
+    exit 2
+  fi
+  fs_type="$(stat -f -c %T "$tmpfs_parent" 2>/dev/null || echo unknown)"
+  if [[ "$fs_type" != "tmpfs" ]]; then
+    echo "[exp42] WARN: TMPFS_ROOT parent is not tmpfs (fs_type=$fs_type): $tmpfs_parent" >&2
+    echo "[exp42]       This may re-introduce base FS noise into simfs results." >&2
+  fi
+  avail_bytes="$(df -B1 --output=avail "$tmpfs_parent" | tail -n 1 | tr -d ' ')"
+  req_bytes="$(awk -v gib="$TARGET_DB_GIB" -v k="$KEY_SIZE" -v v="$VALUE_SIZE" -v cr="$COMPRESSION_RATIO" \
+    'BEGIN { logical=gib*1024*1024*1024; per=(k+v); est=(k+v*cr)/per; printf "%.0f", logical*est*1.25 }')"
+  if [[ -n "$avail_bytes" && "$avail_bytes" -lt "$req_bytes" ]]; then
+    echo "[exp42] ERROR: insufficient tmpfs space under $tmpfs_parent" >&2
+    echo "[exp42]        avail_bytes=$avail_bytes req_bytes~=$req_bytes (target_db_gib=$TARGET_DB_GIB)" >&2
+    echo "[exp42]        Suggest: mount a larger tmpfs and set TMPFS_ROOT accordingly." >&2
+    exit 2
+  fi
+fi
 
 common_simfs_args=(
   --histogram=1
@@ -143,12 +187,18 @@ common_simfs_args=(
   --simulate_xp_levels=0,1,2,3,4,5,6
   --simulate_xp_line_bytes=256
   --simulate_xp_buffer_bytes=16384
-  --simulate_xp_latency_ns=300
+  --simulate_xp_latency_ns="$XP_LATENCY_NS"
   --simulate_xp_rpq_depth=64
   --simulate_xp_wpq_depth=64
   --simulate_xp_wpq_submit_ns=100
   --simulate_xp_prefetch_hit_ns=120
   --simulate_xp_enable_prefetch=true
+  # IMPORTANT: For microsecond-/nanosecond-scale delay injection, OS sleep can
+  # overshoot by milliseconds under virtualization, causing large tail spikes
+  # in simfs_max_latency_per_window. Default to busy-wait to keep experiments
+  # stable/reproducible; override via SIMULATE_XP_BUSY_WAIT=0 if needed.
+  --simulate_xp_busy_wait="${SIMULATE_XP_BUSY_WAIT:-1}"
+  --simulate_xp_mmap_base_io="$SIMULATE_XP_MMAP_BASE_IO"
 )
 if [[ "$USE_TMPFS_REDIRECT" == "1" ]]; then
   common_simfs_args+=(
@@ -166,6 +216,37 @@ common_readpath_args=(
   --enable_super_block_read_coalescing=1
 )
 
+cpu_heavy_keygen_args=()
+if [[ "$CPU_HEAVY_KEYGEN" == "1" ]]; then
+  cpu_heavy_keygen_args+=(
+    --cpu_heavy_keygen=1
+    --cpu_heavy_keygen_fill_byte="$CPU_HEAVY_KEYGEN_FILL_BYTE"
+  )
+fi
+
+filter_args=()
+if [[ "$BLOOM_BITS" != "-1" ]]; then
+  filter_args+=(--bloom_bits="$BLOOM_BITS")
+fi
+
+safe_rmtree() {
+  # Avoid relying on `rm -rf` (some environments restrict it). Best-effort.
+  local p="$1"
+  if [[ -z "$p" ]]; then
+    return 0
+  fi
+  python3 - "$p" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+try:
+    shutil.rmtree(p, ignore_errors=True)
+except Exception:
+    pass
+PY
+}
+
 run_one() {
   local case_label="$1"
   shift
@@ -176,13 +257,14 @@ run_one() {
   mkdir -p "$out_dir"
 
   echo "[exp42][$case_label] OUT_DIR=$out_dir"
-  rm -rf "$DB_DIR" "$WAL_DIR"
+  safe_rmtree "$DB_DIR"
+  safe_rmtree "$WAL_DIR"
   mkdir -p "$WAL_DIR"
   if [[ "$USE_TMPFS_REDIRECT" == "1" ]]; then
-    rm -rf "$TMPFS_ROOT"
+    safe_rmtree "$TMPFS_ROOT"
   fi
 
-  local base_db_bench_args="${common_simfs_args[*]} ${common_readpath_args[*]} ${extra_flags[*]}"
+  local base_db_bench_args="${common_simfs_args[*]} --compression_ratio=$COMPRESSION_RATIO ${common_readpath_args[*]} ${filter_args[*]} ${cpu_heavy_keygen_args[*]} ${extra_flags[*]}"
   # Allow callers to append extra db_bench flags without clobbering the required
   # simfs/readpath flags. For rare cases where you truly want to override all
   # defaults, set EXTRA_DB_BENCH_ARGS_MODE=override.
@@ -275,11 +357,40 @@ run_one() {
   python3 "$ROOT_DIR/tools/plot_mixgraph_monitoring.py" --run_dir "$out_dir"
   if [[ "$POST_TAIL_PROBE_ENABLE" == "1" ]]; then
     echo "[exp42][$case_label] post-process: tail probe attribution (max_samples=$TAIL_PROBE_MAX_SAMPLES)"
-    python3 "$ROOT_DIR/tools/run_tail_probe_from_run_dir.py" \
-      --run_dir "$out_dir" \
-      --out_subdir tail_probe \
-      --max_samples "$TAIL_PROBE_MAX_SAMPLES" \
-      --duration_override_seconds "$POST_TAIL_PROBE_DURATION_SECONDS"
+    # Tail-probe reruns can fail intermittently (e.g., checksum mismatch surfaced
+    # as corruption). Retry a small number of times so the overall experiment
+    # can proceed and still capture useful samples most of the time.
+    local tail_probe_retries="${POST_TAIL_PROBE_RETRIES:-2}"
+    local attempt=1
+    IFS=',' read -r -a _ops <<<"$POST_TAIL_PROBE_OPS"
+    local op
+    for op in "${_ops[@]}"; do
+      op="$(echo "$op" | tr -d ' ')"
+      if [[ -z "$op" ]]; then
+        continue
+      fi
+      local out_subdir="tail_probe_${op}"
+      local attempt=1
+      while true; do
+        if python3 "$ROOT_DIR/tools/run_tail_probe_from_run_dir.py" \
+          --run_dir "$out_dir" \
+          --out_subdir "$out_subdir" \
+          --op "$op" \
+          --max_samples "$TAIL_PROBE_MAX_SAMPLES" \
+          --min_threshold_us "$POST_TAIL_PROBE_MIN_THRESHOLD_US" \
+          --p99_multiplier "$POST_TAIL_PROBE_P99_MULTIPLIER" \
+          --duration_override_seconds "$POST_TAIL_PROBE_DURATION_SECONDS"; then
+          break
+        fi
+        if [[ "$attempt" -ge "$tail_probe_retries" ]]; then
+          echo "[exp42][$case_label] WARN: tail probe (${op}) failed after ${attempt}/${tail_probe_retries} attempts; continuing." >&2
+          break
+        fi
+        attempt=$((attempt + 1))
+        echo "[exp42][$case_label] WARN: tail probe (${op}) failed; retrying attempt ${attempt}/${tail_probe_retries}..." >&2
+        sleep 2
+      done
+    done
   fi
 }
 

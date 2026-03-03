@@ -183,6 +183,20 @@ def _read_seek_p99_from_op_percentiles(op_csv: Path) -> Optional[float]:
     return None
 
 
+def _read_op_p99_from_op_percentiles(op_csv: Path, op_name: str) -> Optional[float]:
+    # op_latency_percentiles.csv format: op,p50_us,p95_us,p99_us
+    # It usually contains both fine-grained (Get/MultiGet/Seek) and aggregated
+    # (read/seek) rows. We prefer aggregated rows for tail-probe thresholding.
+    with op_csv.open("r", encoding="utf-8", newline="") as f:
+        for r in csv.DictReader(f):
+            if str(r.get("op", "")).strip() != op_name:
+                continue
+            v = _safe_float(r.get("p99_us", ""))
+            if _is_finite(v) and v > 0:
+                return v
+    return None
+
+
 def _run_and_log(tokens: List[str], log_path: Path, cwd: Path) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as f:
@@ -199,6 +213,12 @@ def main() -> int:
     ap.add_argument("--phase", default="cache_sweep", help="phase name used in reports (default: cache_sweep)")
     ap.add_argument("--p99_multiplier", type=float, default=1.0, help="threshold_us = max(min, p99*multiplier)")
     ap.add_argument("--min_threshold_us", type=int, default=2000, help="minimum threshold (us)")
+    ap.add_argument(
+        "--op",
+        default="seek",
+        choices=("seek", "read"),
+        help="which op type to probe: seek (kSeek) or read (kRead: Get/MultiGet)",
+    )
     ap.add_argument("--max_samples", type=int, default=20000, help="tail probe max samples")
     ap.add_argument("--perf_level", type=int, default=4, help="min perf_level to enable perf_context timing")
     ap.add_argument(
@@ -241,11 +261,12 @@ def main() -> int:
         phase = str(args.phase)
 
         op_csv = run_dir / "monitor_analysis" / f"{case_prefix}.op_latency_percentiles.csv"
-        seek_p99_us = _read_seek_p99_from_op_percentiles(op_csv)
-        if seek_p99_us is None:
-            raise SystemExit(f"missing seek p99 (need {op_csv})")
+        op_name = "seek" if str(args.op) == "seek" else "read"
+        op_p99_us = _read_op_p99_from_op_percentiles(op_csv, op_name)
+        if op_p99_us is None:
+            raise SystemExit(f"missing {op_name} p99 (need {op_csv})")
 
-        threshold_us = max(args.min_threshold_us, int(seek_p99_us * float(args.p99_multiplier)))
+        threshold_us = max(args.min_threshold_us, int(op_p99_us * float(args.p99_multiplier)))
 
         sample_path = (samples_dir / f"{label}_{phase}_tail_samples.csv").resolve()
         log_path = (logs_dir / f"{case_prefix}.tail_probe.log").resolve()
@@ -292,6 +313,7 @@ def main() -> int:
             tokens.append(f"--tail_probe_threshold_us={threshold_us}")
             tokens.append(f"--tail_probe_max_samples={int(args.max_samples)}")
             tokens.append(f"--tail_probe_case_label={label}")
+            tokens.append(f"--tail_probe_op={args.op}")
             tokens.append("--tail_probe_scenario=mixgraph")
 
             rc = _run_and_log(tokens, log_path, cwd=Path.cwd())
@@ -307,7 +329,8 @@ def main() -> int:
                 "phase": phase,
                 "case_prefix": case_prefix,
                 "cache_size": cache_size,
-                "seek_p99_us": seek_p99_us,
+                "op": str(args.op),
+                "op_p99_us": op_p99_us,
                 "threshold_us": threshold_us,
                 "p99_multiplier": float(args.p99_multiplier),
                 "min_threshold_us": int(args.min_threshold_us),
@@ -360,19 +383,51 @@ def main() -> int:
         out_png=out_root / f"phase{prefix}_tail_latency_bucket_stage_stack.png",
     )
 
+    # Filter-centric plots (paper-style signals). Best-effort: only runs if the
+    # sample rows contain the computed fields.
+    try:
+        tpm.plot_phase_filter_total_share_distribution(
+            all_sample_rows,
+            phase=str(args.phase),
+            out_png=out_root / f"phase{prefix}_tail_filter_total_share_distribution.png",
+        )
+        tpm.plot_phase_filter_probe_vs_share_scatter(
+            all_sample_rows,
+            phase=str(args.phase),
+            out_png=out_root / f"phase{prefix}_tail_filter_probe_vs_share_scatter.png",
+        )
+        probe_summary_rows = tpm.build_filter_probe_bucket_summary_rows(
+            all_sample_rows, phase=str(args.phase)
+        )
+        if probe_summary_rows:
+            _write_csv(out_root / "tail_filter_probe_bucket_summary.csv", probe_summary_rows)
+            tpm.plot_phase_filter_probe_knee_latency(
+                probe_summary_rows,
+                phase=str(args.phase),
+                out_png=out_root / f"phase{prefix}_tail_filter_probe_knee_latency.png",
+            )
+            tpm.plot_phase_filter_probe_knee_filter_share(
+                probe_summary_rows,
+                phase=str(args.phase),
+                out_png=out_root / f"phase{prefix}_tail_filter_probe_knee_filter_share.png",
+            )
+    except Exception:
+        pass
+
     # Short report.
     report = out_root / "tail_probe_report.md"
     lines: List[str] = []
     lines.append("# Tail Probe Report\n")
     lines.append(f"- run_dir: `{run_dir}`\n")
     lines.append(f"- phase: `{args.phase}`\n")
+    lines.append(f"- op: `{args.op}`\n")
     lines.append(f"- p99_multiplier: `{args.p99_multiplier}`\n")
     lines.append(f"- min_threshold_us: `{args.min_threshold_us}`\n")
     lines.append(f"- max_samples: `{args.max_samples}`\n")
     lines.append("\n## Thresholds\n")
     for r in threshold_rows:
         lines.append(
-            f"- {r['label']}: seek_p99_us={r['seek_p99_us']:.3f}, "
+            f"- {r['label']}: op_p99_us={r['op_p99_us']:.3f}, "
             f"threshold_us={r['threshold_us']}, samples={r['samples']}\n"
         )
     lines.append("\n## Artifacts\n")
@@ -382,9 +437,14 @@ def main() -> int:
         "tail_stage_breakdown.csv",
         "tail_stage_distribution.csv",
         "tail_latency_bucket_breakdown.csv",
+        "tail_filter_probe_bucket_summary.csv",
         f"phase{prefix}_tail_seek_stage_stack.png",
         f"phase{prefix}_tail_component_share_distribution.png",
         f"phase{prefix}_tail_latency_bucket_stage_stack.png",
+        f"phase{prefix}_tail_filter_total_share_distribution.png",
+        f"phase{prefix}_tail_filter_probe_vs_share_scatter.png",
+        f"phase{prefix}_tail_filter_probe_knee_latency.png",
+        f"phase{prefix}_tail_filter_probe_knee_filter_share.png",
     ]:
         lines.append(f"- `{out_root / p}`\n")
     report.write_text("".join(lines), encoding="utf-8")

@@ -37,8 +37,10 @@ PHASE_PREFIX = {
 STAGES = [
     "memtable_route",
     "table_open_meta",
+    "filter_maymatch_cpu",
     "index_lookup",
     "seek_dispatch",
+    "get_from_output_files",
     "block_read_io",
     "block_decode_checksum",
     "post_process",
@@ -50,8 +52,10 @@ STAGES = [
 STAGE_COLORS = {
     "memtable_route": "#4e79a7",
     "table_open_meta": "#af7aa1",
+    "filter_maymatch_cpu": "#ff9da7",
     "index_lookup": "#e15759",
     "seek_dispatch": "#76b7b2",
+    "get_from_output_files": "#8cd17d",
     "block_read_io": "#edc948",
     "block_decode_checksum": "#b07aa1",
     "post_process": "#59a14f",
@@ -292,6 +296,12 @@ def compute_stage_values(row: Dict[str, str]) -> Dict[str, float]:
         to_float(row.get("delta_find_table_nanos", ""))
         + to_float(row.get("delta_new_table_iterator_nanos", ""))
     )
+    raw_get_from_output_files = ns_to_us(
+        to_float(row.get("delta_get_from_output_files_time_ns", ""))
+    )
+    raw_filter_maymatch_cpu = ns_to_us(
+        to_float(row.get("delta_bloom_filter_maymatch_nanos", ""))
+    )
     raw_index_lookup = ns_to_us(
         to_float(row.get("delta_read_index_block_nanos", ""))
         + to_float(row.get("delta_read_filter_block_nanos", ""))
@@ -305,9 +315,16 @@ def compute_stage_values(row: Dict[str, str]) -> Dict[str, float]:
         + to_float(row.get("delta_seek_max_heap_time_ns", ""))
         + to_float(row.get("delta_find_next_user_entry_time_ns", ""))
     )
-    raw_block_read_io = ns_to_us(
+    # NOTE: delta_get_from_output_files_time_ns is a high-level counter that
+    # tends to be *inclusive* of lower-level work (block fetch, block iterator
+    # construction, comparisons). Treating it as "I/O" will swallow CPU time
+    # and can mislead Gate3 ("CPU-dominant") conclusions.
+    #
+    # For stage accounting, keep block_read_io focused on actual block read
+    # waiting (block_read_time minus decode/checksum), and account the
+    # residual "get_from_output_files" work as a separate CPU-heavy stage.
+    raw_block_read_total = ns_to_us(
         to_float(row.get("delta_block_read_time_ns", ""))
-        + to_float(row.get("delta_get_from_output_files_time_ns", ""))
     )
     raw_block_decode_checksum = ns_to_us(
         to_float(row.get("delta_block_decompress_time_ns", ""))
@@ -321,16 +338,29 @@ def compute_stage_values(row: Dict[str, str]) -> Dict[str, float]:
     # Child stages are stripped from parent stages before final capping.
     memtable_route = nonneg(raw_memtable_route)
     table_open_meta = nonneg(raw_table_open_meta)
+    filter_maymatch_cpu = nonneg(raw_filter_maymatch_cpu)
     block_decode_checksum = nonneg(raw_block_decode_checksum)
-    block_read_io = max(nonneg(raw_block_read_io) - block_decode_checksum, 0.0)
-    index_lookup = max(nonneg(raw_index_lookup) - nonneg(raw_block_read_io), 0.0)
+    block_read_io = max(nonneg(raw_block_read_total) - block_decode_checksum, 0.0)
+    index_lookup = max(nonneg(raw_index_lookup) - nonneg(raw_block_read_total), 0.0)
     post_process = nonneg(raw_post_process)
     cpu_iter_seek = nonneg(raw_cpu_iter_seek)
     cpu_get = nonneg(raw_cpu_get)
+    # Approximate the residual CPU-heavy work inside Get() file search after
+    # subtracting lower-level measured components. This is intentionally a
+    # conservative estimate (clamped at 0).
+    get_from_output_files = max(
+        nonneg(raw_get_from_output_files)
+        - nonneg(raw_table_open_meta)
+        - nonneg(raw_filter_maymatch_cpu)
+        - nonneg(raw_index_lookup)
+        - nonneg(raw_block_read_total)
+        - post_process,
+        0.0,
+    )
     seek_dispatch = max(
         nonneg(raw_seek_dispatch)
         - nonneg(raw_index_lookup)
-        - nonneg(raw_block_read_io)
+        - nonneg(raw_block_read_total)
         - post_process,
         0.0,
     )
@@ -342,6 +372,8 @@ def compute_stage_values(row: Dict[str, str]) -> Dict[str, float]:
         remaining -= memtable_route
         table_open_meta = cap_to_remaining(table_open_meta, remaining)
         remaining -= table_open_meta
+        filter_maymatch_cpu = cap_to_remaining(filter_maymatch_cpu, remaining)
+        remaining -= filter_maymatch_cpu
         block_decode_checksum = cap_to_remaining(block_decode_checksum, remaining)
         remaining -= block_decode_checksum
         block_read_io = cap_to_remaining(block_read_io, remaining)
@@ -350,6 +382,8 @@ def compute_stage_values(row: Dict[str, str]) -> Dict[str, float]:
         remaining -= index_lookup
         post_process = cap_to_remaining(post_process, remaining)
         remaining -= post_process
+        get_from_output_files = cap_to_remaining(get_from_output_files, remaining)
+        remaining -= get_from_output_files
         seek_dispatch = cap_to_remaining(seek_dispatch, remaining)
         remaining -= seek_dispatch
         cpu_iter_seek = cap_to_remaining(cpu_iter_seek, remaining)
@@ -361,8 +395,10 @@ def compute_stage_values(row: Dict[str, str]) -> Dict[str, float]:
     return {
         "memtable_route": memtable_route,
         "table_open_meta": table_open_meta,
+        "filter_maymatch_cpu": filter_maymatch_cpu,
         "index_lookup": index_lookup,
         "seek_dispatch": seek_dispatch,
+        "get_from_output_files": get_from_output_files,
         "block_read_io": block_read_io,
         "block_decode_checksum": block_decode_checksum,
         "post_process": post_process,
@@ -385,6 +421,51 @@ def build_sample_row(
     io_wait_us = float("nan")
     if is_finite(io_read_nanos) and is_finite(io_cpu_read_nanos):
         io_wait_us = max((io_read_nanos - io_cpu_read_nanos) / 1000.0, 0.0)
+    latency_us = to_float(tr.get("latency_us", ""))
+    simfs_injected_delay_us = ns_to_us(to_float(tr.get("delta_simfs_injected_delay_ns", "")))
+    simfs_base_read_us = ns_to_us(to_float(tr.get("delta_simfs_base_read_ns", "")))
+    simfs_actual_injected_wait_us = ns_to_us(
+        to_float(tr.get("delta_simfs_actual_injected_wait_ns", ""))
+    )
+    simfs_injected_wait_overshoot_us = ns_to_us(
+        to_float(tr.get("delta_simfs_injected_wait_overshoot_ns", ""))
+    )
+    simfs_read_wall_us = ns_to_us(to_float(tr.get("delta_simfs_read_wall_ns", "")))
+    simfs_read_other_us = float("nan")
+    if (
+        is_finite(simfs_read_wall_us)
+        and is_finite(simfs_base_read_us)
+        and is_finite(simfs_actual_injected_wait_us)
+    ):
+        simfs_read_other_us = max(
+            simfs_read_wall_us - simfs_base_read_us - simfs_actual_injected_wait_us,
+            0.0,
+        )
+    cpu_excl_simfs_us = float("nan")
+    if is_finite(latency_us) and is_finite(simfs_injected_delay_us):
+        cpu_excl_simfs_us = max(latency_us - simfs_injected_delay_us, 0.0)
+
+    filter_block_fetch_us = ns_to_us(to_float(tr.get("delta_read_filter_block_nanos", "")))
+    filter_maymatch_cpu_us = ns_to_us(to_float(tr.get("delta_bloom_filter_maymatch_nanos", "")))
+    filter_fetch_share_pct = float("nan")
+    filter_cpu_share_pct = float("nan")
+    if is_finite(latency_us) and latency_us > 0:
+        if is_finite(filter_block_fetch_us):
+            filter_fetch_share_pct = filter_block_fetch_us * 100.0 / latency_us
+        if is_finite(filter_maymatch_cpu_us):
+            filter_cpu_share_pct = filter_maymatch_cpu_us * 100.0 / latency_us
+    filter_total_us = filter_block_fetch_us + filter_maymatch_cpu_us
+    filter_probe_sst = (
+        to_int(tr.get("delta_bloom_sst_hit_count", 0))
+        + to_int(tr.get("delta_bloom_sst_miss_count", 0))
+    )
+    filter_probe_memtable = (
+        to_int(tr.get("delta_bloom_memtable_hit_count", 0))
+        + to_int(tr.get("delta_bloom_memtable_miss_count", 0))
+    )
+    filter_total_share_pct = float("nan")
+    if is_finite(latency_us) and latency_us > 0 and is_finite(filter_total_us):
+        filter_total_share_pct = filter_total_us * 100.0 / latency_us
     return {
         "label": label,
         "phase": phase,
@@ -392,22 +473,40 @@ def build_sample_row(
         "sample_id": to_int(tr.get("sample_id", 0)),
         "wall_time_us": to_int(tr.get("wall_time_us", 0)),
         "thread_id": to_int(tr.get("thread_id", 0)),
-        "latency_us": to_float(tr.get("latency_us", "")),
+        "latency_us": latency_us,
         "threshold_us": threshold_us,
         "stage_memtable_route_us": stage["memtable_route"],
         "stage_table_open_meta_us": stage["table_open_meta"],
+        "stage_filter_maymatch_cpu_us": stage["filter_maymatch_cpu"],
         "stage_index_lookup_us": stage["index_lookup"],
         "stage_seek_dispatch_us": stage["seek_dispatch"],
+        "stage_get_from_output_files_us": stage["get_from_output_files"],
         "stage_block_read_io_us": stage["block_read_io"],
         "stage_block_decode_checksum_us": stage["block_decode_checksum"],
         "stage_post_process_us": stage["post_process"],
         "stage_cpu_iter_seek_us": stage["cpu_iter_seek"],
         "stage_cpu_get_us": stage["cpu_get"],
         "stage_unattributed_us": stage["unattributed"],
+        "simfs_injected_delay_us": simfs_injected_delay_us,
+        "simfs_base_read_us": simfs_base_read_us,
+        "simfs_actual_injected_wait_us": simfs_actual_injected_wait_us,
+        "simfs_injected_wait_overshoot_us": simfs_injected_wait_overshoot_us,
+        "simfs_read_wall_us": simfs_read_wall_us,
+        "simfs_read_other_us": simfs_read_other_us,
+        "cpu_excl_simfs_us": cpu_excl_simfs_us,
         "io_wait_us": io_wait_us,
         "io_read_bytes": to_float(tr.get("delta_io_bytes_read", "")),
         "io_write_bytes": to_float(tr.get("delta_io_bytes_written", "")),
         "cpu_read_us": ns_to_us(to_float(tr.get("delta_io_cpu_read_nanos", ""))),
+        "filter_block_fetch_us": filter_block_fetch_us,
+        "filter_maymatch_cpu_us": filter_maymatch_cpu_us,
+        "filter_fetch_share_pct": filter_fetch_share_pct,
+        "filter_cpu_share_pct": filter_cpu_share_pct,
+        "filter_total_us": filter_total_us,
+        "filter_total_share_pct": filter_total_share_pct,
+        "filter_probe_sst": filter_probe_sst,
+        "filter_probe_memtable": filter_probe_memtable,
+        "filter_probe_total": filter_probe_sst + filter_probe_memtable,
     }
 
 
@@ -641,12 +740,15 @@ def build_latency_bucket_breakdown_rows(sample_rows: List[Dict[str, object]]) ->
 
 
 def plot_phase_stack(breakdown_rows: List[Dict[str, object]], phase: str, out_png: Path) -> bool:
-    subset = [r for r in breakdown_rows if str(r["phase"]) == phase and str(r["scenario"]) == "mixgraph"]
+    subset = [r for r in breakdown_rows if str(r.get("phase", "")) == phase]
     if not subset:
         return False
     labels = sorted({str(r["label"]) for r in subset})
     if not labels:
         return False
+
+    scenarios = sorted({str(r.get("scenario", "")) for r in subset if str(r.get("scenario", ""))})
+    scenario_note = scenarios[0] if len(scenarios) == 1 else "mixed"
 
     mat_abs = np.zeros((len(STAGES), len(labels)), dtype=float)
     mat_share = np.zeros((len(STAGES), len(labels)), dtype=float)
@@ -671,11 +773,11 @@ def plot_phase_stack(breakdown_rows: List[Dict[str, object]], phase: str, out_pn
         bottom_abs += np.nan_to_num(vals_abs)
         bottom_share += np.nan_to_num(vals_share)
 
-    ax_abs.set_title(f"{phase}: mixgraph tail-seek latency stage stack (absolute)")
+    ax_abs.set_title(f"{phase}: tail latency stage stack ({scenario_note}, absolute)")
     ax_abs.set_ylabel("us/sample")
     ax_abs.grid(axis="y", alpha=0.25)
     ax_abs.legend(ncol=3, fontsize=8)
-    ax_share.set_title(f"{phase}: mixgraph tail-seek latency stage stack (relative)")
+    ax_share.set_title(f"{phase}: tail latency stage stack ({scenario_note}, relative)")
     ax_share.set_ylabel("share (%)")
     ax_share.grid(axis="y", alpha=0.25)
     ax_share.set_xticks(x)
@@ -693,7 +795,7 @@ def plot_phase_latency_bucket_stage_stack(
     subset = [
         r
         for r in bucket_rows
-        if str(r.get("phase", "")) == phase and str(r.get("scenario", "")) == "mixgraph"
+        if str(r.get("phase", "")) == phase
     ]
     if not subset:
         return False
@@ -775,7 +877,7 @@ def plot_phase_component_share_distribution(
     subset = [
         r
         for r in sample_rows
-        if str(r.get("phase", "")) == phase and str(r.get("scenario", "")) == "mixgraph"
+        if str(r.get("phase", "")) == phase
     ]
     if not subset:
         return False
@@ -787,15 +889,19 @@ def plot_phase_component_share_distribution(
     stage_col_map = {
         "memtable_route": "stage_memtable_route_us",
         "table_open_meta": "stage_table_open_meta_us",
+        "filter_maymatch_cpu": "stage_filter_maymatch_cpu_us",
         "index_lookup": "stage_index_lookup_us",
         "seek_dispatch": "stage_seek_dispatch_us",
+        "get_from_output_files": "stage_get_from_output_files_us",
         "block_read_io": "stage_block_read_io_us",
         "block_decode_checksum": "stage_block_decode_checksum_us",
         "post_process": "stage_post_process_us",
         "unattributed": "stage_unattributed_us",
     }
     # Keep the distribution figure focused on the dominant latency contributors.
-    stages = ["seek_dispatch", "index_lookup", "block_read_io"]
+    # For CPU-dominance experiments on fast media, filter MayMatch can become a
+    # first-order term.
+    stages = ["get_from_output_files", "index_lookup", "block_read_io", "filter_maymatch_cpu"]
 
     all_share_vals: List[float] = []
     per_label_data: Dict[str, List[List[float]]] = {}
@@ -857,10 +963,447 @@ def plot_phase_component_share_distribution(
 
     axes[0].set_ylabel("share in request latency (%)")
     fig.suptitle(
-        f"{phase}: per-request component latency-share distribution (tail seek)",
+        f"{phase}: per-request component latency-share distribution (tail samples)",
         fontsize=12,
     )
     plt.tight_layout(rect=[0, 0, 1, 0.95])
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def plot_phase_filter_total_share_distribution(
+    sample_rows: List[Dict[str, object]], phase: str, out_png: Path
+) -> bool:
+    subset = [
+        r
+        for r in sample_rows
+        if str(r.get("phase", "")) == phase
+    ]
+    if not subset:
+        return False
+    labels = sorted({str(r["label"]) for r in subset})
+    if not labels:
+        return False
+
+    data: List[List[float]] = []
+    for lb in labels:
+        vals: List[float] = []
+        for r in subset:
+            if str(r.get("label", "")) != lb:
+                continue
+            v = to_float(r.get("filter_total_share_pct", float("nan")))
+            if is_finite(v) and v >= 0:
+                vals.append(v)
+        data.append(vals)
+
+    if not any(data):
+        return False
+
+    fig = plt.figure(figsize=(10, 4))
+    ax = fig.add_subplot(111)
+    ax.boxplot(
+        data,
+        labels=labels,
+        showfliers=False,
+        whis=(5, 95),
+    )
+    ax.set_ylabel("FilterTotal share of latency (%)")
+    ax.set_title(f"{phase}: FilterTotal share distribution (tail samples)")
+    ax.grid(True, axis="y", alpha=0.25)
+    plt.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def plot_phase_filter_probe_vs_share_scatter(
+    sample_rows: List[Dict[str, object]], phase: str, out_png: Path
+) -> bool:
+    subset = [
+        r
+        for r in sample_rows
+        if str(r.get("phase", "")) == phase
+    ]
+    if not subset:
+        return False
+    xs: List[float] = []
+    ys: List[float] = []
+    cs: List[str] = []
+    for r in subset:
+        x = to_float(r.get("filter_probe_total", float("nan")))
+        y = to_float(r.get("filter_total_share_pct", float("nan")))
+        if not (is_finite(x) and is_finite(y)):
+            continue
+        xs.append(x)
+        ys.append(y)
+        cs.append(str(r.get("label", "NA")))
+    if not xs:
+        return False
+
+    labels = sorted(set(cs))
+    colors = {lb: plt.cm.tab10(i % 10) for i, lb in enumerate(labels)}
+
+    fig = plt.figure(figsize=(9, 4.5))
+    ax = fig.add_subplot(111)
+    for lb in labels:
+        xlb = [x for x, c in zip(xs, cs) if c == lb]
+        ylb = [y for y, c in zip(ys, cs) if c == lb]
+        ax.scatter(xlb, ylb, s=6, alpha=0.35, label=lb, color=colors[lb])
+    ax.set_xlabel("Filter probe count per op (memtable + SST)")
+    ax.set_ylabel("FilterTotal share of latency (%)")
+    ax.set_title(f"{phase}: filter probes vs FilterTotal share (tail samples)")
+    ax.grid(True, alpha=0.25)
+    if len(labels) <= 6:
+        ax.legend(fontsize=9, frameon=False, loc="best")
+    plt.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=180)
+    plt.close(fig)
+    return True
+
+
+PROBE_BUCKETS: List[Tuple[str, int, Optional[int]]] = [
+    ("1", 1, 1),
+    ("2-3", 2, 3),
+    ("4-7", 4, 7),
+    ("8-15", 8, 15),
+    ("16+", 16, None),
+]
+
+
+def probe_bucket_name(v: int) -> str:
+    if v <= 0:
+        return "0"
+    for name, lo, hi in PROBE_BUCKETS:
+        if v < lo:
+            continue
+        if hi is None or v <= hi:
+            return name
+    return str(v)
+
+
+def build_filter_probe_bucket_summary_rows(
+    sample_rows: List[Dict[str, object]], phase: str
+) -> List[Dict[str, object]]:
+    subset = [r for r in sample_rows if str(r.get("phase", "")) == phase]
+    if not subset:
+        return []
+
+    groups: Dict[Tuple[str, str, str], List[Dict[str, object]]] = {}
+    for r in subset:
+        label = str(r.get("label", "NA"))
+        scenario = str(r.get("scenario", ""))
+        probe = to_int(r.get("filter_probe_total", 0))
+        bucket = probe_bucket_name(probe)
+        groups.setdefault((label, scenario, bucket), []).append(r)
+
+    def shares(rows: List[Dict[str, object]], num_key: str, denom_key: str = "latency_us") -> List[float]:
+        out: List[float] = []
+        for r in rows:
+            num = to_float(r.get(num_key, float("nan")))
+            den = to_float(r.get(denom_key, float("nan")))
+            if is_finite(num) and is_finite(den) and den > 0:
+                out.append(num * 100.0 / den)
+        return out
+
+    def ratios(rows: List[Dict[str, object]], a_key: str, b_key: str) -> List[float]:
+        out: List[float] = []
+        for r in rows:
+            a = to_float(r.get(a_key, float("nan")))
+            b = to_float(r.get(b_key, float("nan")))
+            if is_finite(a) and is_finite(b) and b > 0:
+                out.append(a / b)
+        return out
+
+    out_rows: List[Dict[str, object]] = []
+    for (label, scenario, bucket), rows in sorted(groups.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
+        probes = [to_int(r.get("filter_probe_total", 0)) for r in rows]
+        probes = [p for p in probes if p >= 0]
+        lat = [to_float(r.get("latency_us", float("nan"))) for r in rows]
+        lat = [x for x in lat if is_finite(x) and x >= 0]
+
+        filter_total = [to_float(r.get("filter_total_us", float("nan"))) for r in rows]
+        filter_total = [x for x in filter_total if is_finite(x) and x >= 0]
+        filter_fetch = [to_float(r.get("filter_block_fetch_us", float("nan"))) for r in rows]
+        filter_fetch = [x for x in filter_fetch if is_finite(x) and x >= 0]
+        filter_cpu = [to_float(r.get("filter_maymatch_cpu_us", float("nan"))) for r in rows]
+        filter_cpu = [x for x in filter_cpu if is_finite(x) and x >= 0]
+        base_read = [to_float(r.get("simfs_base_read_us", float("nan"))) for r in rows]
+        base_read = [x for x in base_read if is_finite(x) and x >= 0]
+        wait_actual = [to_float(r.get("simfs_actual_injected_wait_us", float("nan"))) for r in rows]
+        wait_actual = [x for x in wait_actual if is_finite(x) and x >= 0]
+        wait_overshoot = [to_float(r.get("simfs_injected_wait_overshoot_us", float("nan"))) for r in rows]
+        wait_overshoot = [x for x in wait_overshoot if is_finite(x) and x >= 0]
+        read_wall = [to_float(r.get("simfs_read_wall_us", float("nan"))) for r in rows]
+        read_wall = [x for x in read_wall if is_finite(x) and x >= 0]
+        read_other = [to_float(r.get("simfs_read_other_us", float("nan"))) for r in rows]
+        read_other = [x for x in read_other if is_finite(x) and x >= 0]
+        injected = [to_float(r.get("simfs_injected_delay_us", float("nan"))) for r in rows]
+        injected = [x for x in injected if is_finite(x) and x >= 0]
+
+        filter_share = shares(rows, "filter_total_us")
+        filter_fetch_share = shares(rows, "filter_block_fetch_us")
+        filter_cpu_share = shares(rows, "filter_maymatch_cpu_us")
+        base_share = shares(rows, "simfs_base_read_us")
+        wait_actual_share = shares(rows, "simfs_actual_injected_wait_us")
+        wait_overshoot_share = shares(rows, "simfs_injected_wait_overshoot_us")
+        read_wall_share = shares(rows, "simfs_read_wall_us")
+        injected_share = shares(rows, "simfs_injected_delay_us")
+        base_over_injected = ratios(rows, "simfs_base_read_us", "simfs_injected_delay_us")
+        wait_actual_over_injected = ratios(
+            rows, "simfs_actual_injected_wait_us", "simfs_injected_delay_us"
+        )
+        read_wall_over_injected = ratios(rows, "simfs_read_wall_us", "simfs_injected_delay_us")
+
+        out_rows.append(
+            {
+                "label": label,
+                "phase": phase,
+                "scenario": scenario,
+                "probe_bucket": bucket,
+                "samples": len(rows),
+                "probe_median": _quantile([float(p) for p in probes], 0.50) if probes else float("nan"),
+                "latency_p50_us": _quantile(lat, 0.50),
+                "latency_p95_us": _quantile(lat, 0.95),
+                "filter_total_p50_us": _quantile(filter_total, 0.50),
+                "filter_total_p95_us": _quantile(filter_total, 0.95),
+                "filter_fetch_p50_us": _quantile(filter_fetch, 0.50),
+                "filter_fetch_p95_us": _quantile(filter_fetch, 0.95),
+                "filter_cpu_p50_us": _quantile(filter_cpu, 0.50),
+                "filter_cpu_p95_us": _quantile(filter_cpu, 0.95),
+                "simfs_base_read_p50_us": _quantile(base_read, 0.50),
+                "simfs_base_read_p95_us": _quantile(base_read, 0.95),
+                "simfs_wait_actual_p50_us": _quantile(wait_actual, 0.50),
+                "simfs_wait_actual_p95_us": _quantile(wait_actual, 0.95),
+                "simfs_wait_overshoot_p50_us": _quantile(wait_overshoot, 0.50),
+                "simfs_wait_overshoot_p95_us": _quantile(wait_overshoot, 0.95),
+                "simfs_read_wall_p50_us": _quantile(read_wall, 0.50),
+                "simfs_read_wall_p95_us": _quantile(read_wall, 0.95),
+                "simfs_read_other_p50_us": _quantile(read_other, 0.50),
+                "simfs_read_other_p95_us": _quantile(read_other, 0.95),
+                "simfs_injected_p50_us": _quantile(injected, 0.50),
+                "simfs_injected_p95_us": _quantile(injected, 0.95),
+                "filter_total_share_p50_pct": _quantile(filter_share, 0.50),
+                "filter_total_share_p95_pct": _quantile(filter_share, 0.95),
+                "filter_fetch_share_p50_pct": _quantile(filter_fetch_share, 0.50),
+                "filter_fetch_share_p95_pct": _quantile(filter_fetch_share, 0.95),
+                "filter_cpu_share_p50_pct": _quantile(filter_cpu_share, 0.50),
+                "filter_cpu_share_p95_pct": _quantile(filter_cpu_share, 0.95),
+                "simfs_base_read_share_p50_pct": _quantile(base_share, 0.50),
+                "simfs_base_read_share_p95_pct": _quantile(base_share, 0.95),
+                "simfs_wait_actual_share_p50_pct": _quantile(wait_actual_share, 0.50),
+                "simfs_wait_actual_share_p95_pct": _quantile(wait_actual_share, 0.95),
+                "simfs_wait_overshoot_share_p50_pct": _quantile(wait_overshoot_share, 0.50),
+                "simfs_wait_overshoot_share_p95_pct": _quantile(wait_overshoot_share, 0.95),
+                "simfs_read_wall_share_p50_pct": _quantile(read_wall_share, 0.50),
+                "simfs_read_wall_share_p95_pct": _quantile(read_wall_share, 0.95),
+                "simfs_injected_share_p50_pct": _quantile(injected_share, 0.50),
+                "simfs_injected_share_p95_pct": _quantile(injected_share, 0.95),
+                "base_over_injected_p50": _quantile(base_over_injected, 0.50),
+                "base_over_injected_p95": _quantile(base_over_injected, 0.95),
+                "wait_actual_over_injected_p50": _quantile(wait_actual_over_injected, 0.50),
+                "wait_actual_over_injected_p95": _quantile(wait_actual_over_injected, 0.95),
+                "read_wall_over_injected_p50": _quantile(read_wall_over_injected, 0.50),
+                "read_wall_over_injected_p95": _quantile(read_wall_over_injected, 0.95),
+            }
+        )
+    return out_rows
+
+
+def plot_phase_filter_probe_knee_latency(
+    summary_rows: List[Dict[str, object]], phase: str, out_png: Path
+) -> bool:
+    subset = [r for r in summary_rows if str(r.get("phase", "")) == phase]
+    if not subset:
+        return False
+    labels = sorted({str(r.get("label", "NA")) for r in subset})
+    if not labels:
+        return False
+
+    fig = plt.figure(figsize=(9.5, 4.8))
+    ax = fig.add_subplot(111)
+    for i, lb in enumerate(labels):
+        rows_lb = [r for r in subset if str(r.get("label", "")) == lb]
+        xs: List[float] = []
+        ys: List[float] = []
+        for bname, _, _ in PROBE_BUCKETS:
+            rows_b = [r for r in rows_lb if str(r.get("probe_bucket", "")) == bname]
+            if not rows_b:
+                continue
+            r0 = rows_b[0]
+            x = to_float(r0.get("probe_median", float("nan")))
+            y = to_float(r0.get("latency_p50_us", float("nan")))
+            if is_finite(x) and is_finite(y):
+                xs.append(x)
+                ys.append(y)
+        if xs:
+            ax.plot(xs, ys, marker="o", linewidth=1.4, markersize=4, label=lb, color=plt.cm.tab10(i % 10))
+    ax.set_xlabel("median filter_probe_total (by bucket)")
+    ax.set_ylabel("latency p50 (us)")
+    ax.set_title(f"{phase}: latency vs filter-probe (bucketed knee curve)")
+    ax.grid(True, alpha=0.25)
+    if len(labels) <= 8:
+        ax.legend(fontsize=9, frameon=False, loc="best")
+    plt.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def plot_phase_filter_probe_knee_filter_share(
+    summary_rows: List[Dict[str, object]], phase: str, out_png: Path
+) -> bool:
+    subset = [r for r in summary_rows if str(r.get("phase", "")) == phase]
+    if not subset:
+        return False
+    labels = sorted({str(r.get("label", "NA")) for r in subset})
+    if not labels:
+        return False
+
+    fig = plt.figure(figsize=(9.5, 4.8))
+    ax = fig.add_subplot(111)
+    for i, lb in enumerate(labels):
+        rows_lb = [r for r in subset if str(r.get("label", "")) == lb]
+        xs: List[float] = []
+        ys: List[float] = []
+        for bname, _, _ in PROBE_BUCKETS:
+            rows_b = [r for r in rows_lb if str(r.get("probe_bucket", "")) == bname]
+            if not rows_b:
+                continue
+            r0 = rows_b[0]
+            x = to_float(r0.get("probe_median", float("nan")))
+            y = to_float(r0.get("filter_total_share_p50_pct", float("nan")))
+            if is_finite(x) and is_finite(y):
+                xs.append(x)
+                ys.append(y)
+        if xs:
+            ax.plot(xs, ys, marker="o", linewidth=1.4, markersize=4, label=lb, color=plt.cm.tab10(i % 10))
+    ax.set_xlabel("median filter_probe_total (by bucket)")
+    ax.set_ylabel("FilterTotal share p50 (%)")
+    ax.set_title(f"{phase}: FilterTotal share vs filter-probe (bucketed knee curve)")
+    ax.grid(True, alpha=0.25)
+    if len(labels) <= 8:
+        ax.legend(fontsize=9, frameon=False, loc="best")
+    plt.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def plot_phase_gate2_simfs_wait_expected_vs_actual_scatter(
+    sample_rows: List[Dict[str, object]], phase: str, out_png: Path
+) -> bool:
+    subset = [r for r in sample_rows if str(r.get("phase", "")) == phase]
+    if not subset:
+        return False
+
+    xs: List[float] = []
+    ys: List[float] = []
+    for r in subset:
+        expected = to_float(r.get("simfs_injected_delay_us", float("nan")))
+        actual = to_float(r.get("simfs_actual_injected_wait_us", float("nan")))
+        if is_finite(expected) and is_finite(actual) and expected > 0 and actual >= 0:
+            xs.append(expected)
+            ys.append(actual)
+    if not xs:
+        return False
+
+    fig = plt.figure(figsize=(8.8, 5.2))
+    ax = fig.add_subplot(111)
+    ax.scatter(xs, ys, s=8, alpha=0.25, edgecolors="none")
+    m = max(max(xs), max(ys))
+    ax.plot([0, m], [0, m], linestyle="--", linewidth=1.2, color="gray", alpha=0.8, label="y=x")
+    ax.set_xlabel("simfs injected delay (expected) per-op (us)")
+    ax.set_ylabel("simfs injected wait (actual wall time) per-op (us)")
+    ax.set_title(f"{phase}: expected vs actual injected wait (Gate2)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, fontsize=9, loc="best")
+    plt.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def plot_phase_gate2_simfs_wait_overshoot_distribution(
+    sample_rows: List[Dict[str, object]], phase: str, out_png: Path
+) -> bool:
+    subset = [r for r in sample_rows if str(r.get("phase", "")) == phase]
+    if not subset:
+        return False
+    overshoot: List[float] = []
+    ratio: List[float] = []
+    for r in subset:
+        o = to_float(r.get("simfs_injected_wait_overshoot_us", float("nan")))
+        expected = to_float(r.get("simfs_injected_delay_us", float("nan")))
+        actual = to_float(r.get("simfs_actual_injected_wait_us", float("nan")))
+        if is_finite(o) and o >= 0:
+            overshoot.append(o)
+        if is_finite(expected) and is_finite(actual) and expected > 0 and actual >= 0:
+            ratio.append(actual / expected)
+    overshoot = [x for x in overshoot if is_finite(x)]
+    ratio = [x for x in ratio if is_finite(x) and x >= 0]
+    if not overshoot and not ratio:
+        return False
+
+    fig = plt.figure(figsize=(10.0, 4.4))
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax2 = fig.add_subplot(1, 2, 2)
+
+    if overshoot:
+        ax1.hist(overshoot, bins=60, alpha=0.85, color="#d95f02")
+    ax1.set_xlabel("simfs injected wait overshoot (us)")
+    ax1.set_ylabel("count")
+    ax1.set_title("overshoot distribution")
+    ax1.grid(True, alpha=0.25)
+
+    if ratio:
+        ax2.hist(ratio, bins=60, alpha=0.85, color="#1b9e77")
+    ax2.set_xlabel("actual_wait / expected_injected")
+    ax2.set_ylabel("count")
+    ax2.set_title("wait ratio distribution")
+    ax2.grid(True, alpha=0.25)
+
+    fig.suptitle(f"{phase}: injected wait overshoot + ratio (Gate2)")
+    plt.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def plot_phase_gate2_simfs_read_wall_vs_block_read_scatter(
+    sample_rows: List[Dict[str, object]], phase: str, out_png: Path
+) -> bool:
+    subset = [r for r in sample_rows if str(r.get("phase", "")) == phase]
+    if not subset:
+        return False
+    xs: List[float] = []
+    ys: List[float] = []
+    for r in subset:
+        wall = to_float(r.get("simfs_read_wall_us", float("nan")))
+        block_io = to_float(r.get("stage_block_read_io_us", float("nan")))
+        if is_finite(wall) and is_finite(block_io) and wall >= 0 and block_io >= 0:
+            xs.append(wall)
+            ys.append(block_io)
+    if not xs:
+        return False
+    fig = plt.figure(figsize=(8.8, 5.2))
+    ax = fig.add_subplot(111)
+    ax.scatter(xs, ys, s=8, alpha=0.25, edgecolors="none")
+    m = max(max(xs), max(ys))
+    ax.plot([0, m], [0, m], linestyle="--", linewidth=1.2, color="gray", alpha=0.8, label="y=x")
+    ax.set_xlabel("simfs read wall time (us)")
+    ax.set_ylabel("stage block_read_io (us)")
+    ax.set_title(f"{phase}: simfs read wall vs block_read_io (Gate2)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, fontsize=9, loc="best")
+    plt.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_png, dpi=180)
     plt.close(fig)
