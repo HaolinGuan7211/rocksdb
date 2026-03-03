@@ -118,3 +118,8 @@ experiment/REBOOT_RESUME.md
 tools/__pycache__/
 **/__pycache__/
 tools/nvm_fs/.*.json
+
+# Local calibration/benchmark run artifacts (keep summary JSON/README tracked)
+results/calibration_runs*/
+results/calibration_runs_*/
+results/quick_cpu_dominance_runs/

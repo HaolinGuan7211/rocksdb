@@ -1470,6 +1470,11 @@ DEFINE_bool(simulate_dimm_nvm, false,
             "wrapper.");
 DEFINE_uint64(simulate_xp_line_bytes, 256,
               "XP-like write/read granularity in bytes.");
+DEFINE_uint64(
+    simulate_xp_service_bytes, 256,
+    "XP-like service granularity in bytes used for translating request sizes "
+    "into service units for --simulate_xp_latency_ns. Default matches "
+    "--simulate_xp_line_bytes for backward compatibility.");
 DEFINE_uint64(simulate_xp_buffer_bytes, 16 * 1024,
               "XP-like write buffer size in bytes.");
 DEFINE_uint64(simulate_xp_latency_ns, 300,
@@ -1478,6 +1483,22 @@ DEFINE_uint64(simulate_xp_rpq_depth, 64,
               "Depth of simulated PMEM read pending queue (RPQ).");
 DEFINE_uint64(simulate_xp_wpq_depth, 64,
               "Depth of simulated PMEM write pending queue (WPQ).");
+DEFINE_uint64(simulate_xp_rpq_parallelism, 1,
+              "Simulated PMEM RPQ server parallelism (number of concurrent "
+              "read servers).");
+DEFINE_uint64(simulate_xp_wpq_parallelism, 1,
+              "Simulated PMEM WPQ server parallelism (number of concurrent "
+              "write servers).");
+DEFINE_uint64(simulate_xp_read_line_parallelism, 1,
+              "XP-like line service parallelism for reads. Used to scale "
+              "service time when a request spans multiple service units.");
+DEFINE_uint64(simulate_xp_write_line_parallelism, 1,
+              "XP-like line service parallelism for writes. Used to scale "
+              "service time when a request spans multiple service units.");
+DEFINE_uint64(simulate_xp_rpq_arb_ns, 0,
+              "Additional RPQ arbitration penalty per outstanding read "
+              "request (ns). Models controller-side contention that grows "
+              "with queue depth.");
 DEFINE_uint64(
     simulate_xp_wpq_submit_ns, 100,
     "Write completion latency in nanoseconds when a request is accepted into "
@@ -1507,6 +1528,16 @@ DEFINE_string(simulate_xp_levels, "",
               "Example: \"0,1\". Empty means all levels.");
 DEFINE_string(simulate_xp_stats_file, "",
               "Optional output path to dump simulated storage model stats.");
+DEFINE_bool(simulate_xp_busy_wait, false,
+            "If true, simulated XP/DIMM delays use busy-spinning instead of "
+            "SleepForMicroseconds. This is useful for DRAM/NVM-scale latency "
+            "experiments where OS sleeps can overshoot by microseconds and "
+            "artificially inflate iowait / hide CPU-side costs.");
+DEFINE_bool(simulate_xp_use_dimm_device_model, false,
+            "If true, XP read path uses DIMM-style fixed overhead + bandwidth "
+            "transfer time (simulate_dimm_*) in addition to XPBuffer hit/miss "
+            "accounting, instead of purely scaling device service time by "
+            "service units * simulate_xp_latency_ns.");
 
 DEFINE_uint64(simulate_dimm_fixed_read_overhead_ns, 1080,
               "Single-DIMM NVM: fixed host-side read overhead in ns.");
@@ -10297,14 +10328,20 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
     std::unordered_set<int> xp_target_levels;
     if (FLAGS_simulate_xp_nvm) {
       if (FLAGS_simulate_xp_line_bytes == 0 ||
+          FLAGS_simulate_xp_service_bytes == 0 ||
           FLAGS_simulate_xp_buffer_bytes == 0 ||
           FLAGS_simulate_xp_latency_ns == 0 ||
           FLAGS_simulate_xp_rpq_depth == 0 ||
-          FLAGS_simulate_xp_wpq_depth == 0) {
+          FLAGS_simulate_xp_wpq_depth == 0 ||
+          FLAGS_simulate_xp_rpq_parallelism == 0 ||
+          FLAGS_simulate_xp_wpq_parallelism == 0 ||
+          FLAGS_simulate_xp_read_line_parallelism == 0 ||
+          FLAGS_simulate_xp_write_line_parallelism == 0) {
         fprintf(stderr,
-                "Error: --simulate_xp_line_bytes, --simulate_xp_buffer_bytes, "
-                "--simulate_xp_latency_ns, --simulate_xp_rpq_depth, and "
-                "--simulate_xp_wpq_depth must all be > 0\n");
+                "Error: --simulate_xp_line_bytes, --simulate_xp_service_bytes, "
+                "--simulate_xp_buffer_bytes, --simulate_xp_latency_ns, "
+                "--simulate_xp_rpq_depth, and --simulate_xp_wpq_depth must all "
+                "be > 0\n");
         db_bench_exit(1);
       }
     }
@@ -10378,10 +10415,16 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
     model_options.use_xp_model = FLAGS_simulate_xp_nvm;
     model_options.use_dimm_model = FLAGS_simulate_dimm_nvm;
     model_options.xp_line_bytes = FLAGS_simulate_xp_line_bytes;
+    model_options.xp_service_bytes = FLAGS_simulate_xp_service_bytes;
     model_options.xp_buffer_bytes = FLAGS_simulate_xp_buffer_bytes;
     model_options.xp_latency_ns = FLAGS_simulate_xp_latency_ns;
     model_options.xp_rpq_depth = FLAGS_simulate_xp_rpq_depth;
     model_options.xp_wpq_depth = FLAGS_simulate_xp_wpq_depth;
+    model_options.xp_rpq_parallelism = FLAGS_simulate_xp_rpq_parallelism;
+    model_options.xp_wpq_parallelism = FLAGS_simulate_xp_wpq_parallelism;
+    model_options.xp_read_line_parallelism = FLAGS_simulate_xp_read_line_parallelism;
+    model_options.xp_write_line_parallelism = FLAGS_simulate_xp_write_line_parallelism;
+    model_options.xp_rpq_arb_ns = FLAGS_simulate_xp_rpq_arb_ns;
     model_options.xp_wpq_submit_ns = FLAGS_simulate_xp_wpq_submit_ns;
     model_options.xp_prefetch_hit_ns = FLAGS_simulate_xp_prefetch_hit_ns;
     model_options.dram_read_seq_ns = FLAGS_simulate_xp_dram_seq_read_ns;
@@ -10394,6 +10437,16 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
     model_options.path_prefix = FLAGS_simulate_xp_path_prefix;
     model_options.target_levels = std::move(xp_target_levels);
     model_options.stats_file = FLAGS_simulate_xp_stats_file;
+    model_options.xp_busy_wait = FLAGS_simulate_xp_busy_wait;
+    model_options.xp_use_dimm_device_model = FLAGS_simulate_xp_use_dimm_device_model;
+    model_options.monitor_enable = FLAGS_simulate_xp_monitor_enable;
+    model_options.monitor_window_us = FLAGS_simulate_xp_monitor_window_us;
+    model_options.monitor_stage_seconds = FLAGS_simulate_xp_monitor_stage_seconds;
+    model_options.monitor_max_read = FLAGS_simulate_xp_monitor_max_read;
+    model_options.monitor_max_open = FLAGS_simulate_xp_monitor_max_open;
+    model_options.monitor_max_prefetch = FLAGS_simulate_xp_monitor_max_prefetch;
+    model_options.monitor_window_csv = FLAGS_simulate_xp_monitor_window_csv;
+    model_options.monitor_stage_csv = FLAGS_simulate_xp_monitor_stage_csv;
     model_options.dimm_fixed_read_overhead_ns =
         FLAGS_simulate_dimm_fixed_read_overhead_ns;
     model_options.dimm_fixed_write_overhead_ns =

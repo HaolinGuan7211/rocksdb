@@ -57,8 +57,9 @@ uint64_t GetXpServiceNsForLines(const SimulatedStorageModelOptions& options,
 
 uint64_t GetXpServiceNs(const SimulatedStorageModelOptions& options,
                         uint64_t bytes, bool is_write) {
-  const uint64_t line_bytes = std::max<uint64_t>(1, options.xp_line_bytes);
-  const uint64_t lines = std::max<uint64_t>(1, CeilDiv(bytes, line_bytes));
+  const uint64_t service_bytes =
+      std::max<uint64_t>(1, options.xp_service_bytes);
+  const uint64_t lines = std::max<uint64_t>(1, CeilDiv(bytes, service_bytes));
   return GetXpServiceNsForLines(options, lines, is_write);
 }
 
@@ -162,8 +163,22 @@ uint64_t GetDimmTransferTimeNs(uint64_t media_bytes, double bw_gbps) {
                                                bw));
 }
 
-void SleepForNanoseconds(uint64_t delay_ns) {
+void BusySpinForNanoseconds(uint64_t delay_ns) {
   if (delay_ns == 0) {
+    return;
+  }
+  const auto clock = Env::Default()->GetSystemClock();
+  const uint64_t start = clock->NowNanos();
+  while (clock->NowNanos() - start < delay_ns) {
+  }
+}
+
+void WaitForNanoseconds(uint64_t delay_ns, bool busy_wait) {
+  if (delay_ns == 0) {
+    return;
+  }
+  if (busy_wait) {
+    BusySpinForNanoseconds(delay_ns);
     return;
   }
   if (delay_ns >= 1000) {
@@ -173,10 +188,7 @@ void SleepForNanoseconds(uint64_t delay_ns) {
       return;
     }
   }
-  const auto clock = Env::Default()->GetSystemClock();
-  const uint64_t start = clock->NowNanos();
-  while (clock->NowNanos() - start < delay_ns) {
-  }
+  BusySpinForNanoseconds(delay_ns);
 }
 
 uint64_t NowNanos() { return Env::Default()->GetSystemClock()->NowNanos(); }
@@ -1100,7 +1112,7 @@ void SimulateXpWriteQueueSubmission(
                       iteration_now_ns + waited_for_queue_ns +
                           submit_latency_ns);
       if (!options.xp_bypass_base_io) {
-        SleepForNanoseconds(submit_latency_ns);
+        WaitForNanoseconds(submit_latency_ns, options.xp_busy_wait);
       }
       return;
     }
@@ -1108,7 +1120,7 @@ void SimulateXpWriteQueueSubmission(
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + queue_wait_ns);
       if (!options.xp_bypass_base_io) {
-        SleepForNanoseconds(queue_wait_ns);
+        WaitForNanoseconds(queue_wait_ns, options.xp_busy_wait);
       }
       waited_for_queue_ns += queue_wait_ns;
     }
@@ -1136,6 +1148,7 @@ void SimulateXpReadQueueServe(
     uint64_t queue_delay_ns = 0;
     uint64_t service_delay_ns = 0;
     uint64_t xp_service_delay_ns = 0;
+    uint64_t device_fixed_overhead_ns = 0;
     uint64_t dram_delay_ns = 0;
     uint64_t arb_delay_ns = 0;
     uint64_t media_bytes = 0;
@@ -1163,6 +1176,7 @@ void SimulateXpReadQueueServe(
         const uint64_t end = GetSaturatedEnd(offset, logical_bytes);
         const bool sequential = stream.has_last && offset == stream.last_end;
         const bool first_read = !stream.has_last;
+        const bool is_random = stream.has_last && !sequential;
         const bool seq_for_dram = first_read || sequential;
         dram_delay_ns = GetDramReadBaseNs(options, seq_for_dram);
         const uint64_t total_lines =
@@ -1180,8 +1194,24 @@ void SimulateXpReadQueueServe(
           xp_service_delay_ns =
               std::max<uint64_t>(1, options.xp_prefetch_hit_ns);
         } else {
-          xp_service_delay_ns = GetXpServiceNsForLines(
-              options, miss_lines, /*is_write=*/false);
+          if (options.xp_use_dimm_device_model) {
+            device_fixed_overhead_ns = options.dimm_fixed_read_overhead_ns;
+            // Model a request-level device round-trip to fetch XPLine(s).
+            // Real devices can pipeline multiple XPLine reads for one 4KB
+            // request, so the latency should not necessarily scale as
+            // miss_lines * xp_latency_ns.
+            const uint64_t command_ns = std::max<uint64_t>(1, options.xp_latency_ns);
+            const double bw_gbps =
+                GetDimmEffectiveBandwidthGbps(options, /*is_write=*/false, is_random);
+            const uint64_t transfer_ns = GetDimmTransferTimeNs(media_bytes, bw_gbps);
+            if (device_fixed_overhead_ns > 0) {
+              stats->simulated_read_fixed_delay_ns.fetch_add(device_fixed_overhead_ns);
+            }
+            xp_service_delay_ns = command_ns + transfer_ns;
+          } else {
+            xp_service_delay_ns =
+                GetXpServiceNs(options, media_bytes, /*is_write=*/false);
+          }
           if (hit_lines > 0) {
             xp_service_delay_ns +=
                 std::max<uint64_t>(1, options.xp_prefetch_hit_ns);
@@ -1189,7 +1219,8 @@ void SimulateXpReadQueueServe(
         }
         const uint64_t outstanding_reads = state.rpq_finish_times.size();
         arb_delay_ns = outstanding_reads * options.xp_rpq_arb_ns;
-        service_delay_ns = xp_service_delay_ns + dram_delay_ns + arb_delay_ns;
+        service_delay_ns = device_fixed_overhead_ns + xp_service_delay_ns +
+                           dram_delay_ns + arb_delay_ns;
         const auto [server_idx, server_available_ns] =
             SelectEarliestServerWithHint(state.rpq_server_available_ns,
                                          state.rpq_rr_cursor);
@@ -1242,7 +1273,7 @@ void SimulateXpReadQueueServe(
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + total_delay_ns);
       if (!options.xp_bypass_base_io) {
-        SleepForNanoseconds(total_delay_ns);
+        WaitForNanoseconds(total_delay_ns, options.xp_busy_wait);
       }
       return;
     }
@@ -1250,7 +1281,7 @@ void SimulateXpReadQueueServe(
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + wait_for_depth_ns);
       if (!options.xp_bypass_base_io) {
-        SleepForNanoseconds(wait_for_depth_ns);
+        WaitForNanoseconds(wait_for_depth_ns, options.xp_busy_wait);
       }
     }
   }
@@ -1273,7 +1304,7 @@ void SimulateDimmReadQueueServe(
     AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                     begin_ns + fixed_overhead_ns);
     if (!options.xp_bypass_base_io) {
-      SleepForNanoseconds(fixed_overhead_ns);
+      WaitForNanoseconds(fixed_overhead_ns, options.xp_busy_wait);
     }
   }
   stats->simulated_read_fixed_delay_ns.fetch_add(fixed_overhead_ns);
@@ -1350,7 +1381,7 @@ void SimulateDimmReadQueueServe(
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + device_delay_ns);
       if (!options.xp_bypass_base_io) {
-        SleepForNanoseconds(device_delay_ns);
+        WaitForNanoseconds(device_delay_ns, options.xp_busy_wait);
       }
       return;
     }
@@ -1358,7 +1389,7 @@ void SimulateDimmReadQueueServe(
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + wait_for_depth_ns);
       if (!options.xp_bypass_base_io) {
-        SleepForNanoseconds(wait_for_depth_ns);
+        WaitForNanoseconds(wait_for_depth_ns, options.xp_busy_wait);
       }
     }
   }
@@ -1381,7 +1412,7 @@ void SimulateDimmWriteQueueServe(
     AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                     begin_ns + fixed_overhead_ns);
     if (!options.xp_bypass_base_io) {
-      SleepForNanoseconds(fixed_overhead_ns);
+      WaitForNanoseconds(fixed_overhead_ns, options.xp_busy_wait);
     }
   }
   stats->simulated_write_fixed_delay_ns.fetch_add(fixed_overhead_ns);
@@ -1458,7 +1489,7 @@ void SimulateDimmWriteQueueServe(
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + device_delay_ns);
       if (!options.xp_bypass_base_io) {
-        SleepForNanoseconds(device_delay_ns);
+        WaitForNanoseconds(device_delay_ns, options.xp_busy_wait);
       }
       return;
     }
@@ -1466,7 +1497,7 @@ void SimulateDimmWriteQueueServe(
       AdvanceSimNowNs(instance_id, options.xp_bypass_base_io,
                       iteration_now_ns + wait_for_depth_ns);
       if (!options.xp_bypass_base_io) {
-        SleepForNanoseconds(wait_for_depth_ns);
+        WaitForNanoseconds(wait_for_depth_ns, options.xp_busy_wait);
       }
     }
   }
@@ -1520,6 +1551,8 @@ SimulatedHybridFileSystem::SimulatedHybridFileSystem(
     std::exit(1);
   }
   model_options_.xp_line_bytes = std::max<uint64_t>(1, model_options_.xp_line_bytes);
+  model_options_.xp_service_bytes =
+      std::max<uint64_t>(1, model_options_.xp_service_bytes);
   model_options_.xp_buffer_bytes =
       std::max<uint64_t>(1, model_options_.xp_buffer_bytes);
   model_options_.xp_latency_ns = std::max<uint64_t>(1, model_options_.xp_latency_ns);
@@ -1690,6 +1723,7 @@ void SimulatedHybridFileSystem::MaybeWriteModelStats() const {
   out << "use_xp_model=" << (model_options_.use_xp_model ? 1 : 0) << "\n";
   out << "use_dimm_model=" << (model_options_.use_dimm_model ? 1 : 0) << "\n";
   out << "xp_line_bytes=" << model_options_.xp_line_bytes << "\n";
+  out << "xp_service_bytes=" << model_options_.xp_service_bytes << "\n";
   out << "xp_buffer_bytes=" << model_options_.xp_buffer_bytes << "\n";
   out << "xp_latency_ns=" << model_options_.xp_latency_ns << "\n";
   out << "xp_rpq_depth=" << model_options_.xp_rpq_depth << "\n";
@@ -1728,6 +1762,9 @@ void SimulatedHybridFileSystem::MaybeWriteModelStats() const {
       << model_options_.xp_forced_tag_init_stagger_ns << "\n";
   out << "xp_bypass_base_io=" << (model_options_.xp_bypass_base_io ? 1 : 0)
       << "\n";
+  out << "xp_busy_wait=" << (model_options_.xp_busy_wait ? 1 : 0) << "\n";
+  out << "xp_use_dimm_device_model="
+      << (model_options_.xp_use_dimm_device_model ? 1 : 0) << "\n";
   out << "dimm_fixed_read_overhead_ns=" << model_options_.dimm_fixed_read_overhead_ns
       << "\n";
   out << "dimm_fixed_write_overhead_ns="

@@ -22,7 +22,14 @@ class SimulatedFsLatencyMonitor;
 
 struct SimulatedStorageModelOptions {
   // XP-like NVM simulation model:
-  // delay_ns = ceil(bytes / xp_line_bytes) * xp_latency_ns.
+  // Service delay is based on request size with a configurable granularity:
+  // - service_units = ceil(bytes / xp_service_bytes)
+  // - xp_service_delay_ns ~= service_units * xp_latency_ns (with parallelism)
+  //
+  // NOTE: `xp_line_bytes` is still used for buffer/prefetch line accounting and
+  // media-byte rounding. `xp_service_bytes` exists to decouple "service time
+  // scaling" from "prefetch/cache line modeling", which is important when
+  // you want a 4KB-scale latency model while keeping 256B line accounting.
   bool use_xp_model = false;
   // Single-DIMM NVM model:
   // - A file-level simulator that injects a fixed overhead plus a bandwidth
@@ -32,6 +39,10 @@ struct SimulatedStorageModelOptions {
   //   `bw_gbps` is numerically equal to bytes/ns.
   bool use_dimm_model = false;
   uint64_t xp_line_bytes = 256;
+  // XP-like "service granularity" in bytes used for translating request bytes
+  // into service units for xp_latency_ns. Default keeps legacy behavior
+  // (xp_service_bytes == xp_line_bytes).
+  uint64_t xp_service_bytes = 256;
   uint64_t xp_buffer_bytes = 16 * 1024;
   uint64_t xp_latency_ns = 300;
   uint64_t xp_rpq_depth = 64;
@@ -59,6 +70,23 @@ struct SimulatedStorageModelOptions {
   // If true, bypass base filesystem IO in wrappers and only keep simulated
   // latency / queue behavior. Useful for pure model profiling.
   bool xp_bypass_base_io = false;
+  // If true, simulated delays use busy-spinning instead of sleeping.
+  // This is useful for DRAM/NVM-scale experiments where OS sleeps can
+  // overshoot by microseconds and incorrectly inflate "iowait" while hiding
+  // CPU-side costs (filter check, compression, compare/search) that should
+  // become visible when media gets fast.
+  bool xp_busy_wait = false;
+  // If true, XP read path uses DIMM-style fixed-overhead + bandwidth transfer
+  // time (dimm_*) in addition to XPBuffer hit/miss accounting, instead of
+  // purely scaling device service time by XP service units * xp_latency_ns.
+  //
+  // Motivation:
+  // - Hardware may issue multiple XPLine reads in parallel for a single 4KB
+  //   read request, so 4KB latency should not necessarily be 16 * 300ns even
+  //   if a single XPLine read is ~300ns end-to-end.
+  // - The XPBuffer (prefetch/cache line behavior) is still modeled via
+  //   xp_line_bytes and xp_buffer_bytes.
+  bool xp_use_dimm_device_model = false;
 
   // DIMM model parameters.
   // Target example (user requirement):

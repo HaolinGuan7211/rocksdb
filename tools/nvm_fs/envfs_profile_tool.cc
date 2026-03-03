@@ -47,6 +47,7 @@ struct ToolOptions {
   uint64_t seed = 20260207;
 
   uint64_t xp_line_bytes = 256;
+  uint64_t xp_service_bytes = 256;
   uint64_t xp_buffer_bytes = 16ULL * 1024ULL;
   uint64_t xp_latency_ns = 305;
   uint64_t xp_rpq_depth = 64;
@@ -63,6 +64,8 @@ struct ToolOptions {
   bool xp_enable_prefetch = true;
   bool xp_share_buffer_between_rw = true;
   bool xp_bypass_base_io = true;
+  bool xp_busy_wait = false;
+  bool xp_use_dimm_device_model = false;
   uint64_t xp_forced_tag_init_stagger_ns = 32;
   bool deterministic_schedule = false;
   uint64_t deterministic_chunk_ops = 1;
@@ -212,6 +215,10 @@ bool ParseArgs(int argc, char** argv, ToolOptions* opts, std::string* err) {
       if (!ParseUInt64(val, &opts->seed)) return bad("invalid --seed");
     } else if (key == "xp_line_bytes") {
       if (!ParseUInt64(val, &opts->xp_line_bytes)) return bad("invalid --xp_line_bytes");
+    } else if (key == "xp_service_bytes") {
+      if (!ParseUInt64(val, &opts->xp_service_bytes)) {
+        return bad("invalid --xp_service_bytes");
+      }
     } else if (key == "xp_buffer_bytes") {
       if (!ParseUInt64(val, &opts->xp_buffer_bytes)) return bad("invalid --xp_buffer_bytes");
     } else if (key == "xp_latency_ns") {
@@ -256,6 +263,12 @@ bool ParseArgs(int argc, char** argv, ToolOptions* opts, std::string* err) {
       }
     } else if (key == "xp_bypass_base_io") {
       if (!ParseBool(val, &opts->xp_bypass_base_io)) return bad("invalid --xp_bypass_base_io");
+    } else if (key == "xp_busy_wait") {
+      if (!ParseBool(val, &opts->xp_busy_wait)) return bad("invalid --xp_busy_wait");
+    } else if (key == "xp_use_dimm_device_model") {
+      if (!ParseBool(val, &opts->xp_use_dimm_device_model)) {
+        return bad("invalid --xp_use_dimm_device_model");
+      }
     } else if (key == "xp_forced_tag_init_stagger_ns") {
       if (!ParseUInt64(val, &opts->xp_forced_tag_init_stagger_ns)) {
         return bad("invalid --xp_forced_tag_init_stagger_ns");
@@ -703,6 +716,7 @@ int EnvFSProfileMain(int argc, char** argv) {
   model.use_xp_model = opts.nvm_model == "xp";
   model.use_dimm_model = opts.nvm_model == "dimm";
   model.xp_line_bytes = opts.xp_line_bytes;
+  model.xp_service_bytes = opts.xp_service_bytes;
   model.xp_buffer_bytes = opts.xp_buffer_bytes;
   model.xp_latency_ns = opts.xp_latency_ns;
   model.xp_rpq_depth = opts.xp_rpq_depth;
@@ -719,6 +733,8 @@ int EnvFSProfileMain(int argc, char** argv) {
   model.xp_enable_prefetch = opts.xp_enable_prefetch;
   model.xp_share_buffer_between_rw = opts.xp_share_buffer_between_rw;
   model.xp_bypass_base_io = opts.xp_bypass_base_io;
+  model.xp_busy_wait = opts.xp_busy_wait;
+  model.xp_use_dimm_device_model = opts.xp_use_dimm_device_model;
   model.xp_forced_tag_init_stagger_ns = opts.xp_forced_tag_init_stagger_ns;
   model.path_prefix = opts.xp_path_prefix;
   model.stats_file = opts.stats_file;

@@ -155,7 +155,12 @@ bool FullFilterBlockReader::MayMatch(const Slice& entry,
       filter_block.GetValue()->filter_bits_reader();
 
   if (filter_bits_reader) {
-    if (filter_bits_reader->MayMatch(entry)) {
+    bool may_match = false;
+    {
+      PERF_TIMER_GUARD(bloom_filter_maymatch_nanos);
+      may_match = filter_bits_reader->MayMatch(entry);
+    }
+    if (may_match) {
       PERF_COUNTER_ADD(bloom_sst_hit_count, 1);
       return true;
     } else {

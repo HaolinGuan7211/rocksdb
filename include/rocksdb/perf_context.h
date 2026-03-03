@@ -235,6 +235,9 @@ struct PerfContextBase {
   uint64_t bloom_sst_hit_count;
   // total number of SST bloom misses
   uint64_t bloom_sst_miss_count;
+  // Total CPU nanos spent inside bloom/ribbon filter bits MayMatch() checks.
+  // Excludes filter block read/decompression costs.
+  uint64_t bloom_filter_maymatch_nanos;
 
   // Time spent waiting on key locks in transaction lock manager.
   // This metric gets collected starting from

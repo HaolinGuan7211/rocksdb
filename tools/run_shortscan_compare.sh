@@ -36,6 +36,9 @@ AUTO_POST_PROCESS="${AUTO_POST_PROCESS:-1}"
 PLOT_SCRIPT="${PLOT_SCRIPT:-$ROOT_DIR/tools/plot_shortscan_results.py}"
 RUN_ONLY_MIXGRAPH="${RUN_ONLY_MIXGRAPH:-0}"
 MIXGRAPH_DURATION_SECONDS="${MIXGRAPH_DURATION_SECONDS:-0}"
+POST_FILL_BENCHMARKS="${POST_FILL_BENCHMARKS:-}" # optional post-fill meta benchmarks, e.g. "compactall,waitforcompaction"
+MIXGRAPH_READONLY="${MIXGRAPH_READONLY:-0}"
+MIXGRAPH_DISABLE_AUTO_COMPACTIONS="${MIXGRAPH_DISABLE_AUTO_COMPACTIONS:-0}"
 
 MIX_GET_RATIO="${MIX_GET_RATIO:-0.10}"
 MIX_PUT_RATIO="${MIX_PUT_RATIO:-0.05}"
@@ -86,6 +89,7 @@ SIMFS_MONITOR_STAGE_SECONDS="${SIMFS_MONITOR_STAGE_SECONDS:-0}"
 SIMFS_MONITOR_MAX_READ="${SIMFS_MONITOR_MAX_READ:-1}"
 SIMFS_MONITOR_MAX_OPEN="${SIMFS_MONITOR_MAX_OPEN:-1}"
 SIMFS_MONITOR_MAX_PREFETCH="${SIMFS_MONITOR_MAX_PREFETCH:-1}"
+SIMFS_STATS_DIR="${SIMFS_STATS_DIR:-}"  # if set, write per-step simfs stats files under this dir
 
 # Tail probe (P99 composition) capture for mixgraph seeks/reads.
 TAIL_PROBE_ENABLE="${TAIL_PROBE_ENABLE:-0}"
@@ -186,8 +190,13 @@ run_step() {
   fi
   local log_file="$OUT_DIR/${name}.log"
   echo "[$(date '+%F %T')] START $name" | tee -a "$OUT_DIR/runner.log"
-  echo "$DB_BENCH ${args[*]} ${EXTRA_ARGS_ARRAY[*]}" >"$OUT_DIR/${name}.cmd"
-  "$DB_BENCH" "${args[@]}" "${EXTRA_ARGS_ARRAY[@]}" 2>&1 | tee "$log_file"
+  local simfs_stats_arg=()
+  if [[ -n "$SIMFS_STATS_DIR" ]]; then
+    mkdir -p "$SIMFS_STATS_DIR"
+    simfs_stats_arg=(--simulate_xp_stats_file="$SIMFS_STATS_DIR/${name}.simfs_stats.txt")
+  fi
+  echo "$DB_BENCH ${args[*]} ${EXTRA_ARGS_ARRAY[*]} ${simfs_stats_arg[*]}" >"$OUT_DIR/${name}.cmd"
+  "$DB_BENCH" "${args[@]}" "${EXTRA_ARGS_ARRAY[@]}" "${simfs_stats_arg[@]}" 2>&1 | tee "$log_file"
   echo "[$(date '+%F %T')] END   $name" | tee -a "$OUT_DIR/runner.log"
 }
 
@@ -392,6 +401,23 @@ else
     --cache_size="${CACHE_SIZE_ARRAY[0]}" \
     --use_direct_reads="$USE_DIRECT" \
     --use_direct_io_for_flush_and_compaction="$USE_DIRECT"
+
+  if [[ -n "$POST_FILL_BENCHMARKS" ]]; then
+    run_step "01b_post_fill" \
+      --db="$fill_db" \
+      --wal_dir="$fill_wal" \
+      --use_existing_db=1 \
+      --benchmarks="$POST_FILL_BENCHMARKS",stats \
+      --statistics \
+      --num="$NUM_KEYS" \
+      --key_size="$KEY_SIZE" \
+      --value_size="$VALUE_SIZE" \
+      --threads="$THREADS" \
+      --compression_type="$COMPRESSION_TYPE" \
+      --cache_size="${CACHE_SIZE_ARRAY[0]}" \
+      --use_direct_reads="$USE_DIRECT" \
+      --use_direct_io_for_flush_and_compaction="$USE_DIRECT"
+  fi
 fi
 
 for cache_size in "${CACHE_SIZE_ARRAY[@]}"; do
@@ -449,6 +475,8 @@ for cache_size in "${CACHE_SIZE_ARRAY[@]}"; do
     --cache_size="$cache_size" \
     --use_direct_reads="$USE_DIRECT" \
     --use_direct_io_for_flush_and_compaction="$USE_DIRECT" \
+    --readonly="$MIXGRAPH_READONLY" \
+    --disable_auto_compactions="$MIXGRAPH_DISABLE_AUTO_COMPACTIONS" \
     --value_k=0.9 --value_sigma=256 --value_theta=0 \
     --key_dist_a="$MIX_KEY_DIST_A" --key_dist_b="$MIX_KEY_DIST_B" \
     --keyrange_dist_a="$MIX_KEYRANGE_DIST_A" --keyrange_dist_b="$MIX_KEYRANGE_DIST_B" \
