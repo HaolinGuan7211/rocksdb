@@ -1294,18 +1294,38 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
         Status ps =
             DecodeExperimentalSstSeekDirHeaderV1(content, &h, &header_bytes);
         if (ps.ok() && h.version == 1u && h.num_data_blocks > 0) {
-          const size_t offsets_bytes =
-              static_cast<size_t>(h.num_data_blocks + 1u) * 4u;
-          const size_t need = header_bytes + offsets_bytes;
-          if (need <= content.size()) {
-            rep_->experimental_sst_seek_dir_header = h;
-            rep_->experimental_sst_seek_dir_key_offsets =
-                content.data() + header_bytes;
-            rep_->experimental_sst_seek_dir_keys_blob =
-                rep_->experimental_sst_seek_dir_key_offsets + offsets_bytes;
-            rep_->experimental_sst_seek_dir_keys_bytes =
-                static_cast<uint32_t>(content.size() - need);
-            rep_->experimental_sst_seek_dir_available = true;
+          const bool no_offsets =
+              (h.flags & kExperimentalSstSeekDirFlagNoOffsets) != 0u;
+          if (no_offsets) {
+            const size_t need = header_bytes;
+            if (h.user_key_fixed_len > 0u && need <= content.size()) {
+              const size_t keys_bytes = content.size() - need;
+              const size_t expect_keys_bytes =
+                  static_cast<size_t>(h.num_data_blocks) *
+                  static_cast<size_t>(h.user_key_fixed_len);
+              if (keys_bytes == expect_keys_bytes && keys_bytes <= 0xFFFFFFFFu) {
+                rep_->experimental_sst_seek_dir_header = h;
+                rep_->experimental_sst_seek_dir_key_offsets = nullptr;
+                rep_->experimental_sst_seek_dir_keys_blob = content.data() + need;
+                rep_->experimental_sst_seek_dir_keys_bytes =
+                    static_cast<uint32_t>(keys_bytes);
+                rep_->experimental_sst_seek_dir_available = true;
+              }
+            }
+          } else {
+            const size_t offsets_bytes =
+                static_cast<size_t>(h.num_data_blocks + 1u) * 4u;
+            const size_t need = header_bytes + offsets_bytes;
+            if (need <= content.size() && (content.size() - need) <= 0xFFFFFFFFu) {
+              rep_->experimental_sst_seek_dir_header = h;
+              rep_->experimental_sst_seek_dir_key_offsets =
+                  content.data() + header_bytes;
+              rep_->experimental_sst_seek_dir_keys_blob =
+                  rep_->experimental_sst_seek_dir_key_offsets + offsets_bytes;
+              rep_->experimental_sst_seek_dir_keys_bytes =
+                  static_cast<uint32_t>(content.size() - need);
+              rep_->experimental_sst_seek_dir_available = true;
+            }
           }
         }
       }

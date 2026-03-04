@@ -19,6 +19,11 @@ namespace ROCKSDB_NAMESPACE {
 inline constexpr const char kExperimentalSstSeekDirMetaBlockName[] =
     "rocksdb.experimental.sst_seek_dir";
 
+// Header.flags bits.
+// When set, the meta block uses a fixed-len layout without offsets:
+//   [header][keys_blob], where keys_blob has (num_data_blocks * user_key_fixed_len) bytes.
+inline constexpr uint32_t kExperimentalSstSeekDirFlagNoOffsets = 1u << 0;
+
 // On-disk header (fixed-size, little endian).
 //
 // Layout of the meta block:
@@ -77,4 +82,3 @@ inline Status DecodeExperimentalSstSeekDirHeaderV1(
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

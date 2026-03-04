@@ -2656,22 +2656,50 @@ void BlockBasedTableBuilder::WriteExperimentalSstSeekDirBlock(
   h.num_data_blocks = num_data_blocks;
   h.user_key_fixed_len = r->experimental_sst_seek_dir_user_key_fixed_len;
 
+  bool use_no_offsets_layout = false;
+  if (h.user_key_fixed_len > 0u) {
+    const size_t fixed_len = static_cast<size_t>(h.user_key_fixed_len);
+    if (r->experimental_sst_seek_dir_keys.size() ==
+        static_cast<size_t>(num_data_blocks) * fixed_len) {
+      // Verify a handful of offsets to ensure the in-memory build state is
+      // consistent with the no-offsets fixed-len layout.
+      const uint32_t verify = std::min<uint32_t>(num_data_blocks, 8u);
+      bool ok = true;
+      for (uint32_t i = 0; i < verify; ++i) {
+        const uint32_t expect = static_cast<uint32_t>(i * fixed_len);
+        if (r->experimental_sst_seek_dir_key_offsets[i] != expect) {
+          ok = false;
+          break;
+        }
+      }
+      use_no_offsets_layout = ok;
+    }
+  }
+  if (use_no_offsets_layout) {
+    h.flags |= kExperimentalSstSeekDirFlagNoOffsets;
+  }
+
   std::string header_buf;
   EncodeExperimentalSstSeekDirHeaderV1(h, &header_buf);
 
   std::string out;
-  const size_t offsets_bytes =
-      static_cast<size_t>(num_data_blocks + 1u) * 4u;
-  out.reserve(header_buf.size() + offsets_bytes +
-              r->experimental_sst_seek_dir_keys.size());
-  out.append(header_buf);
-
-  for (uint32_t off : r->experimental_sst_seek_dir_key_offsets) {
-    PutFixed32(&out, off);
+  if (use_no_offsets_layout) {
+    out.reserve(header_buf.size() + r->experimental_sst_seek_dir_keys.size());
+    out.append(header_buf);
+    out.append(r->experimental_sst_seek_dir_keys);
+  } else {
+    const size_t offsets_bytes =
+        static_cast<size_t>(num_data_blocks + 1u) * 4u;
+    out.reserve(header_buf.size() + offsets_bytes +
+                r->experimental_sst_seek_dir_keys.size());
+    out.append(header_buf);
+    for (uint32_t off : r->experimental_sst_seek_dir_key_offsets) {
+      PutFixed32(&out, off);
+    }
+    PutFixed32(&out,
+               static_cast<uint32_t>(r->experimental_sst_seek_dir_keys.size()));
+    out.append(r->experimental_sst_seek_dir_keys);
   }
-  PutFixed32(&out,
-             static_cast<uint32_t>(r->experimental_sst_seek_dir_keys.size()));
-  out.append(r->experimental_sst_seek_dir_keys);
 
   BlockHandle seek_dir_handle;
   WriteMaybeCompressedBlock(out, kNoCompression, &seek_dir_handle,
@@ -2695,6 +2723,12 @@ void BlockBasedTableBuilder::WriteExperimentalSstSeekDirBlock(
       PutFixed32(&v, static_cast<uint32_t>(r->experimental_sst_seek_dir_keys.size()));
       r->props.user_collected_properties
           ["rocksdb.experimental.sst_seek_dir.keys_bytes"] = v;
+    }
+    {
+      std::string v;
+      PutFixed32(&v, use_no_offsets_layout ? 1u : 0u);
+      r->props.user_collected_properties
+          ["rocksdb.experimental.sst_seek_dir.no_offsets_layout"] = v;
     }
   }
 }

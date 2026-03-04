@@ -147,13 +147,27 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
       const bool is_bytewise =
           rep->internal_comparator.user_comparator() == BytewiseComparator();
       const uint32_t n = rep->experimental_sst_seek_dir_header.num_data_blocks;
-      const char* offs = rep->experimental_sst_seek_dir_key_offsets;
       const char* keys = rep->experimental_sst_seek_dir_keys_blob;
       const uint32_t keys_bytes = rep->experimental_sst_seek_dir_keys_bytes;
 
-      uint32_t fixed_len = rep->experimental_sst_seek_dir_header.user_key_fixed_len;
+      const uint32_t flags = rep->experimental_sst_seek_dir_header.flags;
+      const bool no_offsets =
+          (flags & kExperimentalSstSeekDirFlagNoOffsets) != 0u;
+      const char* offs = rep->experimental_sst_seek_dir_key_offsets;
+
+      uint32_t fixed_len =
+          rep->experimental_sst_seek_dir_header.user_key_fixed_len;
       bool direct_index = false;
-      if (is_bytewise && n > 0) {
+      bool valid_layout = true;
+      if (no_offsets) {
+        if (fixed_len > 0 &&
+            static_cast<uint64_t>(n) * fixed_len == keys_bytes) {
+          direct_index = true;
+        } else {
+          // Invalid layout; fall back to the normal index seek path.
+          valid_layout = false;
+        }
+      } else if (is_bytewise && n > 0) {
         if (fixed_len > 0) {
           direct_index = true;
         } else if (keys_bytes % n == 0) {
@@ -188,6 +202,9 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
           }
           return Slice(keys + s, fixed_len);
         }
+        if (UNLIKELY(offs == nullptr)) {
+          return Slice();
+        }
         const uint32_t s = DecodeFixed32(offs + static_cast<size_t>(i) * 4u);
         const uint32_t e =
             DecodeFixed32(offs + static_cast<size_t>(i + 1u) * 4u);
@@ -199,61 +216,86 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
 
       bool used = false;
       bool fallback = false;
-      uint32_t lo = 0, hi = n;
-      while (lo < hi) {
-        const uint32_t mid = lo + (hi - lo) / 2u;
-        const Slice boundary = key_at(mid);
-        if (UNLIKELY(boundary.data() == nullptr)) {
-          fallback = true;
-          break;
-        }
-        int cmp = 0;
-        if (is_bytewise) {
-          if (fixed_len > 0 && boundary.size() == fixed_len &&
-              target_user.size() == fixed_len) {
-            cmp = memcmp(boundary.data(), target_user.data(), fixed_len);
-          } else {
-            const size_t ncmp = std::min(boundary.size(), target_user.size());
-            cmp = (ncmp == 0) ? 0 : memcmp(boundary.data(), target_user.data(), ncmp);
-            if (cmp == 0 && boundary.size() != target_user.size()) {
-              cmp = (boundary.size() < target_user.size()) ? -1 : 1;
+      if (!valid_layout) {
+        used = false;
+        fallback = true;
+      } else {
+        uint32_t lo = 0, hi = n;
+        if (direct_index && is_bytewise && fixed_len > 0 &&
+            target_user.size() == fixed_len) {
+          // Fast path: fixed-len bytewise compare without Slice construction.
+          const char* const target_p = target_user.data();
+          while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2u;
+            const char* const boundary_p =
+                keys + static_cast<size_t>(mid) * fixed_len;
+            const int cmp = memcmp(boundary_p, target_p, fixed_len);
+            if (cmp < 0) {
+              lo = mid + 1u;
+            } else {
+              hi = mid;
             }
           }
         } else {
-          cmp = user_comparator_.Compare(boundary, target_user);
-        }
-        if (cmp < 0) {
-          lo = mid + 1u;
-        } else {
-          hi = mid;
-        }
-      }
-
-      if (!fallback) {
-        used = true;
-        if (lo >= n) {
-          // Target is beyond the max user key in this SST.
-          index_iter_->SeekToLast();
-          index_iter_->Next();  // make invalid (like Seek beyond last).
-          is_index_at_curr_block_ = true;
-          need_seek_index = false;
-          if (perf != nullptr) {
-            ++perf->experimental_sst_seek_dir_seek_hits;
+          while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2u;
+            const Slice boundary = key_at(mid);
+            if (UNLIKELY(boundary.data() == nullptr)) {
+              fallback = true;
+              break;
+            }
+            int cmp = 0;
+            if (is_bytewise) {
+              if (fixed_len > 0 && boundary.size() == fixed_len &&
+                  target_user.size() == fixed_len) {
+                cmp = memcmp(boundary.data(), target_user.data(), fixed_len);
+              } else {
+                const size_t ncmp =
+                    std::min(boundary.size(), target_user.size());
+                cmp = (ncmp == 0)
+                          ? 0
+                          : memcmp(boundary.data(), target_user.data(), ncmp);
+                if (cmp == 0 && boundary.size() != target_user.size()) {
+                  cmp = (boundary.size() < target_user.size()) ? -1 : 1;
+                }
+              }
+            } else {
+              cmp = user_comparator_.Compare(boundary, target_user);
+            }
+            if (cmp < 0) {
+              lo = mid + 1u;
+            } else {
+              hi = mid;
+            }
           }
         }
 
-        if (need_seek_index) {
-          auto* idx_iter = static_cast<IndexBlockIter*>(index_iter_.get());
-          idx_iter->SeekToRestartPoint(lo);
-          idx_iter->Next();
-          if (idx_iter->Valid()) {
+        if (!fallback) {
+          used = true;
+          if (lo >= n) {
+            // Target is beyond the max user key in this SST.
+            index_iter_->SeekToLast();
+            index_iter_->Next();  // make invalid (like Seek beyond last).
             is_index_at_curr_block_ = true;
             need_seek_index = false;
             if (perf != nullptr) {
               ++perf->experimental_sst_seek_dir_seek_hits;
             }
-          } else {
-            fallback = true;
+          }
+
+          if (need_seek_index) {
+            auto* idx_iter = static_cast<IndexBlockIter*>(index_iter_.get());
+            idx_iter->SeekToRestartPoint(lo);
+            idx_iter->Next();
+            if (idx_iter->Valid()) {
+              is_index_at_curr_block_ = true;
+              need_seek_index = false;
+              if (perf != nullptr) {
+                ++perf->experimental_sst_seek_dir_seek_hits;
+              }
+            } else {
+              fallback = true;
+            }
           }
         }
       }
