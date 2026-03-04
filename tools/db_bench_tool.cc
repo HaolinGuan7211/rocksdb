@@ -8635,7 +8635,12 @@ class Benchmark {
                      std::min(value.size(), sizeof(value_buffer)));
               bytes += single_iter->key().size() + single_iter->value().size();
               single_iter->Next();
-              assert(single_iter->status().ok());
+              if (!single_iter->status().ok()) {
+                fprintf(stderr, "mixgraph seek iterator error: %s\n",
+                        single_iter->status().ToString().c_str());
+                delete single_iter;
+                ErrorExit();
+              }
               total_scan_length++;
             }
           }
