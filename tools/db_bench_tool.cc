@@ -2851,6 +2851,12 @@ class TailProbeWriter {
               output_path_.c_str());
       return;
     }
+    // Use a large fully-buffered stdio buffer to reduce synchronization and
+    // syscall overhead in tail/sample probes. This significantly reduces
+    // measurement perturbation in seek-heavy benchmarks.
+    //
+    // Note: Passing nullptr requests libc to allocate its own buffer.
+    std::setvbuf(file_, nullptr, _IOFBF, kStdioBufferBytes);
     enabled_ = true;
     if (!has_data) {
       WriteHeader();
@@ -2957,7 +2963,12 @@ class TailProbeWriter {
     row.append(std::to_string(delta.simfs_injected_delay_ns));
     row.push_back('\n');
     std::fwrite(row.data(), 1, row.size(), file_);
-    std::fflush(file_);
+    // Avoid flushing on every record. Flush in batches to reduce tail probe
+    // overhead; always flush on destructor.
+    if (++pending_flush_records_ >= kFlushEveryRecords) {
+      pending_flush_records_ = 0;
+      std::fflush(file_);
+    }
     return true;
   }
 
@@ -3018,6 +3029,10 @@ class TailProbeWriter {
   std::atomic<uint64_t> dropped_samples_{0};
   std::mutex mu_;
   bool enabled_ = false;
+  uint64_t pending_flush_records_ = 0;
+
+  static constexpr size_t kStdioBufferBytes = 4u << 20;  // 4MiB
+  static constexpr uint64_t kFlushEveryRecords = 256;
 };
 
 enum OperationType : unsigned char {
