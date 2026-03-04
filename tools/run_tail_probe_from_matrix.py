@@ -475,6 +475,15 @@ def build_sample_row(
         "thread_id": to_int(tr.get("thread_id", 0)),
         "latency_us": latency_us,
         "threshold_us": threshold_us,
+        # IO amplification / fixed CPU cost signals (raw perf_context deltas).
+        "user_key_comparison_count": to_int(
+            tr.get("delta_user_key_comparison_count", 0)
+        ),
+        "block_cache_hit_count": to_int(tr.get("delta_block_cache_hit_count", 0)),
+        "block_read_count": to_int(tr.get("delta_block_read_count", 0)),
+        "block_read_bytes": to_int(tr.get("delta_block_read_byte", 0)),
+        "iter_seek_count": to_int(tr.get("delta_iter_seek_count", 0)),
+        "iter_read_bytes": to_int(tr.get("delta_iter_read_bytes", 0)),
         "stage_memtable_route_us": stage["memtable_route"],
         "stage_table_open_meta_us": stage["table_open_meta"],
         "stage_filter_maymatch_cpu_us": stage["filter_maymatch_cpu"],
