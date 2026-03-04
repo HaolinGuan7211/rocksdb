@@ -2344,6 +2344,15 @@ IOStatus SimulatedHybridFileSystem::NewRandomAccessFile(
     open_opts.use_direct_reads = false;
     open_opts.use_direct_writes = false;
   }
+  if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
+      (model_options_.xp_bypass_base_io || model_options_.xp_mmap_base_io)) {
+    // mmap-based reads rely on the page cache. Mixing mmap with O_DIRECT
+    // flush/compaction writes can yield stale page-cache contents and checksum
+    // mismatches. Force buffered IO for correctness when mmap-base-IO (or
+    // bypass-base-IO) is enabled.
+    open_opts.use_direct_reads = false;
+    open_opts.use_direct_writes = false;
+  }
   const uint64_t start_us = NowMicros();
   IOStatus s = target()->NewRandomAccessFile(real_path, open_opts, result, dbg);
   const uint64_t end_us = NowMicros();
@@ -2417,6 +2426,11 @@ IOStatus SimulatedHybridFileSystem::NewSequentialFile(
     open_opts.use_direct_reads = false;
     open_opts.use_direct_writes = false;
   }
+  if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
+      (model_options_.xp_bypass_base_io || model_options_.xp_mmap_base_io)) {
+    open_opts.use_direct_reads = false;
+    open_opts.use_direct_writes = false;
+  }
   const uint64_t start_us = NowMicros();
   IOStatus s = target()->NewSequentialFile(real_path, open_opts, result, dbg);
   const uint64_t end_us = NowMicros();
@@ -2469,6 +2483,11 @@ IOStatus SimulatedHybridFileSystem::NewWritableFile(
     open_opts.use_direct_reads = false;
     open_opts.use_direct_writes = false;
   }
+  if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
+      (model_options_.xp_bypass_base_io || model_options_.xp_mmap_base_io)) {
+    open_opts.use_direct_reads = false;
+    open_opts.use_direct_writes = false;
+  }
   const uint64_t start_us = NowMicros();
   s = target()->NewWritableFile(real_path, open_opts, result, dbg);
   const uint64_t end_us = NowMicros();
@@ -2515,6 +2534,11 @@ IOStatus SimulatedHybridFileSystem::ReopenWritableFile(
   }
   FileOptions open_opts = file_opts;
   if (IsTmpfsRedirectEnabled() && IsUnderTmpfsRoot(real_path)) {
+    open_opts.use_direct_reads = false;
+    open_opts.use_direct_writes = false;
+  }
+  if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
+      (model_options_.xp_bypass_base_io || model_options_.xp_mmap_base_io)) {
     open_opts.use_direct_reads = false;
     open_opts.use_direct_writes = false;
   }
@@ -2566,6 +2590,11 @@ IOStatus SimulatedHybridFileSystem::ReuseWritableFile(
   }
   FileOptions open_opts = file_opts;
   if (IsTmpfsRedirectEnabled() && IsUnderTmpfsRoot(new_real)) {
+    open_opts.use_direct_reads = false;
+    open_opts.use_direct_writes = false;
+  }
+  if ((model_options_.use_xp_model || model_options_.use_dimm_model) &&
+      (model_options_.xp_bypass_base_io || model_options_.xp_mmap_base_io)) {
     open_opts.use_direct_reads = false;
     open_opts.use_direct_writes = false;
   }
