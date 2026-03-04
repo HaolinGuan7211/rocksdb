@@ -27,6 +27,7 @@
 #include "table/block_based/cachable_entry.h"
 #include "table/block_based/filter_block.h"
 #include "table/block_based/sst_hash_index_format.h"
+#include "table/block_based/sst_seek_dir_format.h"
 #include "table/block_based/uncompression_dict_reader.h"
 #include "table/format.h"
 #include "table/persistent_cache_options.h"
@@ -729,6 +730,17 @@ struct BlockBasedTable::Rep {
   const char* experimental_sst_hash_index_block_dir = nullptr;
   const char* experimental_sst_hash_index_slots = nullptr;
   uint32_t experimental_sst_hash_index_slots_mask = 0;
+
+  // EXPERIMENTAL: Per-SST Seek() directory meta block.
+  // When available and enabled, it can accelerate iterator Seek-heavy paths by
+  // mapping target user key to a candidate data-block id via binary search
+  // over per-data-block boundary keys.
+  CachableEntry<Block_kUserDefinedIndex> experimental_sst_seek_dir_block;
+  bool experimental_sst_seek_dir_available = false;
+  ExperimentalSstSeekDirHeaderV1 experimental_sst_seek_dir_header;
+  const char* experimental_sst_seek_dir_key_offsets = nullptr;
+  const char* experimental_sst_seek_dir_keys_blob = nullptr;
+  uint32_t experimental_sst_seek_dir_keys_bytes = 0;
 
   SequenceNumber get_global_seqno(BlockType block_type) const {
     return (block_type == BlockType::kFilterPartitionIndex ||

@@ -1267,6 +1267,51 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
     return s;
   }
 
+  // Optional experimental per-SST Seek() directory meta block.
+  if (table_options.experimental_sst_seek_dir_enable) {
+    BlockHandle sst_seek_dir_handle;
+    s = FindOptionalMetaBlock(meta_iter, kExperimentalSstSeekDirMetaBlockName,
+                              &sst_seek_dir_handle);
+    if (!s.ok()) {
+      return s;
+    }
+    if (sst_seek_dir_handle.size() > 0) {
+      const bool use_cache_for_seek_dir =
+          table_options.experimental_sst_seek_dir_pin
+              ? table_options.cache_index_and_filter_blocks
+              : false;
+
+      Status sd = RetrieveBlock(
+          prefetch_buffer, ro, sst_seek_dir_handle, rep_->decompressor.get(),
+          &rep_->experimental_sst_seek_dir_block, /*get_context=*/nullptr,
+          lookup_context, /*for_compaction=*/false, use_cache_for_seek_dir,
+          /*async_read=*/false, /*use_block_cache_for_lookup=*/false);
+      if (sd.ok() && !rep_->experimental_sst_seek_dir_block.IsEmpty()) {
+        const Slice content =
+            rep_->experimental_sst_seek_dir_block.GetValue()->ContentSlice();
+        size_t header_bytes = 0;
+        ExperimentalSstSeekDirHeaderV1 h;
+        Status ps =
+            DecodeExperimentalSstSeekDirHeaderV1(content, &h, &header_bytes);
+        if (ps.ok() && h.version == 1u && h.num_data_blocks > 0) {
+          const size_t offsets_bytes =
+              static_cast<size_t>(h.num_data_blocks + 1u) * 4u;
+          const size_t need = header_bytes + offsets_bytes;
+          if (need <= content.size()) {
+            rep_->experimental_sst_seek_dir_header = h;
+            rep_->experimental_sst_seek_dir_key_offsets =
+                content.data() + header_bytes;
+            rep_->experimental_sst_seek_dir_keys_blob =
+                rep_->experimental_sst_seek_dir_key_offsets + offsets_bytes;
+            rep_->experimental_sst_seek_dir_keys_bytes =
+                static_cast<uint32_t>(content.size() - need);
+            rep_->experimental_sst_seek_dir_available = true;
+          }
+        }
+      }
+    }
+  }
+
   // Optional experimental per-SST hash index meta block.
   if (table_options.experimental_sst_hash_index_enable) {
     BlockHandle sst_hash_index_handle;

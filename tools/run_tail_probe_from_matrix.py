@@ -509,6 +509,16 @@ def build_sample_row(
         "sst_hash_get_slot_probes": to_int(
             tr.get("delta_experimental_sst_hash_index_get_slot_probes", 0)
         ),
+        # EXPERIMENTAL: SSTSeekDir counters.
+        "sst_seek_dir_seek_lookups": to_int(
+            tr.get("delta_experimental_sst_seek_dir_seek_lookups", 0)
+        ),
+        "sst_seek_dir_seek_hits": to_int(
+            tr.get("delta_experimental_sst_seek_dir_seek_hits", 0)
+        ),
+        "sst_seek_dir_seek_fallbacks": to_int(
+            tr.get("delta_experimental_sst_seek_dir_seek_fallbacks", 0)
+        ),
         "stage_memtable_route_us": stage["memtable_route"],
         "stage_table_open_meta_us": stage["table_open_meta"],
         "stage_filter_maymatch_cpu_us": stage["filter_maymatch_cpu"],

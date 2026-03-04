@@ -131,6 +131,9 @@ struct PerfContextByLevelInt {
   defCmd(experimental_sst_hash_index_get_hits)     \
   defCmd(experimental_sst_hash_index_get_fallbacks)\
   defCmd(experimental_sst_hash_index_get_slot_probes)\
+  defCmd(experimental_sst_seek_dir_seek_lookups)   \
+  defCmd(experimental_sst_seek_dir_seek_hits)      \
+  defCmd(experimental_sst_seek_dir_seek_fallbacks) \
   defCmd(key_lock_wait_time)                       \
   defCmd(key_lock_wait_count)                      \
   defCmd(env_new_sequential_file_nanos)            \

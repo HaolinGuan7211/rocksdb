@@ -787,6 +787,18 @@ DEFINE_bool(
     "EXPERIMENTAL: pin the per-SST hash index meta block for the lifetime of "
     "the table reader to avoid extra reads on lookups.");
 
+DEFINE_bool(experimental_sst_seek_dir_enable, false,
+            "EXPERIMENTAL: write a per-SST seek directory meta block and use it "
+            "to accelerate Iterator::Seek by mapping user keys to candidate "
+            "data-block ids via binary search, avoiding index block seeks on "
+            "Seek-heavy workloads.");
+
+DEFINE_bool(
+    experimental_sst_seek_dir_pin,
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions().experimental_sst_seek_dir_pin,
+    "EXPERIMENTAL: pin the per-SST seek directory meta block for the lifetime "
+    "of the table reader to avoid extra reads.");
+
 DEFINE_int64(compressed_cache_size, -1,
              "Number of bytes to use as a cache of compressed data.");
 
@@ -2550,6 +2562,11 @@ struct TailProbeSnapshot {
   uint64_t experimental_sst_hash_index_get_fallbacks = 0;
   uint64_t experimental_sst_hash_index_get_slot_probes = 0;
 
+  // EXPERIMENTAL: SSTSeekDir counters.
+  uint64_t experimental_sst_seek_dir_seek_lookups = 0;
+  uint64_t experimental_sst_seek_dir_seek_hits = 0;
+  uint64_t experimental_sst_seek_dir_seek_fallbacks = 0;
+
   uint64_t io_bytes_read = 0;
   uint64_t io_read_nanos = 0;
   uint64_t io_cpu_read_nanos = 0;
@@ -2638,6 +2655,12 @@ static TailProbeSnapshot CaptureTailProbeSnapshot() {
         perf->experimental_sst_hash_index_get_fallbacks;
     out.experimental_sst_hash_index_get_slot_probes =
         perf->experimental_sst_hash_index_get_slot_probes;
+    out.experimental_sst_seek_dir_seek_lookups =
+        perf->experimental_sst_seek_dir_seek_lookups;
+    out.experimental_sst_seek_dir_seek_hits =
+        perf->experimental_sst_seek_dir_seek_hits;
+    out.experimental_sst_seek_dir_seek_fallbacks =
+        perf->experimental_sst_seek_dir_seek_fallbacks;
   }
   if (io != nullptr) {
     out.io_bytes_read = io->bytes_read;
@@ -2742,6 +2765,15 @@ static TailProbeSnapshot DeltaTailProbeSnapshot(const TailProbeSnapshot& current
   delta.experimental_sst_hash_index_get_slot_probes = SafeDelta(
       current.experimental_sst_hash_index_get_slot_probes,
       prev.experimental_sst_hash_index_get_slot_probes);
+  delta.experimental_sst_seek_dir_seek_lookups =
+      SafeDelta(current.experimental_sst_seek_dir_seek_lookups,
+                prev.experimental_sst_seek_dir_seek_lookups);
+  delta.experimental_sst_seek_dir_seek_hits =
+      SafeDelta(current.experimental_sst_seek_dir_seek_hits,
+                prev.experimental_sst_seek_dir_seek_hits);
+  delta.experimental_sst_seek_dir_seek_fallbacks =
+      SafeDelta(current.experimental_sst_seek_dir_seek_fallbacks,
+                prev.experimental_sst_seek_dir_seek_fallbacks);
 
   delta.io_bytes_read = SafeDelta(current.io_bytes_read, prev.io_bytes_read);
   delta.io_read_nanos = SafeDelta(current.io_read_nanos, prev.io_read_nanos);
@@ -2867,6 +2899,9 @@ class TailProbeWriter {
     append_u64(&row, delta.experimental_sst_hash_index_get_hits);
     append_u64(&row, delta.experimental_sst_hash_index_get_fallbacks);
     append_u64(&row, delta.experimental_sst_hash_index_get_slot_probes);
+    append_u64(&row, delta.experimental_sst_seek_dir_seek_lookups);
+    append_u64(&row, delta.experimental_sst_seek_dir_seek_hits);
+    append_u64(&row, delta.experimental_sst_seek_dir_seek_fallbacks);
     append_u64(&row, delta.io_bytes_read);
     append_u64(&row, delta.io_read_nanos);
     append_u64(&row, delta.io_cpu_read_nanos);
@@ -2913,6 +2948,9 @@ class TailProbeWriter {
         "delta_experimental_sst_hash_index_get_hits,"
         "delta_experimental_sst_hash_index_get_fallbacks,"
         "delta_experimental_sst_hash_index_get_slot_probes,"
+        "delta_experimental_sst_seek_dir_seek_lookups,"
+        "delta_experimental_sst_seek_dir_seek_hits,"
+        "delta_experimental_sst_seek_dir_seek_fallbacks,"
         "delta_io_bytes_read,delta_io_read_nanos,delta_io_cpu_read_nanos,"
         "delta_io_bytes_written,delta_io_write_nanos,"
         "delta_simfs_base_read_ns,"
@@ -5666,6 +5704,10 @@ class Benchmark {
           FLAGS_experimental_sst_hash_index_fingerprint_bits;
       block_based_options.experimental_sst_hash_index_pin =
           FLAGS_experimental_sst_hash_index_pin;
+      block_based_options.experimental_sst_seek_dir_enable =
+          FLAGS_experimental_sst_seek_dir_enable;
+      block_based_options.experimental_sst_seek_dir_pin =
+          FLAGS_experimental_sst_seek_dir_pin;
       if (FLAGS_read_cache_path != "") {
         Status rc_status;
 

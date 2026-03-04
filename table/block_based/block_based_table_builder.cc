@@ -48,6 +48,7 @@
 #include "table/block_based/full_filter_block.h"
 #include "table/block_based/partitioned_filter_block.h"
 #include "table/block_based/sst_hash_index_format.h"
+#include "table/block_based/sst_seek_dir_format.h"
 #include "table/block_based/user_defined_index_wrapper.h"
 #include "table/format.h"
 #include "table/meta_blocks.h"
@@ -1004,6 +1005,16 @@ struct BlockBasedTableBuilder::Rep {
   std::vector<ExperimentalSstHashIndexEntry> experimental_sst_hash_entries;
   std::vector<BlockHandle> experimental_sst_hash_block_dir;
 
+  // EXPERIMENTAL: per-SST seek directory build state (one boundary user key per
+  // data block). Intended for Seek-heavy workloads where exact-key hashing has
+  // low hit-rate. The directory is written as a meta block.
+  bool experimental_sst_seek_dir_enabled = false;
+  std::string experimental_sst_seek_dir_prev_last_user_key;
+  uint32_t experimental_sst_seek_dir_user_key_fixed_len = 0;
+  bool experimental_sst_seek_dir_user_key_fixed_len_disabled = false;
+  std::vector<uint32_t> experimental_sst_seek_dir_key_offsets;
+  std::string experimental_sst_seek_dir_keys;
+
   GrowableBuffer single_threaded_compressed_output;
   std::unique_ptr<FlushBlockPolicy> flush_block_policy;
 
@@ -1411,6 +1422,16 @@ struct BlockBasedTableBuilder::Rep {
         table_options.experimental_sst_hash_index_enable &&
         (table_options.experimental_sst_hash_index_fingerprint_bits == 16u) &&
         (ts_sz == 0) && (state == State::kUnbuffered) &&
+        !tbo.internal_comparator.user_comparator()
+             ->CanKeysWithDifferentByteContentsBeEqual();
+
+    experimental_sst_seek_dir_enabled =
+        table_options.experimental_sst_seek_dir_enable && (ts_sz == 0) &&
+        (state == State::kUnbuffered) &&
+        (table_options.index_type == BlockBasedTableOptions::kBinarySearch ||
+         table_options.index_type ==
+             BlockBasedTableOptions::kBinarySearchWithFirstKey) &&
+        (table_options.index_block_restart_interval == 1) &&
         !tbo.internal_comparator.user_comparator()
              ->CanKeysWithDifferentByteContentsBeEqual();
   }
@@ -1896,6 +1917,52 @@ void BlockBasedTableBuilder::EmitBlock(std::string& uncompressed,
       }
       r->experimental_sst_hash_current_block_entries.clear();
       r->experimental_sst_hash_entry_idx_in_block = 0;
+    }
+    if (UNLIKELY(r->experimental_sst_seek_dir_enabled)) {
+      const Slice last_user_key =
+          ExtractUserKeyAndStripTimestamp(last_key_in_current_block, r->ts_sz);
+      if (!r->experimental_sst_seek_dir_prev_last_user_key.empty()) {
+        const Slice prev(r->experimental_sst_seek_dir_prev_last_user_key);
+        if (r->internal_comparator.user_comparator()->Compare(
+                prev, last_user_key) > 0) {
+          // Give up on building the directory for this file (unexpected key
+          // order).
+          r->experimental_sst_seek_dir_enabled = false;
+          r->experimental_sst_seek_dir_prev_last_user_key.clear();
+          r->experimental_sst_seek_dir_user_key_fixed_len = 0;
+          r->experimental_sst_seek_dir_user_key_fixed_len_disabled = false;
+          r->experimental_sst_seek_dir_key_offsets.clear();
+          r->experimental_sst_seek_dir_keys.clear();
+        }
+      }
+      if (LIKELY(r->experimental_sst_seek_dir_enabled)) {
+        const size_t cur = r->experimental_sst_seek_dir_keys.size();
+        const size_t add = last_user_key.size();
+        if (UNLIKELY(cur > 0xFFFFFFFFu || add > 0xFFFFFFFFu ||
+                     cur + add > 0xFFFFFFFFu)) {
+          r->experimental_sst_seek_dir_enabled = false;
+          r->experimental_sst_seek_dir_prev_last_user_key.clear();
+          r->experimental_sst_seek_dir_user_key_fixed_len = 0;
+          r->experimental_sst_seek_dir_user_key_fixed_len_disabled = false;
+          r->experimental_sst_seek_dir_key_offsets.clear();
+          r->experimental_sst_seek_dir_keys.clear();
+        } else {
+          r->experimental_sst_seek_dir_key_offsets.push_back(
+              static_cast<uint32_t>(cur));
+          r->experimental_sst_seek_dir_keys.append(last_user_key.data(), add);
+          r->experimental_sst_seek_dir_prev_last_user_key.assign(
+              last_user_key.data(), add);
+          if (!r->experimental_sst_seek_dir_user_key_fixed_len_disabled) {
+            if (r->experimental_sst_seek_dir_user_key_fixed_len == 0) {
+              r->experimental_sst_seek_dir_user_key_fixed_len =
+                  static_cast<uint32_t>(add);
+            } else if (r->experimental_sst_seek_dir_user_key_fixed_len != add) {
+              r->experimental_sst_seek_dir_user_key_fixed_len = 0;
+              r->experimental_sst_seek_dir_user_key_fixed_len_disabled = true;
+            }
+          }
+        }
+      }
     }
     // We do not emit the index entry for a block until we have seen the
     // first key for the next data block.  This allows us to use shorter
@@ -2544,6 +2611,94 @@ void BlockBasedTableBuilder::WriteIndexBlock(
   }
 }
 
+void BlockBasedTableBuilder::WriteExperimentalSstSeekDirBlock(
+    MetaIndexBuilder* meta_index_builder) {
+  Rep* r = rep_.get();
+  {
+    std::string v;
+    PutFixed32(&v, r->table_options.experimental_sst_seek_dir_enable ? 1u : 0u);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_seek_dir.enable_requested"] = v;
+  }
+  if (meta_index_builder == nullptr) {
+    return;
+  }
+  if (UNLIKELY(!ok())) {
+    return;
+  }
+  if (!r->experimental_sst_seek_dir_enabled) {
+    std::string v;
+    PutFixed32(&v, 0u);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_seek_dir.enabled_for_file"] = v;
+    return;
+  }
+  {
+    std::string v;
+    PutFixed32(&v, 1u);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_seek_dir.enabled_for_file"] = v;
+  }
+
+  const uint32_t num_data_blocks =
+      static_cast<uint32_t>(r->experimental_sst_seek_dir_key_offsets.size());
+  if (num_data_blocks == 0) {
+    std::string v;
+    PutFixed32(&v, 0u);
+    r->props.user_collected_properties["rocksdb.experimental.sst_seek_dir.built"] =
+        v;
+    return;
+  }
+
+  ExperimentalSstSeekDirHeaderV1 h;
+  h.version = 1u;
+  h.flags = 0u;
+  h.num_data_blocks = num_data_blocks;
+  h.user_key_fixed_len = r->experimental_sst_seek_dir_user_key_fixed_len;
+
+  std::string header_buf;
+  EncodeExperimentalSstSeekDirHeaderV1(h, &header_buf);
+
+  std::string out;
+  const size_t offsets_bytes =
+      static_cast<size_t>(num_data_blocks + 1u) * 4u;
+  out.reserve(header_buf.size() + offsets_bytes +
+              r->experimental_sst_seek_dir_keys.size());
+  out.append(header_buf);
+
+  for (uint32_t off : r->experimental_sst_seek_dir_key_offsets) {
+    PutFixed32(&out, off);
+  }
+  PutFixed32(&out,
+             static_cast<uint32_t>(r->experimental_sst_seek_dir_keys.size()));
+  out.append(r->experimental_sst_seek_dir_keys);
+
+  BlockHandle seek_dir_handle;
+  WriteMaybeCompressedBlock(out, kNoCompression, &seek_dir_handle,
+                            BlockType::kUserDefinedIndex);
+  if (LIKELY(ok())) {
+    meta_index_builder->Add(kExperimentalSstSeekDirMetaBlockName, seek_dir_handle);
+    {
+      std::string v;
+      PutFixed32(&v, 1u);
+      r->props.user_collected_properties
+          ["rocksdb.experimental.sst_seek_dir.built"] = v;
+    }
+    {
+      std::string v;
+      PutFixed32(&v, num_data_blocks);
+      r->props.user_collected_properties
+          ["rocksdb.experimental.sst_seek_dir.num_data_blocks"] = v;
+    }
+    {
+      std::string v;
+      PutFixed32(&v, static_cast<uint32_t>(r->experimental_sst_seek_dir_keys.size()));
+      r->props.user_collected_properties
+          ["rocksdb.experimental.sst_seek_dir.keys_bytes"] = v;
+    }
+  }
+}
+
 void BlockBasedTableBuilder::WriteExperimentalSstHashIndexBlock(
     MetaIndexBuilder* meta_index_builder) {
   Rep* r = rep_.get();
@@ -3060,16 +3215,18 @@ Status BlockBasedTableBuilder::Finish() {
   // Write meta blocks, metaindex block and footer in the following order.
   //    1. [meta block: filter]
   //    2. [meta block: index]
-  //    3. [meta block: experimental sst_hash_index (optional)]
-  //    4. [meta block: compression dictionary]
-  //    5. [meta block: range deletion tombstone]
-  //    6. [meta block: properties]
-  //    7. [metaindex block]
-  //    8. Footer
+  //    3. [meta block: experimental sst_seek_dir (optional)]
+  //    4. [meta block: experimental sst_hash_index (optional)]
+  //    5. [meta block: compression dictionary]
+  //    6. [meta block: range deletion tombstone]
+  //    7. [meta block: properties]
+  //    8. [metaindex block]
+  //    9. Footer
   BlockHandle metaindex_block_handle, index_block_handle;
   MetaIndexBuilder meta_index_builder;
   WriteFilterBlock(&meta_index_builder);
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
+  WriteExperimentalSstSeekDirBlock(&meta_index_builder);
   WriteExperimentalSstHashIndexBlock(&meta_index_builder);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);

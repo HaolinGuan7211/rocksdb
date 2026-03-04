@@ -252,6 +252,11 @@ struct PerfContextBase {
   uint64_t experimental_sst_hash_index_get_fallbacks;
   uint64_t experimental_sst_hash_index_get_slot_probes;
 
+  // EXPERIMENTAL: per-SST Seek() directory counters.
+  uint64_t experimental_sst_seek_dir_seek_lookups;
+  uint64_t experimental_sst_seek_dir_seek_hits;
+  uint64_t experimental_sst_seek_dir_seek_fallbacks;
+
   // Time spent waiting on key locks in transaction lock manager.
   // This metric gets collected starting from
   // PerfLevel::kEnableTimeExceptForMutex

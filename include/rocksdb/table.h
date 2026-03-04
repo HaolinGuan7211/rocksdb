@@ -280,6 +280,18 @@ struct BlockBasedTableOptions {
   // reader to avoid extra reads on lookups.
   bool experimental_sst_hash_index_pin = true;
 
+  // EXPERIMENTAL: Per-SST seek directory meta block.
+  //
+  // When enabled, the table builder writes a compact per-data-block directory
+  // of boundary user keys (one key per data block). The table iterator can use
+  // it to binary-search block id by user key and position the index iterator
+  // with O(1) restart access (requires index_block_restart_interval == 1),
+  // avoiding comparator-heavy index seeks on Seek-heavy workloads.
+  bool experimental_sst_seek_dir_enable = false;
+  // If true, pin the seek directory meta block for the lifetime of the table
+  // reader to avoid extra reads.
+  bool experimental_sst_seek_dir_pin = true;
+
   // The index type that will be used for the data block.
   enum DataBlockIndexType : char {
     kDataBlockBinarySearch = 0,   // traditional block type
