@@ -257,38 +257,89 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
           if (perf != nullptr && use_predecoded_prefix_u64) {
             ++perf->experimental_sst_seek_dir_seek_used_predecoded_prefix_u64;
           }
-          while (lo < hi) {
-            const uint32_t mid = lo + (hi - lo) / 2u;
-            const char* const boundary_p =
-                keys + static_cast<size_t>(mid) * fixed_len;
-            int cmp = 0;
-            if (use_predecoded_prefix_u64) {
-              const uint64_t boundary_be64 =
-                  rep->experimental_sst_seek_dir_keys_prefix_u64[mid];
-              cmp = (boundary_be64 < target_be64)
-                        ? -1
-                        : (boundary_be64 > target_be64) ? 1 : 0;
-              cmp_bytes += 8u;
-            } else if (can_compare_8b) {
-              uint64_t boundary_be64 = 0;
-              std::memcpy(&boundary_be64, boundary_p, sizeof(boundary_be64));
-              if (port::kLittleEndian) {
-                boundary_be64 = EndianSwapValue(boundary_be64);
+          if (use_predecoded_prefix_u64) {
+            // Interpolation + bounded binary search on numeric key ids.
+            //
+            // In typical db_bench fillseq setups, user keys are essentially an
+            // increasing 64-bit id with a constant suffix. Boundary keys are
+            // sampled from those ids, so we can often estimate the correct
+            // block id with a very small window search, reducing the number of
+            // comparisons per lookup.
+            const auto& prefixes = rep->experimental_sst_seek_dir_keys_prefix_u64;
+            if (UNLIKELY(prefixes.empty())) {
+              fallback = true;
+            } else {
+              uint32_t lo2 = 0;
+              uint32_t hi2 = n;
+              const uint64_t first = prefixes.front();
+              const uint64_t last = prefixes.back();
+              if (target_be64 <= first) {
+                lo2 = 0;
+                hi2 = 0;
+              } else if (target_be64 > last) {
+                lo2 = n;
+                hi2 = n;
+              } else if (last > first) {
+                const uint64_t span = last - first;
+                const uint64_t rel = target_be64 - first;
+                const uint32_t guess = static_cast<uint32_t>(
+                    (static_cast<__int128>(rel) * static_cast<__int128>(n - 1u)) /
+                    static_cast<__int128>(span));
+                constexpr uint32_t kWindow = 32u;
+                lo2 = (guess > kWindow) ? (guess - kWindow) : 0u;
+                hi2 = std::min<uint32_t>(n, guess + kWindow + 1u);
+                // If the estimate is wildly off (e.g., due to skew), fall back
+                // to full-range binary search to preserve correctness.
+                if (UNLIKELY(target_be64 < prefixes[lo2] ||
+                             target_be64 > prefixes[hi2 - 1u])) {
+                  lo2 = 0;
+                  hi2 = n;
+                }
               }
-              cmp = (boundary_be64 < target_be64) ? -1
-                                                  : (boundary_be64 > target_be64)
-                                                        ? 1
-                                                        : 0;
-              cmp_bytes += 8u;
-            } else {
-              cmp = memcmp(boundary_p, target_p, fixed_len);
-              cmp_bytes += fixed_len;
+
+              lo = lo2;
+              hi = hi2;
+              while (lo < hi) {
+                const uint32_t mid = lo + (hi - lo) / 2u;
+                const uint64_t boundary_be64 = prefixes[mid];
+                const int cmp = (boundary_be64 < target_be64)
+                                    ? -1
+                                    : (boundary_be64 > target_be64) ? 1 : 0;
+                cmp_bytes += 8u;
+                ++binary_steps;
+                if (cmp < 0) {
+                  lo = mid + 1u;
+                } else {
+                  hi = mid;
+                }
+              }
             }
-            ++binary_steps;
-            if (cmp < 0) {
-              lo = mid + 1u;
-            } else {
-              hi = mid;
+          } else {
+            while (lo < hi) {
+              const uint32_t mid = lo + (hi - lo) / 2u;
+              const char* const boundary_p =
+                  keys + static_cast<size_t>(mid) * fixed_len;
+              int cmp = 0;
+              if (can_compare_8b) {
+                uint64_t boundary_be64 = 0;
+                std::memcpy(&boundary_be64, boundary_p, sizeof(boundary_be64));
+                if (port::kLittleEndian) {
+                  boundary_be64 = EndianSwapValue(boundary_be64);
+                }
+                cmp = (boundary_be64 < target_be64)
+                          ? -1
+                          : (boundary_be64 > target_be64) ? 1 : 0;
+                cmp_bytes += 8u;
+              } else {
+                cmp = memcmp(boundary_p, target_p, fixed_len);
+                cmp_bytes += fixed_len;
+              }
+              ++binary_steps;
+              if (cmp < 0) {
+                lo = mid + 1u;
+              } else {
+                hi = mid;
+              }
             }
           }
         } else {
