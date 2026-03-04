@@ -140,6 +140,10 @@ struct PerfContextByLevelInt {
   defCmd(experimental_sst_seek_dir_seek_layout_no_offsets) \
   defCmd(experimental_sst_seek_dir_seek_used_direct_index) \
   defCmd(experimental_sst_seek_dir_seek_used_predecoded_prefix_u64) \
+  defCmd(experimental_global_seek_dir_seek_lookups) \
+  defCmd(experimental_global_seek_dir_seek_hits) \
+  defCmd(experimental_global_seek_dir_seek_fallbacks) \
+  defCmd(experimental_global_seek_dir_seek_candidate_files_sum) \
   defCmd(key_lock_wait_time)                       \
   defCmd(key_lock_wait_count)                      \
   defCmd(env_new_sequential_file_nanos)            \

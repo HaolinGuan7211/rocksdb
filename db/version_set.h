@@ -20,6 +20,7 @@
 
 #pragma once
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <limits>
 #include <map>
@@ -129,6 +130,23 @@ enum EpochNumberRequirement {
 // compaction, blob files, etc.
 class VersionStorageInfo {
  public:
+  struct ExperimentalGlobalSeekDirLevel {
+    bool valid = false;
+    uint8_t bucket_bits = 0;
+    std::vector<uint32_t> first_file_index;
+    std::vector<uint32_t> last_file_index_plus1;
+  };
+
+  VersionStorageInfo(const InternalKeyComparator* internal_comparator,
+                     const Comparator* user_comparator, int num_levels,
+                     CompactionStyle compaction_style,
+                     VersionStorageInfo* src_vstorage,
+                     bool experimental_global_seek_dir_enable,
+                     bool _force_consistency_checks,
+                     EpochNumberRequirement epoch_number_requirement,
+                     SystemClock* clock,
+                     uint32_t bottommost_file_compaction_delay,
+                     OffpeakTimeOption offpeak_time_option);
   VersionStorageInfo(const InternalKeyComparator* internal_comparator,
                      const Comparator* user_comparator, int num_levels,
                      CompactionStyle compaction_style,
@@ -137,7 +155,14 @@ class VersionStorageInfo {
                      EpochNumberRequirement epoch_number_requirement,
                      SystemClock* clock,
                      uint32_t bottommost_file_compaction_delay,
-                     OffpeakTimeOption offpeak_time_option);
+                     OffpeakTimeOption offpeak_time_option)
+      : VersionStorageInfo(
+            internal_comparator, user_comparator, num_levels, compaction_style,
+            src_vstorage,
+            /*experimental_global_seek_dir_enable=*/false,
+            _force_consistency_checks, epoch_number_requirement, clock,
+            bottommost_file_compaction_delay,
+            std::move(offpeak_time_option)) {}
   // No copying allowed
   VersionStorageInfo(const VersionStorageInfo&) = delete;
   void operator=(const VersionStorageInfo&) = delete;
@@ -465,6 +490,16 @@ class VersionStorageInfo {
     return level_files_brief_[level];
   }
 
+  const ExperimentalGlobalSeekDirLevel* ExperimentalGlobalSeekDirLevelFor(
+      int level) const {
+    if (!finalized_ || level < 0 || level >= num_non_empty_levels_ ||
+        level >= static_cast<int>(experimental_global_seek_dir_.size())) {
+      return nullptr;
+    }
+    const auto& dir = experimental_global_seek_dir_[level];
+    return dir.valid ? &dir : nullptr;
+  }
+
   // REQUIRES: PrepareForVersionAppend has been called
   const std::vector<int>& FilesByCompactionPri(int level) const {
     assert(finalized_);
@@ -655,6 +690,7 @@ class VersionStorageInfo {
   }
 
   void GenerateLevelFilesBrief();
+  void GenerateExperimentalGlobalSeekDir();
   void GenerateLevel0NonOverlapping();
   void GenerateBottommostFiles();
   void GenerateFileLocationIndex();
@@ -669,6 +705,9 @@ class VersionStorageInfo {
 
   // A short brief metadata of files per level
   autovector<ROCKSDB_NAMESPACE::LevelFilesBrief> level_files_brief_;
+  std::vector<ExperimentalGlobalSeekDirLevel> experimental_global_seek_dir_;
+  bool experimental_global_seek_dir_enable_;
+  static constexpr uint8_t kExperimentalGlobalSeekDirBucketBits = 12;
   FileIndexer file_indexer_;
   Arena arena_;  // Used to allocate space for file_levels_
 

@@ -273,6 +273,17 @@ struct PerfContextBase {
   // (numeric compare on the first 8 bytes of 16B keys with suffix "00000000").
   uint64_t experimental_sst_seek_dir_seek_used_predecoded_prefix_u64;
 
+  // EXPERIMENTAL: global seek directory (cross-SST candidate narrowing).
+  // lookup: number of reseek attempts that consulted the global directory.
+  // hit: directory provided a narrowed range that directly found the file.
+  // fallback: lookup performed but fell back to full-range FindFile().
+  // candidate_files_sum: total number of candidate files considered when
+  // directory narrowing was applicable.
+  uint64_t experimental_global_seek_dir_seek_lookups;
+  uint64_t experimental_global_seek_dir_seek_hits;
+  uint64_t experimental_global_seek_dir_seek_fallbacks;
+  uint64_t experimental_global_seek_dir_seek_candidate_files_sum;
+
   // Time spent waiting on key locks in transaction lock manager.
   // This metric gets collected starting from
   // PerfLevel::kEnableTimeExceptForMutex

@@ -60,6 +60,7 @@
 #include "options/options_helper.h"
 #include "rocksdb/env.h"
 #include "rocksdb/merge_operator.h"
+#include "rocksdb/table.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/format.h"
 #include "table/get_context.h"
@@ -97,6 +98,28 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 
 using ScanOptionsMap = std::unordered_map<size_t, MultiScanArgs>;
+
+inline bool ExperimentalGlobalSeekDirComputeBucket(const Slice& user_key,
+                                                   uint8_t bucket_bits,
+                                                   uint32_t* bucket) {
+  if (bucket == nullptr || bucket_bits == 0 || bucket_bits > 24) {
+    return false;
+  }
+  const uint8_t bytes = static_cast<uint8_t>((bucket_bits + 7u) / 8u);
+  uint32_t prefix = 0;
+  for (uint8_t i = 0; i < bytes; ++i) {
+    prefix <<= 8;
+    if (i < user_key.size()) {
+      prefix |= static_cast<uint8_t>(user_key[i]);
+    }
+  }
+  const uint8_t extra = static_cast<uint8_t>(bytes * 8u - bucket_bits);
+  if (extra > 0) {
+    prefix >>= extra;
+  }
+  *bucket = prefix;
+  return true;
+}
 
 // Find File in LevelFilesBrief data structure
 // Within an index range defined by left and right
@@ -977,6 +1000,8 @@ class LevelIterator final : public InternalIterator {
       bool should_sample, HistogramImpl* file_read_hist,
       TableReaderCaller caller, bool skip_filters, int level,
       RangeDelAggregator* range_del_agg,
+      const VersionStorageInfo::ExperimentalGlobalSeekDirLevel*
+          experimental_global_seek_dir_level = nullptr,
       const std::vector<AtomicCompactionUnitBoundary>* compaction_boundaries =
           nullptr,
       bool allow_unprepared_value = false,
@@ -995,6 +1020,7 @@ class LevelIterator final : public InternalIterator {
         caller_(caller),
         file_index_(flevel_->num_files),
         range_del_agg_(range_del_agg),
+        experimental_global_seek_dir_level_(experimental_global_seek_dir_level),
         pinned_iters_mgr_(nullptr),
         compaction_boundaries_(compaction_boundaries),
         range_tombstone_iter_(nullptr),
@@ -1333,6 +1359,8 @@ class LevelIterator final : public InternalIterator {
   TableReaderCaller caller_;
   size_t file_index_;
   RangeDelAggregator* range_del_agg_;
+  const VersionStorageInfo::ExperimentalGlobalSeekDirLevel*
+      experimental_global_seek_dir_level_;
   IteratorWrapper file_iter_;  // May be nullptr
   PinnedIteratorsManager* pinned_iters_mgr_;
 
@@ -1417,7 +1445,46 @@ void LevelIterator::Seek(const Slice& target) {
   }
   if (need_to_reseek) {
     TEST_SYNC_POINT("LevelIterator::Seek:BeforeFindFile");
-    size_t new_file_index = FindFile(icomparator_, *flevel_, target);
+    size_t new_file_index = flevel_->num_files;
+    bool hit_global_seek_dir = false;
+    PerfContext* const perf = get_perf_context();
+    if (experimental_global_seek_dir_level_ != nullptr) {
+      if (perf != nullptr) {
+        ++perf->experimental_global_seek_dir_seek_lookups;
+      }
+      const auto& dir = *experimental_global_seek_dir_level_;
+      uint32_t bucket = 0;
+      const Slice target_user_key = ExtractUserKey(target);
+      if (dir.valid &&
+          ExperimentalGlobalSeekDirComputeBucket(target_user_key,
+                                                 dir.bucket_bits, &bucket) &&
+          bucket < dir.first_file_index.size() &&
+          bucket < dir.last_file_index_plus1.size()) {
+        const uint32_t left = dir.first_file_index[bucket];
+        const uint32_t right = dir.last_file_index_plus1[bucket];
+        if (left < right && right <= flevel_->num_files) {
+          if (perf != nullptr) {
+            perf->experimental_global_seek_dir_seek_candidate_files_sum +=
+                (right - left);
+          }
+          const size_t candidate = FindFileInRange(
+              icomparator_, *flevel_, target, left, right);
+          if (candidate < right) {
+            new_file_index = candidate;
+            hit_global_seek_dir = true;
+            if (perf != nullptr) {
+              ++perf->experimental_global_seek_dir_seek_hits;
+            }
+          }
+        }
+      }
+    }
+    if (!hit_global_seek_dir) {
+      if (experimental_global_seek_dir_level_ != nullptr && perf != nullptr) {
+        ++perf->experimental_global_seek_dir_seek_fallbacks;
+      }
+      new_file_index = FindFile(icomparator_, *flevel_, target);
+    }
     InitFileIterator(new_file_index);
   }
 
@@ -2245,7 +2312,9 @@ InternalIterator* Version::TEST_GetLevelIterator(
       mutable_cf_options_, should_sample_file_read(),
       cfd_->internal_stats()->GetFileReadHist(level),
       TableReaderCaller::kUserIterator, IsFilterSkipped(level), level,
-      nullptr /* range_del_agg */, nullptr /* compaction_boundaries */,
+      nullptr /* range_del_agg */,
+      storage_info_.ExperimentalGlobalSeekDirLevelFor(level),
+      nullptr /* compaction_boundaries */,
       allow_unprepared_value, &tombstone_iter_ptr, db_statistics_, clock_);
   if (read_options.ignore_range_deletions) {
     merge_iter_builder->AddIterator(level_iter);
@@ -2385,6 +2454,7 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
         cfd_->internal_stats()->GetFileReadHist(level),
         TableReaderCaller::kUserIterator, IsFilterSkipped(level), level,
         /*range_del_agg=*/nullptr,
+        storage_info_.ExperimentalGlobalSeekDirLevelFor(level),
         /*compaction_boundaries=*/nullptr, allow_unprepared_value,
         &tombstone_iter_ptr, db_statistics_, clock_);
     if (read_options.ignore_range_deletions) {
@@ -2443,7 +2513,8 @@ Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
         mutable_cf_options_, should_sample_file_read(),
         cfd_->internal_stats()->GetFileReadHist(level),
         TableReaderCaller::kUserIterator, IsFilterSkipped(level), level,
-        &range_del_agg, nullptr, false, nullptr, db_statistics_, clock_));
+        &range_del_agg, storage_info_.ExperimentalGlobalSeekDirLevelFor(level),
+        nullptr, false, nullptr, db_statistics_, clock_));
     status = OverlapWithIterator(ucmp, smallest_user_key, largest_user_key,
                                  iter.get(), overlap);
   }
@@ -2459,6 +2530,7 @@ VersionStorageInfo::VersionStorageInfo(
     const InternalKeyComparator* internal_comparator,
     const Comparator* user_comparator, int levels,
     CompactionStyle compaction_style, VersionStorageInfo* ref_vstorage,
+    bool experimental_global_seek_dir_enable,
     bool _force_consistency_checks,
     EpochNumberRequirement epoch_number_requirement, SystemClock* clock,
     uint32_t bottommost_file_compaction_delay,
@@ -2468,6 +2540,7 @@ VersionStorageInfo::VersionStorageInfo(
       // cfd is nullptr if Version is dummy
       num_levels_(levels),
       num_non_empty_levels_(0),
+      experimental_global_seek_dir_enable_(experimental_global_seek_dir_enable),
       file_indexer_(user_comparator),
       compaction_style_(compaction_style),
       files_(new std::vector<FileMetaData*>[num_levels_]),
@@ -2512,6 +2585,22 @@ VersionStorageInfo::VersionStorageInfo(
   }
 }
 
+namespace {
+
+bool ExperimentalGlobalSeekDirEnabledForCfOptions(
+    const MutableCFOptions& mutable_cf_options) {
+  const auto* table_factory = mutable_cf_options.table_factory.get();
+  if (table_factory == nullptr) {
+    return false;
+  }
+  const auto* block_table_options =
+      table_factory->GetOptions<BlockBasedTableOptions>();
+  return block_table_options != nullptr &&
+         block_table_options->experimental_sst_seek_dir_enable;
+}
+
+}  // namespace
+
 Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
                  const FileOptions& file_opt,
                  const MutableCFOptions& mutable_cf_options,
@@ -2536,6 +2625,7 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
           (cfd_ == nullptr || cfd_->current() == nullptr)
               ? nullptr
               : cfd_->current()->storage_info(),
+          ExperimentalGlobalSeekDirEnabledForCfOptions(mutable_cf_options),
           cfd_ == nullptr ? false : cfd_->ioptions().force_consistency_checks,
           epoch_number_requirement,
           cfd_ == nullptr ? nullptr : cfd_->ioptions().clock,
@@ -3391,6 +3481,61 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
   }
 }
 
+void VersionStorageInfo::GenerateExperimentalGlobalSeekDir() {
+  experimental_global_seek_dir_.clear();
+  experimental_global_seek_dir_.resize(num_non_empty_levels_);
+  if (!experimental_global_seek_dir_enable_ || num_non_empty_levels_ <= 1 ||
+      user_comparator_ == nullptr || user_comparator_ != BytewiseComparator() ||
+      user_comparator_->timestamp_size() != 0) {
+    return;
+  }
+
+  const uint32_t bucket_count =
+      static_cast<uint32_t>(1u << kExperimentalGlobalSeekDirBucketBits);
+  for (int level = 1; level < num_non_empty_levels_; ++level) {
+    const auto& files_brief = level_files_brief_[level];
+    if (files_brief.num_files == 0) {
+      continue;
+    }
+
+    auto& dir = experimental_global_seek_dir_[level];
+    dir.bucket_bits = kExperimentalGlobalSeekDirBucketBits;
+    dir.first_file_index.assign(bucket_count,
+                                static_cast<uint32_t>(files_brief.num_files));
+    dir.last_file_index_plus1.assign(bucket_count, 0);
+
+    for (uint32_t file_idx = 0; file_idx < files_brief.num_files; ++file_idx) {
+      const auto& file = files_brief.files[file_idx];
+      uint32_t bucket_begin = 0;
+      uint32_t bucket_end = 0;
+      if (!ExperimentalGlobalSeekDirComputeBucket(ExtractUserKey(file.smallest_key),
+                                                  dir.bucket_bits,
+                                                  &bucket_begin) ||
+          !ExperimentalGlobalSeekDirComputeBucket(ExtractUserKey(file.largest_key),
+                                                  dir.bucket_bits,
+                                                  &bucket_end) ||
+          bucket_begin > bucket_end || bucket_end >= bucket_count) {
+        continue;
+      }
+      for (uint32_t bucket = bucket_begin; bucket <= bucket_end; ++bucket) {
+        if (dir.first_file_index[bucket] > file_idx) {
+          dir.first_file_index[bucket] = file_idx;
+        }
+        if (dir.last_file_index_plus1[bucket] < file_idx + 1u) {
+          dir.last_file_index_plus1[bucket] = file_idx + 1u;
+        }
+      }
+    }
+
+    for (uint32_t bucket = 0; bucket < bucket_count; ++bucket) {
+      if (dir.first_file_index[bucket] < dir.last_file_index_plus1[bucket]) {
+        dir.valid = true;
+        break;
+      }
+    }
+  }
+}
+
 void VersionStorageInfo::PrepareForVersionAppend(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options) {
@@ -3400,6 +3545,7 @@ void VersionStorageInfo::PrepareForVersionAppend(
   UpdateFilesByCompactionPri(immutable_options, mutable_cf_options);
   GenerateFileIndexer();
   GenerateLevelFilesBrief();
+  GenerateExperimentalGlobalSeekDir();
   GenerateLevel0NonOverlapping();
   GenerateBottommostFiles();
   GenerateFileLocationIndex();
@@ -7554,6 +7700,7 @@ InternalIterator* VersionSet::MakeInputIterator(
             /*no per level latency histogram=*/nullptr,
             TableReaderCaller::kCompaction, /*skip_filters=*/false,
             /*level=*/static_cast<int>(c->level(which)), range_del_agg,
+            /*experimental_global_seek_dir_level=*/nullptr,
             c->boundaries(which), false, &tombstone_iter_ptr,
             db_options_->statistics.get(), clock_);
         range_tombstones.emplace_back(nullptr, tombstone_iter_ptr);
