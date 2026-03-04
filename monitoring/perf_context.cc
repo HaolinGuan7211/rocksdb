@@ -123,6 +123,14 @@ struct PerfContextByLevelInt {
   defCmd(bloom_sst_hit_count)                      \
   defCmd(bloom_sst_miss_count)                     \
   defCmd(bloom_filter_maymatch_nanos)              \
+  defCmd(experimental_sst_hash_index_seek_lookups) \
+  defCmd(experimental_sst_hash_index_seek_hits)    \
+  defCmd(experimental_sst_hash_index_seek_fallbacks)\
+  defCmd(experimental_sst_hash_index_seek_slot_probes)\
+  defCmd(experimental_sst_hash_index_get_lookups)  \
+  defCmd(experimental_sst_hash_index_get_hits)     \
+  defCmd(experimental_sst_hash_index_get_fallbacks)\
+  defCmd(experimental_sst_hash_index_get_slot_probes)\
   defCmd(key_lock_wait_time)                       \
   defCmd(key_lock_wait_count)                      \
   defCmd(env_new_sequential_file_nanos)            \

@@ -132,6 +132,10 @@ def summarize_samples(samples: List[Dict[str, str]]) -> Dict[str, object]:
     block_reads: List[float] = []
     block_bytes: List[float] = []
     key_cmps: List[float] = []
+    seek_lookups: List[float] = []
+    seek_hits: List[float] = []
+    seek_fallbacks: List[float] = []
+    seek_slot_probes: List[float] = []
     for r in samples:
         v = _safe_float(r.get("latency_us"))
         if v is not None:
@@ -145,6 +149,18 @@ def summarize_samples(samples: List[Dict[str, str]]) -> Dict[str, object]:
         kc = _safe_float(r.get("user_key_comparison_count"))
         if kc is not None:
             key_cmps.append(kc)
+        sl = _safe_float(r.get("sst_hash_seek_lookups"))
+        if sl is not None:
+            seek_lookups.append(sl)
+        sh = _safe_float(r.get("sst_hash_seek_hits"))
+        if sh is not None:
+            seek_hits.append(sh)
+        sf = _safe_float(r.get("sst_hash_seek_fallbacks"))
+        if sf is not None:
+            seek_fallbacks.append(sf)
+        sp = _safe_float(r.get("sst_hash_seek_slot_probes"))
+        if sp is not None:
+            seek_slot_probes.append(sp)
 
     out: Dict[str, object] = {"samples": len(samples)}
     out["lat_p50_us"] = _quantile(lat, 0.50) or ""
@@ -153,6 +169,32 @@ def summarize_samples(samples: List[Dict[str, str]]) -> Dict[str, object]:
     out["avg_block_reads"] = (sum(block_reads) / len(block_reads)) if block_reads else ""
     out["avg_block_bytes"] = (sum(block_bytes) / len(block_bytes)) if block_bytes else ""
     out["avg_user_key_cmps"] = (sum(key_cmps) / len(key_cmps)) if key_cmps else ""
+    out["avg_sst_hash_seek_lookups"] = (
+        (sum(seek_lookups) / len(seek_lookups)) if seek_lookups else ""
+    )
+    out["avg_sst_hash_seek_hits"] = (
+        (sum(seek_hits) / len(seek_hits)) if seek_hits else ""
+    )
+    out["avg_sst_hash_seek_fallbacks"] = (
+        (sum(seek_fallbacks) / len(seek_fallbacks)) if seek_fallbacks else ""
+    )
+    out["avg_sst_hash_seek_slot_probes"] = (
+        (sum(seek_slot_probes) / len(seek_slot_probes)) if seek_slot_probes else ""
+    )
+    # Derived per-op metrics (seek-sample rows represent one op).
+    total_lookups = sum(seek_lookups) if seek_lookups else 0.0
+    total_hits = sum(seek_hits) if seek_hits else 0.0
+    total_fallbacks = sum(seek_fallbacks) if seek_fallbacks else 0.0
+    total_probes = sum(seek_slot_probes) if seek_slot_probes else 0.0
+    out["sst_hash_seek_hit_rate"] = (
+        (total_hits / total_lookups) if total_lookups > 0 else ""
+    )
+    out["sst_hash_seek_fallback_rate"] = (
+        (total_fallbacks / total_lookups) if total_lookups > 0 else ""
+    )
+    out["sst_hash_seek_avg_slot_probes_per_lookup"] = (
+        (total_probes / total_lookups) if total_lookups > 0 else ""
+    )
     return out
 
 

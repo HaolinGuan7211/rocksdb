@@ -2539,6 +2539,17 @@ struct TailProbeSnapshot {
   uint64_t bloom_sst_miss_count = 0;
   uint64_t bloom_filter_maymatch_nanos = 0;
 
+  // EXPERIMENTAL: SSTHashSeek (per-SST hash index) counters.
+  uint64_t experimental_sst_hash_index_seek_lookups = 0;
+  uint64_t experimental_sst_hash_index_seek_hits = 0;
+  uint64_t experimental_sst_hash_index_seek_fallbacks = 0;
+  uint64_t experimental_sst_hash_index_seek_slot_probes = 0;
+
+  uint64_t experimental_sst_hash_index_get_lookups = 0;
+  uint64_t experimental_sst_hash_index_get_hits = 0;
+  uint64_t experimental_sst_hash_index_get_fallbacks = 0;
+  uint64_t experimental_sst_hash_index_get_slot_probes = 0;
+
   uint64_t io_bytes_read = 0;
   uint64_t io_read_nanos = 0;
   uint64_t io_cpu_read_nanos = 0;
@@ -2611,6 +2622,22 @@ static TailProbeSnapshot CaptureTailProbeSnapshot() {
     out.bloom_sst_hit_count = perf->bloom_sst_hit_count;
     out.bloom_sst_miss_count = perf->bloom_sst_miss_count;
     out.bloom_filter_maymatch_nanos = perf->bloom_filter_maymatch_nanos;
+    out.experimental_sst_hash_index_seek_lookups =
+        perf->experimental_sst_hash_index_seek_lookups;
+    out.experimental_sst_hash_index_seek_hits =
+        perf->experimental_sst_hash_index_seek_hits;
+    out.experimental_sst_hash_index_seek_fallbacks =
+        perf->experimental_sst_hash_index_seek_fallbacks;
+    out.experimental_sst_hash_index_seek_slot_probes =
+        perf->experimental_sst_hash_index_seek_slot_probes;
+    out.experimental_sst_hash_index_get_lookups =
+        perf->experimental_sst_hash_index_get_lookups;
+    out.experimental_sst_hash_index_get_hits =
+        perf->experimental_sst_hash_index_get_hits;
+    out.experimental_sst_hash_index_get_fallbacks =
+        perf->experimental_sst_hash_index_get_fallbacks;
+    out.experimental_sst_hash_index_get_slot_probes =
+        perf->experimental_sst_hash_index_get_slot_probes;
   }
   if (io != nullptr) {
     out.io_bytes_read = io->bytes_read;
@@ -2691,6 +2718,30 @@ static TailProbeSnapshot DeltaTailProbeSnapshot(const TailProbeSnapshot& current
   delta.bloom_filter_maymatch_nanos =
       SafeDelta(current.bloom_filter_maymatch_nanos,
                 prev.bloom_filter_maymatch_nanos);
+  delta.experimental_sst_hash_index_seek_lookups = SafeDelta(
+      current.experimental_sst_hash_index_seek_lookups,
+      prev.experimental_sst_hash_index_seek_lookups);
+  delta.experimental_sst_hash_index_seek_hits =
+      SafeDelta(current.experimental_sst_hash_index_seek_hits,
+                prev.experimental_sst_hash_index_seek_hits);
+  delta.experimental_sst_hash_index_seek_fallbacks = SafeDelta(
+      current.experimental_sst_hash_index_seek_fallbacks,
+      prev.experimental_sst_hash_index_seek_fallbacks);
+  delta.experimental_sst_hash_index_seek_slot_probes = SafeDelta(
+      current.experimental_sst_hash_index_seek_slot_probes,
+      prev.experimental_sst_hash_index_seek_slot_probes);
+  delta.experimental_sst_hash_index_get_lookups =
+      SafeDelta(current.experimental_sst_hash_index_get_lookups,
+                prev.experimental_sst_hash_index_get_lookups);
+  delta.experimental_sst_hash_index_get_hits =
+      SafeDelta(current.experimental_sst_hash_index_get_hits,
+                prev.experimental_sst_hash_index_get_hits);
+  delta.experimental_sst_hash_index_get_fallbacks = SafeDelta(
+      current.experimental_sst_hash_index_get_fallbacks,
+      prev.experimental_sst_hash_index_get_fallbacks);
+  delta.experimental_sst_hash_index_get_slot_probes = SafeDelta(
+      current.experimental_sst_hash_index_get_slot_probes,
+      prev.experimental_sst_hash_index_get_slot_probes);
 
   delta.io_bytes_read = SafeDelta(current.io_bytes_read, prev.io_bytes_read);
   delta.io_read_nanos = SafeDelta(current.io_read_nanos, prev.io_read_nanos);
@@ -2808,6 +2859,14 @@ class TailProbeWriter {
     append_u64(&row, delta.bloom_sst_hit_count);
     append_u64(&row, delta.bloom_sst_miss_count);
     append_u64(&row, delta.bloom_filter_maymatch_nanos);
+    append_u64(&row, delta.experimental_sst_hash_index_seek_lookups);
+    append_u64(&row, delta.experimental_sst_hash_index_seek_hits);
+    append_u64(&row, delta.experimental_sst_hash_index_seek_fallbacks);
+    append_u64(&row, delta.experimental_sst_hash_index_seek_slot_probes);
+    append_u64(&row, delta.experimental_sst_hash_index_get_lookups);
+    append_u64(&row, delta.experimental_sst_hash_index_get_hits);
+    append_u64(&row, delta.experimental_sst_hash_index_get_fallbacks);
+    append_u64(&row, delta.experimental_sst_hash_index_get_slot_probes);
     append_u64(&row, delta.io_bytes_read);
     append_u64(&row, delta.io_read_nanos);
     append_u64(&row, delta.io_cpu_read_nanos);
@@ -2846,6 +2905,14 @@ class TailProbeWriter {
         "delta_bloom_memtable_hit_count,delta_bloom_memtable_miss_count,"
         "delta_bloom_sst_hit_count,delta_bloom_sst_miss_count,"
         "delta_bloom_filter_maymatch_nanos,"
+        "delta_experimental_sst_hash_index_seek_lookups,"
+        "delta_experimental_sst_hash_index_seek_hits,"
+        "delta_experimental_sst_hash_index_seek_fallbacks,"
+        "delta_experimental_sst_hash_index_seek_slot_probes,"
+        "delta_experimental_sst_hash_index_get_lookups,"
+        "delta_experimental_sst_hash_index_get_hits,"
+        "delta_experimental_sst_hash_index_get_fallbacks,"
+        "delta_experimental_sst_hash_index_get_slot_probes,"
         "delta_io_bytes_read,delta_io_read_nanos,delta_io_cpu_read_nanos,"
         "delta_io_bytes_written,delta_io_write_nanos,"
         "delta_simfs_base_read_ns,"

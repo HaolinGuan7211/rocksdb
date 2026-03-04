@@ -484,6 +484,31 @@ def build_sample_row(
         "block_read_bytes": to_int(tr.get("delta_block_read_byte", 0)),
         "iter_seek_count": to_int(tr.get("delta_iter_seek_count", 0)),
         "iter_read_bytes": to_int(tr.get("delta_iter_read_bytes", 0)),
+        # EXPERIMENTAL: SSTHashSeek counters.
+        "sst_hash_seek_lookups": to_int(
+            tr.get("delta_experimental_sst_hash_index_seek_lookups", 0)
+        ),
+        "sst_hash_seek_hits": to_int(
+            tr.get("delta_experimental_sst_hash_index_seek_hits", 0)
+        ),
+        "sst_hash_seek_fallbacks": to_int(
+            tr.get("delta_experimental_sst_hash_index_seek_fallbacks", 0)
+        ),
+        "sst_hash_seek_slot_probes": to_int(
+            tr.get("delta_experimental_sst_hash_index_seek_slot_probes", 0)
+        ),
+        "sst_hash_get_lookups": to_int(
+            tr.get("delta_experimental_sst_hash_index_get_lookups", 0)
+        ),
+        "sst_hash_get_hits": to_int(
+            tr.get("delta_experimental_sst_hash_index_get_hits", 0)
+        ),
+        "sst_hash_get_fallbacks": to_int(
+            tr.get("delta_experimental_sst_hash_index_get_fallbacks", 0)
+        ),
+        "sst_hash_get_slot_probes": to_int(
+            tr.get("delta_experimental_sst_hash_index_get_slot_probes", 0)
+        ),
         "stage_memtable_route_us": stage["memtable_route"],
         "stage_table_open_meta_us": stage["table_open_meta"],
         "stage_filter_maymatch_cpu_us": stage["filter_maymatch_cpu"],

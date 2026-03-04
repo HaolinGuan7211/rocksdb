@@ -132,15 +132,26 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
         (rep->index_type == BlockBasedTableOptions::kBinarySearch ||
          rep->index_type == BlockBasedTableOptions::kBinarySearchWithFirstKey) &&
         rep->table_options.index_block_restart_interval == 1) {
+      PerfContext* const perf = get_perf_context();
+      if (perf != nullptr) {
+        ++perf->experimental_sst_hash_index_seek_lookups;
+      }
       const Slice user_key = ExtractUserKey(*target);
       const uint32_t mask = rep->experimental_sst_hash_index_slots_mask;
       const uint64_t hash =
           Hash64(user_key.data(), user_key.size(),
                  rep->experimental_sst_hash_index_header.hash_seed);
       const uint16_t fp16 = static_cast<uint16_t>((hash >> 48) & 0xFFFFu);
+      const bool has_hash32 =
+          (rep->experimental_sst_hash_index_header.flags &
+           kExperimentalSstHashIndexFlagSlotHasHash32) != 0u;
+      const uint32_t hash32 = static_cast<uint32_t>(hash);
 
+      uint32_t probe_steps = 0;
+      bool used_hash_seek = false;
       uint32_t idx = static_cast<uint32_t>(hash) & mask;
       for (uint32_t probe = 0; probe <= mask; ++probe) {
+        ++probe_steps;
         const char* p = rep->experimental_sst_hash_index_slots +
                         static_cast<size_t>(idx) * 12u;
         ExperimentalSstHashIndexSlotV1 slot =
@@ -148,7 +159,9 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
         if (slot.block_id == kExperimentalSstHashIndexEmptyBlockId) {
           break;
         }
-        if (slot.fp16 == fp16 &&
+        if (slot.fp16 == fp16 && (!has_hash32 ||
+                                  ExperimentalSstHashIndexSlotHash32(slot) ==
+                                      hash32) &&
             slot.block_id < rep->experimental_sst_hash_index_header
                                 .num_data_blocks) {
           const uint32_t block_id = slot.block_id;
@@ -158,43 +171,63 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
           idx_iter->SeekToRestartPoint(block_id);
           idx_iter->Next();
           if (idx_iter->Valid()) {
-            // Validate the chosen index entry using user-key bounds from
-            // neighboring index entries. This protects correctness under
-            // fingerprint collisions.
-            const Slice upper = idx_iter->user_key();
-            Slice lower;
-            bool has_lower = false;
-            if (block_id > 0) {
-              idx_iter->Prev();
-              if (idx_iter->Valid()) {
-                lower = idx_iter->user_key();
-                has_lower = true;
-              }
-              idx_iter->Next();
-              assert(idx_iter->Valid());
-            }
-
             const Slice target_user = ExtractUserKey(*target);
             bool ok = true;
-            if (has_lower && user_comparator_.Compare(target_user, lower) <= 0) {
-              ok = false;
-            }
             const uint32_t last_block_id =
                 rep->experimental_sst_hash_index_header.num_data_blocks - 1u;
-            if (block_id < last_block_id &&
-                user_comparator_.Compare(target_user, upper) >= 0) {
-              ok = false;
+            if (has_hash32) {
+              // Keep validation lightweight. With a 48-bit signature (hash32 +
+              // fp16), collisions are vanishingly unlikely. We still guard the
+              // most dangerous case: choosing a block whose upper-bound key is
+              // <= target, which would violate Seek() semantics (>= target).
+              if (block_id < last_block_id &&
+                  user_comparator_.Compare(target_user, idx_iter->user_key()) >=
+                      0) {
+                ok = false;
+              }
+            } else {
+              // Old V1 behavior (fp16-only): collisions are common enough to
+              // require strict validation against neighboring index entries.
+              const Slice upper = idx_iter->user_key();
+              Slice lower;
+              bool has_lower = false;
+              if (block_id > 0) {
+                idx_iter->Prev();
+                if (idx_iter->Valid()) {
+                  lower = idx_iter->user_key();
+                  has_lower = true;
+                }
+                idx_iter->Next();
+                assert(idx_iter->Valid());
+              }
+              if (has_lower &&
+                  user_comparator_.Compare(target_user, lower) <= 0) {
+                ok = false;
+              }
+              if (ok && block_id < last_block_id &&
+                  user_comparator_.Compare(target_user, upper) >= 0) {
+                ok = false;
+              }
             }
 
             if (ok) {
               (void)restart_idx;  // MVP: hint reserved for later use.
               is_index_at_curr_block_ = true;
               need_seek_index = false;
+              used_hash_seek = true;
               break;
             }
           }
         }
         idx = (idx + 1u) & mask;
+      }
+      if (perf != nullptr) {
+        perf->experimental_sst_hash_index_seek_slot_probes += probe_steps;
+        if (used_hash_seek) {
+          ++perf->experimental_sst_hash_index_seek_hits;
+        } else {
+          ++perf->experimental_sst_hash_index_seek_fallbacks;
+        }
       }
     }
   }

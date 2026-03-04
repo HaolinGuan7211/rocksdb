@@ -2578,6 +2578,10 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
   if (may_match) {
     if (rep_->experimental_sst_hash_index_available &&
         rep_->internal_comparator.user_comparator()->timestamp_size() == 0) {
+      PerfContext* const perf = get_perf_context();
+      if (perf != nullptr) {
+        ++perf->experimental_sst_hash_index_get_lookups;
+      }
       const Slice user_key = ExtractUserKey(key);
       const uint32_t mask = rep_->experimental_sst_hash_index_slots_mask;
       const uint64_t hash = Hash64(user_key.data(), user_key.size(),
@@ -2585,9 +2589,15 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
                                        .hash_seed);
       const uint16_t fp16 =
           static_cast<uint16_t>((hash >> 48) & 0xFFFFu);
+      const bool has_hash32 =
+          (rep_->experimental_sst_hash_index_header.flags &
+           kExperimentalSstHashIndexFlagSlotHasHash32) != 0u;
+      const uint32_t hash32 = static_cast<uint32_t>(hash);
 
+      uint32_t probe_steps = 0;
       uint32_t idx = static_cast<uint32_t>(hash) & mask;
       for (uint32_t probe = 0; probe <= mask; ++probe) {
+        ++probe_steps;
         const char* p = rep_->experimental_sst_hash_index_slots +
                         static_cast<size_t>(idx) * 12u;
         ExperimentalSstHashIndexSlotV1 slot =
@@ -2595,7 +2605,9 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
         if (slot.block_id == kExperimentalSstHashIndexEmptyBlockId) {
           break;
         }
-        if (slot.fp16 == fp16 &&
+        if (slot.fp16 == fp16 && (!has_hash32 ||
+                                  ExperimentalSstHashIndexSlotHash32(slot) ==
+                                      hash32) &&
             slot.block_id < rep_->experimental_sst_hash_index_header
                                 .num_data_blocks) {
           const uint32_t block_id = slot.block_id;
@@ -2698,6 +2710,10 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
             }
 
             if (done) {
+              if (perf != nullptr) {
+                perf->experimental_sst_hash_index_get_slot_probes += probe_steps;
+                ++perf->experimental_sst_hash_index_get_hits;
+              }
               if (matched && filter != nullptr) {
                 if (rep_->whole_key_filtering) {
                   RecordTick(rep_->ioptions.stats,
@@ -2714,6 +2730,10 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
           }
         }
         idx = (idx + 1u) & mask;
+      }
+      if (perf != nullptr) {
+        perf->experimental_sst_hash_index_get_slot_probes += probe_steps;
+        ++perf->experimental_sst_hash_index_get_fallbacks;
       }
     }
 

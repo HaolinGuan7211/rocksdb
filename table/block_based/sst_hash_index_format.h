@@ -19,13 +19,17 @@ namespace ROCKSDB_NAMESPACE {
 inline constexpr const char kExperimentalSstHashIndexMetaBlockName[] =
     "rocksdb.experimental.sst_hash_index";
 
+// Header.flags bits.
+inline constexpr uint32_t kExperimentalSstHashIndexFlagSlotHasHash32 = 1u << 0;
+
 // On-disk header (fixed-size, little endian).
 //
 // Notes:
 // - `restart_interval` is recorded for analysis/debugging; the MVP hint uses
 //   restart_idx computed as entry_idx_in_block / restart_interval.
 // - Hashing is on user keys (bytes), and correctness is enforced by verifying
-//   against the data block contents on lookup.
+//   against the data block contents on lookup (Get), or by using enough hash
+//   bits to make collisions vanishingly unlikely (Seek fast path).
 struct ExperimentalSstHashIndexHeaderV1 {
   uint32_t version = 1;
   uint32_t flags = 0;
@@ -52,9 +56,20 @@ struct ExperimentalSstHashIndexSlotV1 {
   uint32_t block_id = kExperimentalSstHashIndexEmptyBlockId;
   uint16_t fp16 = 0;
   uint16_t restart_idx = 0;
+  // NOTE: For V1 slots, `within` and `reserved` were intended for hinting.
+  // For the current MVP, when header.flags has kExperimentalSstHashIndexFlagSlotHasHash32,
+  // these two fields store the low 32 bits of the 64-bit hash:
+  //   - within:  low 16 bits of hash32
+  //   - reserved: high 16 bits of hash32
   uint16_t within = 0;
   uint16_t reserved = 0;
 };
+
+inline uint32_t ExperimentalSstHashIndexSlotHash32(
+    const ExperimentalSstHashIndexSlotV1& s) {
+  return (static_cast<uint32_t>(s.reserved) << 16) |
+         static_cast<uint32_t>(s.within);
+}
 
 inline void EncodeExperimentalSstHashIndexHeaderV1(
     const ExperimentalSstHashIndexHeaderV1& h, std::string* out) {

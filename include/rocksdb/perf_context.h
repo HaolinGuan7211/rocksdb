@@ -239,6 +239,19 @@ struct PerfContextBase {
   // Excludes filter block read/decompression costs.
   uint64_t bloom_filter_maymatch_nanos;
 
+  // EXPERIMENTAL: per-SST hash index (SSTHashSeek) counters.
+  // These are intended for diagnosing hit/miss and overhead of the
+  // experimental per-SST hash index seek/get fast paths in this fork.
+  uint64_t experimental_sst_hash_index_seek_lookups;
+  uint64_t experimental_sst_hash_index_seek_hits;
+  uint64_t experimental_sst_hash_index_seek_fallbacks;
+  uint64_t experimental_sst_hash_index_seek_slot_probes;
+
+  uint64_t experimental_sst_hash_index_get_lookups;
+  uint64_t experimental_sst_hash_index_get_hits;
+  uint64_t experimental_sst_hash_index_get_fallbacks;
+  uint64_t experimental_sst_hash_index_get_slot_probes;
+
   // Time spent waiting on key locks in transaction lock manager.
   // This metric gets collected starting from
   // PerfLevel::kEnableTimeExceptForMutex

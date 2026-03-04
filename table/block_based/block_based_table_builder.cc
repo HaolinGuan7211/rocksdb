@@ -129,8 +129,11 @@ Status BuildExperimentalSstHashIndexLinearProbing(
         slot.block_id = e.block_id;
         slot.fp16 = e.fp16;
         slot.restart_idx = e.restart_idx;
-        slot.within = e.within;
-        slot.reserved = 0;
+        // Store hash32 (low 32 bits) in within/reserved so lookups can match
+        // 48 bits (hash32 + fp16) and avoid expensive validation on Seek.
+        const uint32_t hash32 = static_cast<uint32_t>(e.hash);
+        slot.within = static_cast<uint16_t>(hash32 & 0xFFFFu);
+        slot.reserved = static_cast<uint16_t>((hash32 >> 16) & 0xFFFFu);
         break;
       }
       idx = (idx + 1u) & mask;
@@ -2622,7 +2625,7 @@ void BlockBasedTableBuilder::WriteExperimentalSstHashIndexBlock(
 
   ExperimentalSstHashIndexHeaderV1 h;
   h.version = 1;
-  h.flags = 0;
+  h.flags = kExperimentalSstHashIndexFlagSlotHasHash32;
   h.user_key_fixed_len = 0;
   h.fingerprint_bits = 16;
   h.hash_seed = r->experimental_sst_hash_index_seed;
