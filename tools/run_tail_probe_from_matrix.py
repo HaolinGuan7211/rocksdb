@@ -519,6 +519,21 @@ def build_sample_row(
         "sst_seek_dir_seek_fallbacks": to_int(
             tr.get("delta_experimental_sst_seek_dir_seek_fallbacks", 0)
         ),
+        "sst_seek_dir_seek_binary_steps": to_int(
+            tr.get("delta_experimental_sst_seek_dir_seek_binary_steps", 0)
+        ),
+        "sst_seek_dir_seek_cmp_bytes": to_int(
+            tr.get("delta_experimental_sst_seek_dir_seek_cmp_bytes", 0)
+        ),
+        "sst_seek_dir_seek_num_data_blocks_sum": to_int(
+            tr.get("delta_experimental_sst_seek_dir_seek_num_data_blocks_sum", 0)
+        ),
+        "sst_seek_dir_seek_layout_no_offsets": to_int(
+            tr.get("delta_experimental_sst_seek_dir_seek_layout_no_offsets", 0)
+        ),
+        "sst_seek_dir_seek_used_direct_index": to_int(
+            tr.get("delta_experimental_sst_seek_dir_seek_used_direct_index", 0)
+        ),
         "stage_memtable_route_us": stage["memtable_route"],
         "stage_table_open_meta_us": stage["table_open_meta"],
         "stage_filter_maymatch_cpu_us": stage["filter_maymatch_cpu"],

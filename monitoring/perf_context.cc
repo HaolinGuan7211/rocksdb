@@ -134,6 +134,11 @@ struct PerfContextByLevelInt {
   defCmd(experimental_sst_seek_dir_seek_lookups)   \
   defCmd(experimental_sst_seek_dir_seek_hits)      \
   defCmd(experimental_sst_seek_dir_seek_fallbacks) \
+  defCmd(experimental_sst_seek_dir_seek_binary_steps) \
+  defCmd(experimental_sst_seek_dir_seek_cmp_bytes) \
+  defCmd(experimental_sst_seek_dir_seek_num_data_blocks_sum) \
+  defCmd(experimental_sst_seek_dir_seek_layout_no_offsets) \
+  defCmd(experimental_sst_seek_dir_seek_used_direct_index) \
   defCmd(key_lock_wait_time)                       \
   defCmd(key_lock_wait_count)                      \
   defCmd(env_new_sequential_file_nanos)            \

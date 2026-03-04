@@ -256,6 +256,19 @@ struct PerfContextBase {
   uint64_t experimental_sst_seek_dir_seek_lookups;
   uint64_t experimental_sst_seek_dir_seek_hits;
   uint64_t experimental_sst_seek_dir_seek_fallbacks;
+  // Total number of boundary comparisons performed during directory binary
+  // searches (one per step).
+  uint64_t experimental_sst_seek_dir_seek_binary_steps;
+  // Total number of bytes compared in memcmp-based boundary comparisons.
+  // Only counts the bytewise/memcmp fast paths.
+  uint64_t experimental_sst_seek_dir_seek_cmp_bytes;
+  // Sum of num_data_blocks for which the directory lookup was attempted.
+  uint64_t experimental_sst_seek_dir_seek_num_data_blocks_sum;
+  // Number of lookups where the meta block used the no-offsets layout.
+  uint64_t experimental_sst_seek_dir_seek_layout_no_offsets;
+  // Number of lookups where the code path used direct indexing into the keys
+  // blob (fixed-len key layout), avoiding offset decoding.
+  uint64_t experimental_sst_seek_dir_seek_used_direct_index;
 
   // Time spent waiting on key locks in transaction lock manager.
   // This metric gets collected starting from

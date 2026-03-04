@@ -147,6 +147,9 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
       const bool is_bytewise =
           rep->internal_comparator.user_comparator() == BytewiseComparator();
       const uint32_t n = rep->experimental_sst_seek_dir_header.num_data_blocks;
+      if (perf != nullptr) {
+        perf->experimental_sst_seek_dir_seek_num_data_blocks_sum += n;
+      }
       const char* keys = rep->experimental_sst_seek_dir_keys_blob;
       const uint32_t keys_bytes = rep->experimental_sst_seek_dir_keys_bytes;
 
@@ -160,6 +163,9 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
       bool direct_index = false;
       bool valid_layout = true;
       if (no_offsets) {
+        if (perf != nullptr) {
+          ++perf->experimental_sst_seek_dir_seek_layout_no_offsets;
+        }
         if (fixed_len > 0 &&
             static_cast<uint64_t>(n) * fixed_len == keys_bytes) {
           direct_index = true;
@@ -216,6 +222,8 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
 
       bool used = false;
       bool fallback = false;
+      uint64_t binary_steps = 0;
+      uint64_t cmp_bytes = 0;
       if (!valid_layout) {
         used = false;
         fallback = true;
@@ -224,12 +232,17 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
         if (direct_index && is_bytewise && fixed_len > 0 &&
             target_user.size() == fixed_len) {
           // Fast path: fixed-len bytewise compare without Slice construction.
+          if (perf != nullptr) {
+            ++perf->experimental_sst_seek_dir_seek_used_direct_index;
+          }
           const char* const target_p = target_user.data();
           while (lo < hi) {
             const uint32_t mid = lo + (hi - lo) / 2u;
             const char* const boundary_p =
                 keys + static_cast<size_t>(mid) * fixed_len;
             const int cmp = memcmp(boundary_p, target_p, fixed_len);
+            ++binary_steps;
+            cmp_bytes += fixed_len;
             if (cmp < 0) {
               lo = mid + 1u;
             } else {
@@ -249,12 +262,14 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
               if (fixed_len > 0 && boundary.size() == fixed_len &&
                   target_user.size() == fixed_len) {
                 cmp = memcmp(boundary.data(), target_user.data(), fixed_len);
+                cmp_bytes += fixed_len;
               } else {
                 const size_t ncmp =
                     std::min(boundary.size(), target_user.size());
                 cmp = (ncmp == 0)
                           ? 0
                           : memcmp(boundary.data(), target_user.data(), ncmp);
+                cmp_bytes += ncmp;
                 if (cmp == 0 && boundary.size() != target_user.size()) {
                   cmp = (boundary.size() < target_user.size()) ? -1 : 1;
                 }
@@ -262,6 +277,7 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
             } else {
               cmp = user_comparator_.Compare(boundary, target_user);
             }
+            ++binary_steps;
             if (cmp < 0) {
               lo = mid + 1u;
             } else {
@@ -302,6 +318,10 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
 
       if (perf != nullptr && (!used || fallback)) {
         ++perf->experimental_sst_seek_dir_seek_fallbacks;
+      }
+      if (perf != nullptr) {
+        perf->experimental_sst_seek_dir_seek_binary_steps += binary_steps;
+        perf->experimental_sst_seek_dir_seek_cmp_bytes += cmp_bytes;
       }
     }
   }

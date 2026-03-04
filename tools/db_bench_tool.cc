@@ -2566,6 +2566,11 @@ struct TailProbeSnapshot {
   uint64_t experimental_sst_seek_dir_seek_lookups = 0;
   uint64_t experimental_sst_seek_dir_seek_hits = 0;
   uint64_t experimental_sst_seek_dir_seek_fallbacks = 0;
+  uint64_t experimental_sst_seek_dir_seek_binary_steps = 0;
+  uint64_t experimental_sst_seek_dir_seek_cmp_bytes = 0;
+  uint64_t experimental_sst_seek_dir_seek_num_data_blocks_sum = 0;
+  uint64_t experimental_sst_seek_dir_seek_layout_no_offsets = 0;
+  uint64_t experimental_sst_seek_dir_seek_used_direct_index = 0;
 
   uint64_t io_bytes_read = 0;
   uint64_t io_read_nanos = 0;
@@ -2661,6 +2666,16 @@ static TailProbeSnapshot CaptureTailProbeSnapshot() {
         perf->experimental_sst_seek_dir_seek_hits;
     out.experimental_sst_seek_dir_seek_fallbacks =
         perf->experimental_sst_seek_dir_seek_fallbacks;
+    out.experimental_sst_seek_dir_seek_binary_steps =
+        perf->experimental_sst_seek_dir_seek_binary_steps;
+    out.experimental_sst_seek_dir_seek_cmp_bytes =
+        perf->experimental_sst_seek_dir_seek_cmp_bytes;
+    out.experimental_sst_seek_dir_seek_num_data_blocks_sum =
+        perf->experimental_sst_seek_dir_seek_num_data_blocks_sum;
+    out.experimental_sst_seek_dir_seek_layout_no_offsets =
+        perf->experimental_sst_seek_dir_seek_layout_no_offsets;
+    out.experimental_sst_seek_dir_seek_used_direct_index =
+        perf->experimental_sst_seek_dir_seek_used_direct_index;
   }
   if (io != nullptr) {
     out.io_bytes_read = io->bytes_read;
@@ -2774,6 +2789,21 @@ static TailProbeSnapshot DeltaTailProbeSnapshot(const TailProbeSnapshot& current
   delta.experimental_sst_seek_dir_seek_fallbacks =
       SafeDelta(current.experimental_sst_seek_dir_seek_fallbacks,
                 prev.experimental_sst_seek_dir_seek_fallbacks);
+  delta.experimental_sst_seek_dir_seek_binary_steps =
+      SafeDelta(current.experimental_sst_seek_dir_seek_binary_steps,
+                prev.experimental_sst_seek_dir_seek_binary_steps);
+  delta.experimental_sst_seek_dir_seek_cmp_bytes =
+      SafeDelta(current.experimental_sst_seek_dir_seek_cmp_bytes,
+                prev.experimental_sst_seek_dir_seek_cmp_bytes);
+  delta.experimental_sst_seek_dir_seek_num_data_blocks_sum =
+      SafeDelta(current.experimental_sst_seek_dir_seek_num_data_blocks_sum,
+                prev.experimental_sst_seek_dir_seek_num_data_blocks_sum);
+  delta.experimental_sst_seek_dir_seek_layout_no_offsets =
+      SafeDelta(current.experimental_sst_seek_dir_seek_layout_no_offsets,
+                prev.experimental_sst_seek_dir_seek_layout_no_offsets);
+  delta.experimental_sst_seek_dir_seek_used_direct_index =
+      SafeDelta(current.experimental_sst_seek_dir_seek_used_direct_index,
+                prev.experimental_sst_seek_dir_seek_used_direct_index);
 
   delta.io_bytes_read = SafeDelta(current.io_bytes_read, prev.io_bytes_read);
   delta.io_read_nanos = SafeDelta(current.io_read_nanos, prev.io_read_nanos);
@@ -2902,6 +2932,11 @@ class TailProbeWriter {
     append_u64(&row, delta.experimental_sst_seek_dir_seek_lookups);
     append_u64(&row, delta.experimental_sst_seek_dir_seek_hits);
     append_u64(&row, delta.experimental_sst_seek_dir_seek_fallbacks);
+    append_u64(&row, delta.experimental_sst_seek_dir_seek_binary_steps);
+    append_u64(&row, delta.experimental_sst_seek_dir_seek_cmp_bytes);
+    append_u64(&row, delta.experimental_sst_seek_dir_seek_num_data_blocks_sum);
+    append_u64(&row, delta.experimental_sst_seek_dir_seek_layout_no_offsets);
+    append_u64(&row, delta.experimental_sst_seek_dir_seek_used_direct_index);
     append_u64(&row, delta.io_bytes_read);
     append_u64(&row, delta.io_read_nanos);
     append_u64(&row, delta.io_cpu_read_nanos);
@@ -2951,6 +2986,11 @@ class TailProbeWriter {
         "delta_experimental_sst_seek_dir_seek_lookups,"
         "delta_experimental_sst_seek_dir_seek_hits,"
         "delta_experimental_sst_seek_dir_seek_fallbacks,"
+        "delta_experimental_sst_seek_dir_seek_binary_steps,"
+        "delta_experimental_sst_seek_dir_seek_cmp_bytes,"
+        "delta_experimental_sst_seek_dir_seek_num_data_blocks_sum,"
+        "delta_experimental_sst_seek_dir_seek_layout_no_offsets,"
+        "delta_experimental_sst_seek_dir_seek_used_direct_index,"
         "delta_io_bytes_read,delta_io_read_nanos,delta_io_cpu_read_nanos,"
         "delta_io_bytes_written,delta_io_write_nanos,"
         "delta_simfs_base_read_ns,"

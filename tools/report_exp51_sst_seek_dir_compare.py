@@ -130,6 +130,11 @@ def summarize_samples(samples: List[Dict[str, str]]) -> Dict[str, object]:
     sd_lookups: List[float] = []
     sd_hits: List[float] = []
     sd_fallbacks: List[float] = []
+    sd_steps: List[float] = []
+    sd_cmp_bytes: List[float] = []
+    sd_num_blocks_sum: List[float] = []
+    sd_layout_no_offsets: List[float] = []
+    sd_used_direct_index: List[float] = []
     for r in samples:
         v = _safe_float(r.get("latency_us"))
         if v is not None:
@@ -152,6 +157,21 @@ def summarize_samples(samples: List[Dict[str, str]]) -> Dict[str, object]:
         sf = _safe_float(r.get("sst_seek_dir_seek_fallbacks"))
         if sf is not None:
             sd_fallbacks.append(sf)
+        ss = _safe_float(r.get("sst_seek_dir_seek_binary_steps"))
+        if ss is not None:
+            sd_steps.append(ss)
+        sb = _safe_float(r.get("sst_seek_dir_seek_cmp_bytes"))
+        if sb is not None:
+            sd_cmp_bytes.append(sb)
+        sn = _safe_float(r.get("sst_seek_dir_seek_num_data_blocks_sum"))
+        if sn is not None:
+            sd_num_blocks_sum.append(sn)
+        s_no = _safe_float(r.get("sst_seek_dir_seek_layout_no_offsets"))
+        if s_no is not None:
+            sd_layout_no_offsets.append(s_no)
+        s_di = _safe_float(r.get("sst_seek_dir_seek_used_direct_index"))
+        if s_di is not None:
+            sd_used_direct_index.append(s_di)
 
     out: Dict[str, object] = {"samples": len(samples)}
     out["lat_p50_us"] = _quantile(lat, 0.50) or ""
@@ -168,15 +188,42 @@ def summarize_samples(samples: List[Dict[str, str]]) -> Dict[str, object]:
     out["avg_sst_seek_dir_seek_fallbacks"] = (
         (sum(sd_fallbacks) / len(sd_fallbacks)) if sd_fallbacks else ""
     )
+    out["avg_sst_seek_dir_seek_binary_steps"] = (
+        (sum(sd_steps) / len(sd_steps)) if sd_steps else ""
+    )
+    out["avg_sst_seek_dir_seek_cmp_bytes"] = (
+        (sum(sd_cmp_bytes) / len(sd_cmp_bytes)) if sd_cmp_bytes else ""
+    )
+    out["avg_sst_seek_dir_seek_num_data_blocks_sum"] = (
+        (sum(sd_num_blocks_sum) / len(sd_num_blocks_sum)) if sd_num_blocks_sum else ""
+    )
+    out["avg_sst_seek_dir_seek_layout_no_offsets"] = (
+        (sum(sd_layout_no_offsets) / len(sd_layout_no_offsets)) if sd_layout_no_offsets else ""
+    )
+    out["avg_sst_seek_dir_seek_used_direct_index"] = (
+        (sum(sd_used_direct_index) / len(sd_used_direct_index)) if sd_used_direct_index else ""
+    )
 
     total_lookups = sum(sd_lookups) if sd_lookups else 0.0
     total_hits = sum(sd_hits) if sd_hits else 0.0
     total_fallbacks = sum(sd_fallbacks) if sd_fallbacks else 0.0
+    total_steps = sum(sd_steps) if sd_steps else 0.0
+    total_cmp_bytes = sum(sd_cmp_bytes) if sd_cmp_bytes else 0.0
+    total_num_blocks_sum = sum(sd_num_blocks_sum) if sd_num_blocks_sum else 0.0
     out["sst_seek_dir_seek_hit_rate"] = (
         (total_hits / total_lookups) if total_lookups > 0 else ""
     )
     out["sst_seek_dir_seek_fallback_rate"] = (
         (total_fallbacks / total_lookups) if total_lookups > 0 else ""
+    )
+    out["sst_seek_dir_seek_steps_per_lookup"] = (
+        (total_steps / total_lookups) if total_lookups > 0 else ""
+    )
+    out["sst_seek_dir_seek_cmp_bytes_per_lookup"] = (
+        (total_cmp_bytes / total_lookups) if total_lookups > 0 else ""
+    )
+    out["sst_seek_dir_seek_avg_num_data_blocks"] = (
+        (total_num_blocks_sum / total_lookups) if total_lookups > 0 else ""
     )
     return out
 
@@ -257,4 +304,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
