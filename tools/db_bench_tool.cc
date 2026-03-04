@@ -765,6 +765,28 @@ DEFINE_double(data_block_hash_table_util_ratio, 0.75,
               "This is only valid if use_data_block_hash_index is "
               "set to true");
 
+DEFINE_bool(experimental_sst_hash_index_enable, false,
+            "EXPERIMENTAL: write a per-SST hash index meta block and use it to "
+            "accelerate point lookups / Iterator::Seek by bypassing index block "
+            "binary search when possible.");
+
+DEFINE_double(
+    experimental_sst_hash_index_load_factor,
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions().experimental_sst_hash_index_load_factor,
+    "EXPERIMENTAL: target load factor for the per-SST hash table.");
+
+DEFINE_uint32(
+    experimental_sst_hash_index_fingerprint_bits,
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+        .experimental_sst_hash_index_fingerprint_bits,
+    "EXPERIMENTAL: fingerprint bits per slot for the per-SST hash index.");
+
+DEFINE_bool(
+    experimental_sst_hash_index_pin,
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions().experimental_sst_hash_index_pin,
+    "EXPERIMENTAL: pin the per-SST hash index meta block for the lifetime of "
+    "the table reader to avoid extra reads on lookups.");
+
 DEFINE_int64(compressed_cache_size, -1,
              "Number of bytes to use as a cache of compressed data.");
 
@@ -5569,6 +5591,14 @@ class Benchmark {
       }
       block_based_options.data_block_hash_table_util_ratio =
           FLAGS_data_block_hash_table_util_ratio;
+      block_based_options.experimental_sst_hash_index_enable =
+          FLAGS_experimental_sst_hash_index_enable;
+      block_based_options.experimental_sst_hash_index_load_factor =
+          FLAGS_experimental_sst_hash_index_load_factor;
+      block_based_options.experimental_sst_hash_index_fingerprint_bits =
+          FLAGS_experimental_sst_hash_index_fingerprint_bits;
+      block_based_options.experimental_sst_hash_index_pin =
+          FLAGS_experimental_sst_hash_index_pin;
       if (FLAGS_read_cache_path != "") {
         Status rc_status;
 

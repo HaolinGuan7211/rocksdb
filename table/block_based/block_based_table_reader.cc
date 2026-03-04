@@ -73,6 +73,7 @@
 #include "test_util/sync_point.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
+#include "util/hash.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 
@@ -1264,6 +1265,55 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
                                    &rep_->compression_dict_handle);
   if (!s.ok()) {
     return s;
+  }
+
+  // Optional experimental per-SST hash index meta block.
+  if (table_options.experimental_sst_hash_index_enable) {
+    BlockHandle sst_hash_index_handle;
+    s = FindOptionalMetaBlock(meta_iter, kExperimentalSstHashIndexMetaBlockName,
+                              &sst_hash_index_handle);
+    if (!s.ok()) {
+      return s;
+    }
+    if (sst_hash_index_handle.size() > 0) {
+      const bool use_cache_for_hash_index =
+          table_options.experimental_sst_hash_index_pin
+              ? table_options.cache_index_and_filter_blocks
+              : false;
+
+      // The experimental hash index block is not compressed. RetrieveBlock will
+      // verify the checksum.
+      Status hs = RetrieveBlock(
+          prefetch_buffer, ro, sst_hash_index_handle, rep_->decompressor.get(),
+          &rep_->experimental_sst_hash_index_block, /*get_context=*/nullptr,
+          lookup_context, /*for_compaction=*/false, use_cache_for_hash_index,
+          /*async_read=*/false, /*use_block_cache_for_lookup=*/false);
+      if (hs.ok() && !rep_->experimental_sst_hash_index_block.IsEmpty()) {
+        const Slice content =
+            rep_->experimental_sst_hash_index_block.GetValue()->ContentSlice();
+        size_t header_bytes = 0;
+        ExperimentalSstHashIndexHeaderV1 h;
+        Status ps =
+            DecodeExperimentalSstHashIndexHeaderV1(content, &h, &header_bytes);
+        if (ps.ok() && h.version == 1u && h.fingerprint_bits == 16u &&
+            h.hint_type == 0u && (h.num_slots & (h.num_slots - 1u)) == 0u &&
+            h.num_slots >= 2u) {
+          const size_t need =
+              header_bytes + static_cast<size_t>(h.num_data_blocks) * 16u +
+              static_cast<size_t>(h.num_slots) * 12u;
+          if (need <= content.size()) {
+            rep_->experimental_sst_hash_index_header = h;
+            rep_->experimental_sst_hash_index_block_dir =
+                content.data() + header_bytes;
+            rep_->experimental_sst_hash_index_slots =
+                rep_->experimental_sst_hash_index_block_dir +
+                static_cast<size_t>(h.num_data_blocks) * 16u;
+            rep_->experimental_sst_hash_index_slots_mask = h.num_slots - 1u;
+            rep_->experimental_sst_hash_index_available = true;
+          }
+        }
+      }
+    }
   }
 
   BlockBasedTableOptions::IndexType index_type = rep_->index_type;
@@ -2526,6 +2576,147 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
                             &lookup_context, read_options);
   TEST_SYNC_POINT("BlockBasedTable::Get:AfterFilterMatch");
   if (may_match) {
+    if (rep_->experimental_sst_hash_index_available &&
+        rep_->internal_comparator.user_comparator()->timestamp_size() == 0) {
+      const Slice user_key = ExtractUserKey(key);
+      const uint32_t mask = rep_->experimental_sst_hash_index_slots_mask;
+      const uint64_t hash = Hash64(user_key.data(), user_key.size(),
+                                   rep_->experimental_sst_hash_index_header
+                                       .hash_seed);
+      const uint16_t fp16 =
+          static_cast<uint16_t>((hash >> 48) & 0xFFFFu);
+
+      uint32_t idx = static_cast<uint32_t>(hash) & mask;
+      for (uint32_t probe = 0; probe <= mask; ++probe) {
+        const char* p = rep_->experimental_sst_hash_index_slots +
+                        static_cast<size_t>(idx) * 12u;
+        ExperimentalSstHashIndexSlotV1 slot =
+            DecodeExperimentalSstHashIndexSlotV1(p);
+        if (slot.block_id == kExperimentalSstHashIndexEmptyBlockId) {
+          break;
+        }
+        if (slot.fp16 == fp16 &&
+            slot.block_id < rep_->experimental_sst_hash_index_header
+                                .num_data_blocks) {
+          const uint32_t block_id = slot.block_id;
+          const uint16_t restart_idx = slot.restart_idx;
+
+          uint64_t block_off = 0;
+          uint64_t block_sz = 0;
+          const char* dir = rep_->experimental_sst_hash_index_block_dir +
+                            static_cast<size_t>(block_id) * 16u;
+          Status ds = DecodeExperimentalSstHashIndexBlockDirEntry(
+              dir,
+              rep_->experimental_sst_hash_index_block_dir +
+                  static_cast<size_t>(rep_->experimental_sst_hash_index_header
+                                          .num_data_blocks) *
+                      16u,
+              &block_off, &block_sz);
+          if (ds.ok()) {
+            BlockHandle data_handle;
+            data_handle.set_offset(block_off);
+            data_handle.set_size(block_sz);
+
+            BlockCacheLookupContext lookup_data_block_context{
+                TableReaderCaller::kUserGet, tracing_get_id,
+                /*get_from_user_specified_snapshot=*/read_options.snapshot !=
+                    nullptr};
+
+            bool matched = false;
+            bool done = false;
+            DataBlockIter biter;
+            uint64_t referenced_data_size = 0;
+            bool does_referenced_key_exist = false;
+            Status tmp_status;
+            NewDataBlockIterator<DataBlockIter>(
+                read_options, data_handle, &biter, BlockType::kData, get_context,
+                &lookup_data_block_context, /*prefetch_buffer=*/nullptr,
+                /*for_compaction=*/false, /*async_read=*/false, tmp_status,
+                /*use_block_cache_for_lookup=*/true);
+
+            if (read_options.read_tier == kBlockCacheTier &&
+                biter.status().IsIncomplete()) {
+              get_context->MarkKeyMayExist();
+              s = biter.status();
+              done = true;
+            } else if (!biter.status().ok()) {
+              s = biter.status();
+              done = true;
+            } else {
+              (void)restart_idx;  // MVP: hint reserved for later use.
+              const bool may_exist = biter.SeekForGet(key);
+              if (may_exist && biter.Valid() &&
+                  UserComparatorWrapper(
+                      rep_->internal_comparator.user_comparator())
+                          .CompareWithoutTimestamp(ExtractUserKey(biter.key()),
+                                                   user_key) == 0) {
+                for (; biter.Valid(); biter.Next()) {
+                  ParsedInternalKey parsed_key;
+                  Status pik_status =
+                      ParseInternalKey(biter.key(), &parsed_key,
+                                       false /* log_err_key */);
+                  if (!pik_status.ok()) {
+                    s = pik_status;
+                    break;
+                  }
+                  Status read_status;
+                  bool ret = get_context->SaveValue(
+                      parsed_key, biter.value(), &matched, &read_status,
+                      biter.IsValuePinned() ? &biter : nullptr);
+                  if (!read_status.ok()) {
+                    s = read_status;
+                    break;
+                  }
+                  if (!ret) {
+                    if (get_context->State() == GetContext::GetState::kFound) {
+                      does_referenced_key_exist = true;
+                      referenced_data_size =
+                          biter.key().size() + biter.value().size();
+                    }
+                    done = true;
+                    break;
+                  }
+                }
+                if (s.ok()) {
+                  s = biter.status();
+                }
+              }
+            }
+
+            if (block_cache_tracer_ &&
+                block_cache_tracer_->is_tracing_enabled()) {
+              Slice referenced_key;
+              if (does_referenced_key_exist) {
+                referenced_key = biter.key();
+              } else {
+                referenced_key = key;
+              }
+              FinishTraceRecord(lookup_data_block_context,
+                                lookup_data_block_context.block_key,
+                                referenced_key, does_referenced_key_exist,
+                                referenced_data_size);
+            }
+
+            if (done) {
+              if (matched && filter != nullptr) {
+                if (rep_->whole_key_filtering) {
+                  RecordTick(rep_->ioptions.stats,
+                             BLOOM_FILTER_FULL_TRUE_POSITIVE);
+                } else {
+                  RecordTick(rep_->ioptions.stats,
+                             BLOOM_FILTER_PREFIX_TRUE_POSITIVE);
+                }
+                PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_full_true_positive, 1,
+                                          rep_->level);
+              }
+              return s;
+            }
+          }
+        }
+        idx = (idx + 1u) & mask;
+      }
+    }
+
     IndexBlockIter iiter_on_stack;
     // if prefix_extractor found in block differs from options, disable
     // BlockPrefixIndex. Only do this check when index_type is kHashSearch.

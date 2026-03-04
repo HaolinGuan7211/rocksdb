@@ -275,6 +275,21 @@ static struct BlockBasedTableTypeInfo {
          {offsetof(struct BlockBasedTableOptions,
                    data_block_hash_table_util_ratio),
           OptionType::kDouble, OptionVerificationType::kNormal}},
+        {"experimental_sst_hash_index_enable",
+         {offsetof(struct BlockBasedTableOptions,
+                   experimental_sst_hash_index_enable),
+          OptionType::kBoolean, OptionVerificationType::kNormal}},
+        {"experimental_sst_hash_index_load_factor",
+         {offsetof(struct BlockBasedTableOptions,
+                   experimental_sst_hash_index_load_factor),
+          OptionType::kDouble, OptionVerificationType::kNormal}},
+        {"experimental_sst_hash_index_fingerprint_bits",
+         {offsetof(struct BlockBasedTableOptions,
+                   experimental_sst_hash_index_fingerprint_bits),
+          OptionType::kUInt32T, OptionVerificationType::kNormal}},
+        {"experimental_sst_hash_index_pin",
+         {offsetof(struct BlockBasedTableOptions, experimental_sst_hash_index_pin),
+          OptionType::kBoolean, OptionVerificationType::kNormal}},
         {"checksum",
          {offsetof(struct BlockBasedTableOptions, checksum),
           OptionType::kChecksumType, OptionVerificationType::kNormal}},
@@ -847,6 +862,20 @@ std::string BlockBasedTableFactory::GetPrintableOptions() const {
   ret.append(buffer);
   snprintf(buffer, kBufferSize, "  data_block_hash_table_util_ratio: %lf\n",
            table_options_.data_block_hash_table_util_ratio);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  experimental_sst_hash_index_enable: %d\n",
+           table_options_.experimental_sst_hash_index_enable);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize,
+           "  experimental_sst_hash_index_load_factor: %lf\n",
+           table_options_.experimental_sst_hash_index_load_factor);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize,
+           "  experimental_sst_hash_index_fingerprint_bits: %" PRIu32 "\n",
+           table_options_.experimental_sst_hash_index_fingerprint_bits);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  experimental_sst_hash_index_pin: %d\n",
+           table_options_.experimental_sst_hash_index_pin);
   ret.append(buffer);
   snprintf(buffer, kBufferSize, "  checksum: %d\n", table_options_.checksum);
   ret.append(buffer);

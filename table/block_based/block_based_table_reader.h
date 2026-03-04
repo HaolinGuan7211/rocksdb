@@ -26,6 +26,7 @@
 #include "table/block_based/block_type.h"
 #include "table/block_based/cachable_entry.h"
 #include "table/block_based/filter_block.h"
+#include "table/block_based/sst_hash_index_format.h"
 #include "table/block_based/uncompression_dict_reader.h"
 #include "table/format.h"
 #include "table/persistent_cache_options.h"
@@ -718,6 +719,16 @@ struct BlockBasedTable::Rep {
       table_reader_cache_res_handle = nullptr;
 
   CachableEntry<Block_kUserDefinedIndex> udi_block;
+
+  // EXPERIMENTAL: Per-SST point-lookup hash index meta block.
+  // When available and enabled, it can accelerate point lookups / iterator Seek
+  // by mapping user_key -> data block id + restart hint.
+  CachableEntry<Block_kUserDefinedIndex> experimental_sst_hash_index_block;
+  bool experimental_sst_hash_index_available = false;
+  ExperimentalSstHashIndexHeaderV1 experimental_sst_hash_index_header;
+  const char* experimental_sst_hash_index_block_dir = nullptr;
+  const char* experimental_sst_hash_index_slots = nullptr;
+  uint32_t experimental_sst_hash_index_slots_mask = 0;
 
   SequenceNumber get_global_seqno(BlockType block_type) const {
     return (block_type == BlockType::kFilterPartitionIndex ||

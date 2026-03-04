@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <list>
 #include <map>
 #include <memory>
@@ -46,6 +47,7 @@
 #include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/full_filter_block.h"
 #include "table/block_based/partitioned_filter_block.h"
+#include "table/block_based/sst_hash_index_format.h"
 #include "table/block_based/user_defined_index_wrapper.h"
 #include "table/format.h"
 #include "table/meta_blocks.h"
@@ -54,6 +56,7 @@
 #include "util/coding.h"
 #include "util/compression.h"
 #include "util/defer.h"
+#include "util/hash.h"
 #include "util/semaphore.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
@@ -67,6 +70,78 @@ extern const std::string kHashIndexPrefixesMetadataBlock;
 namespace {
 
 constexpr size_t kBlockTrailerSize = BlockBasedTable::kBlockTrailerSize;
+
+struct ExperimentalSstHashIndexEntry {
+  uint64_t hash = 0;
+  uint32_t block_id = kExperimentalSstHashIndexEmptyBlockId;
+  uint16_t fp16 = 0;
+  uint16_t restart_idx = 0;
+  uint16_t within = 0;
+};
+
+inline uint32_t NextPow2(uint32_t v) {
+  if (v <= 1) {
+    return 1;
+  }
+  v--;
+  v |= v >> 1;
+  v |= v >> 2;
+  v |= v >> 4;
+  v |= v >> 8;
+  v |= v >> 16;
+  return v + 1;
+}
+
+inline uint32_t SstHashBucket1(uint64_t hash, uint32_t mask) {
+  return static_cast<uint32_t>(hash) & mask;
+}
+
+Status BuildExperimentalSstHashIndexLinearProbing(
+    const std::vector<ExperimentalSstHashIndexEntry>& entries,
+    double load_factor, uint32_t* num_slots_out,
+    std::vector<ExperimentalSstHashIndexSlotV1>* slots_out) {
+  if (num_slots_out == nullptr || slots_out == nullptr) {
+    return Status::InvalidArgument("sst_hash_index build: null output");
+  }
+  *num_slots_out = 0;
+  slots_out->clear();
+  if (entries.empty()) {
+    return Status::OK();
+  }
+  if (!(load_factor > 0.1 && load_factor < 0.99)) {
+    return Status::InvalidArgument("sst_hash_index build: bad load_factor");
+  }
+
+  uint32_t m = static_cast<uint32_t>(
+      static_cast<double>(entries.size()) / load_factor + 1.0);
+  m = NextPow2(std::max<uint32_t>(m, 2u));
+  if (m > (1u << 30)) {
+    return Status::InvalidArgument("sst_hash_index build: too many slots");
+  }
+  const uint32_t mask = m - 1;
+
+  slots_out->assign(m, ExperimentalSstHashIndexSlotV1{});
+  for (const auto& e : entries) {
+    uint32_t idx = SstHashBucket1(e.hash, mask);
+    for (uint32_t probe = 0; probe < m; ++probe) {
+      auto& slot = (*slots_out)[idx];
+      if (slot.block_id == kExperimentalSstHashIndexEmptyBlockId) {
+        slot.block_id = e.block_id;
+        slot.fp16 = e.fp16;
+        slot.restart_idx = e.restart_idx;
+        slot.within = e.within;
+        slot.reserved = 0;
+        break;
+      }
+      idx = (idx + 1u) & mask;
+      if (probe + 1u == m) {
+        return Status::Incomplete("sst_hash_index build: table full");
+      }
+    }
+  }
+  *num_slots_out = m;
+  return Status::OK();
+}
 
 // Create a filter block builder based on its type.
 FilterBlockBuilder* CreateFilterBlockBuilder(
@@ -913,6 +988,19 @@ struct BlockBasedTableBuilder::Rep {
 
   BlockHandle pending_handle;  // Handle to add to index block
 
+  // EXPERIMENTAL: Per-SST point-lookup hash index build state (MVP).
+  // The index is written as a meta block and maps user_key -> data block id +
+  // restart hint. Correctness is enforced by verifying against the data block
+  // contents and falling back to standard index search on mismatch.
+  bool experimental_sst_hash_index_enabled = false;
+  uint64_t experimental_sst_hash_index_seed = 0;
+  uint32_t experimental_sst_hash_entry_idx_in_block = 0;
+  std::string experimental_sst_hash_last_user_key;
+  std::vector<ExperimentalSstHashIndexEntry>
+      experimental_sst_hash_current_block_entries;
+  std::vector<ExperimentalSstHashIndexEntry> experimental_sst_hash_entries;
+  std::vector<BlockHandle> experimental_sst_hash_block_dir;
+
   GrowableBuffer single_threaded_compressed_output;
   std::unique_ptr<FlushBlockPolicy> flush_block_policy;
 
@@ -1049,7 +1137,8 @@ struct BlockBasedTableBuilder::Rep {
         compression_parallel_threads(
             ((table_opt.partition_filters &&
               !table_opt.decouple_partitioned_filters) ||
-             table_options.user_defined_index_factory)
+             table_options.user_defined_index_factory ||
+             table_opt.experimental_sst_hash_index_enable)
                 ? uint32_t{1}
                 : tbo.compression_opts.parallel_threads),
         max_compressed_bytes_per_kb(
@@ -1313,6 +1402,14 @@ struct BlockBasedTableBuilder::Rep {
       SetStatus(Status::InvalidArgument(
           "Enable block_align, but compression enabled"));
     }
+
+    experimental_sst_hash_index_seed = Random::GetTLSInstance()->Next64();
+    experimental_sst_hash_index_enabled =
+        table_options.experimental_sst_hash_index_enable &&
+        (table_options.experimental_sst_hash_index_fingerprint_bits == 16u) &&
+        (ts_sz == 0) && (state == State::kUnbuffered) &&
+        !tbo.internal_comparator.user_comparator()
+             ->CanKeysWithDifferentByteContentsBeEqual();
   }
 
   ~Rep() {
@@ -1431,6 +1528,16 @@ struct BlockBasedTableBuilder::Rep {
   IOStatus io_status;
 };
 
+inline uint16_t ExperimentalSstHashIndexFingerprint16(uint64_t hash) {
+  return static_cast<uint16_t>((hash >> 48) & 0xFFFFu);
+}
+
+inline bool ExperimentalSstHashIndexSameUserKey(const std::string& last,
+                                                const Slice& user_key) {
+  return last.size() == user_key.size() &&
+         memcmp(last.data(), user_key.data(), user_key.size()) == 0;
+}
+
 BlockBasedTableBuilder::BlockBasedTableBuilder(
     const BlockBasedTableOptions& table_options, const TableBuilderOptions& tbo,
     WritableFileWriter* file) {
@@ -1502,6 +1609,44 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
       }
     }
 
+    if (UNLIKELY(r->experimental_sst_hash_index_enabled)) {
+      const Slice user_key = ExtractUserKeyAndStripTimestamp(ikey, r->ts_sz);
+
+      const uint32_t restart_interval =
+          static_cast<uint32_t>(r->table_options.block_restart_interval);
+      const uint32_t entry_idx = r->experimental_sst_hash_entry_idx_in_block;
+      const uint32_t restart_idx =
+          restart_interval > 0 ? (entry_idx / restart_interval) : 0;
+      const uint32_t within =
+          restart_interval > 0 ? (entry_idx % restart_interval) : 0;
+      r->experimental_sst_hash_entry_idx_in_block = entry_idx + 1;
+
+      if (!ExperimentalSstHashIndexSameUserKey(
+              r->experimental_sst_hash_last_user_key, user_key)) {
+        r->experimental_sst_hash_last_user_key.assign(user_key.data(),
+                                                      user_key.size());
+
+        if (LIKELY(restart_idx <= 0xFFFFu && within <= 0xFFFFu)) {
+          const uint64_t hash =
+              Hash64(user_key.data(), user_key.size(),
+                     r->experimental_sst_hash_index_seed);
+          ExperimentalSstHashIndexEntry e;
+          e.hash = hash;
+          e.fp16 = ExperimentalSstHashIndexFingerprint16(hash);
+          e.restart_idx = static_cast<uint16_t>(restart_idx);
+          e.within = static_cast<uint16_t>(within);
+          r->experimental_sst_hash_current_block_entries.push_back(e);
+        } else {
+          // Give up on building the experimental index for this file.
+          r->experimental_sst_hash_index_enabled = false;
+          r->experimental_sst_hash_entry_idx_in_block = 0;
+          r->experimental_sst_hash_last_user_key.clear();
+          r->experimental_sst_hash_current_block_entries.clear();
+          r->experimental_sst_hash_entries.clear();
+          r->experimental_sst_hash_block_dir.clear();
+        }
+      }
+    }
     r->data_block.AddWithLastKey(ikey, value, r->last_ikey);
     r->last_ikey.assign(ikey.data(), ikey.size());
     assert(!r->last_ikey.empty());
@@ -1738,6 +1883,17 @@ void BlockBasedTableBuilder::EmitBlock(std::string& uncompressed,
   WriteBlock(uncompressed, &r->pending_handle, BlockType::kData,
              &skip_delta_encoding);
   if (LIKELY(ok())) {
+    if (UNLIKELY(r->experimental_sst_hash_index_enabled)) {
+      const uint32_t block_id =
+          static_cast<uint32_t>(r->experimental_sst_hash_block_dir.size());
+      r->experimental_sst_hash_block_dir.push_back(r->pending_handle);
+      for (auto& e : r->experimental_sst_hash_current_block_entries) {
+        e.block_id = block_id;
+        r->experimental_sst_hash_entries.push_back(e);
+      }
+      r->experimental_sst_hash_current_block_entries.clear();
+      r->experimental_sst_hash_entry_idx_in_block = 0;
+    }
     // We do not emit the index entry for a block until we have seen the
     // first key for the next data block.  This allows us to use shorter
     // keys in the index block.  For example, consider a block boundary
@@ -2385,6 +2541,141 @@ void BlockBasedTableBuilder::WriteIndexBlock(
   }
 }
 
+void BlockBasedTableBuilder::WriteExperimentalSstHashIndexBlock(
+    MetaIndexBuilder* meta_index_builder) {
+  Rep* r = rep_.get();
+  {
+    std::string v;
+    PutFixed32(&v, r->table_options.experimental_sst_hash_index_enable ? 1u : 0u);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_hash_index.enable_requested"] = v;
+  }
+  if (meta_index_builder == nullptr) {
+    return;
+  }
+  if (UNLIKELY(!ok())) {
+    return;
+  }
+  if (!r->experimental_sst_hash_index_enabled) {
+    std::string v;
+    PutFixed32(&v, 0u);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_hash_index.enabled_for_file"] = v;
+    return;
+  }
+  {
+    std::string v;
+    PutFixed32(&v, 1u);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_hash_index.enabled_for_file"] = v;
+  }
+  {
+    std::string v;
+    PutFixed32(&v, static_cast<uint32_t>(r->experimental_sst_hash_entries.size()));
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_hash_index.entries_collected"] = v;
+  }
+  {
+    std::string v;
+    PutFixed32(
+        &v, static_cast<uint32_t>(r->experimental_sst_hash_block_dir.size()));
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_hash_index.data_blocks_collected"] = v;
+  }
+  if (r->experimental_sst_hash_entries.empty() ||
+      r->experimental_sst_hash_block_dir.empty()) {
+    std::string v;
+    PutFixed32(&v, 0u);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_hash_index.built"] = v;
+    return;
+  }
+
+  uint32_t num_slots = 0;
+  std::vector<ExperimentalSstHashIndexSlotV1> slots;
+
+  double lf = r->table_options.experimental_sst_hash_index_load_factor;
+  Status build_s = Status::Incomplete();
+  for (int attempt = 0; attempt < 4 && build_s.IsIncomplete(); ++attempt) {
+    build_s = BuildExperimentalSstHashIndexLinearProbing(
+        r->experimental_sst_hash_entries, lf, &num_slots, &slots);
+    lf *= 0.9;
+    if (lf <= 0.11) {
+      break;
+    }
+  }
+  if (UNLIKELY(!build_s.ok())) {
+    // Treat build issues as "index unavailable" and fall back to standard
+    // index search for this SST.
+    std::string v;
+    PutFixed32(&v, 0u);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_hash_index.built"] = v;
+    return;
+  }
+  {
+    std::string v;
+    PutFixed32(&v, 1u);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_hash_index.built"] = v;
+  }
+
+  ExperimentalSstHashIndexHeaderV1 h;
+  h.version = 1;
+  h.flags = 0;
+  h.user_key_fixed_len = 0;
+  h.fingerprint_bits = 16;
+  h.hash_seed = r->experimental_sst_hash_index_seed;
+  h.restart_interval =
+      static_cast<uint32_t>(r->table_options.block_restart_interval);
+  h.hint_type = 0;  // restart_only
+  h.num_data_blocks =
+      static_cast<uint32_t>(r->experimental_sst_hash_block_dir.size());
+  h.num_slots = num_slots;
+  h.num_entries = static_cast<uint32_t>(r->experimental_sst_hash_entries.size());
+  {
+    std::string v;
+    PutFixed32(&v, h.num_entries);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_hash_index.num_entries"] = v;
+  }
+  {
+    std::string v;
+    PutFixed32(&v, h.num_data_blocks);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_hash_index.num_data_blocks"] = v;
+  }
+  {
+    std::string v;
+    PutFixed32(&v, h.num_slots);
+    r->props.user_collected_properties
+        ["rocksdb.experimental.sst_hash_index.num_slots"] = v;
+  }
+
+  std::string header_buf;
+  EncodeExperimentalSstHashIndexHeaderV1(h, &header_buf);
+
+  std::string out;
+  out.reserve(header_buf.size() + h.num_data_blocks * 16u +
+              static_cast<size_t>(h.num_slots) * 12u);
+  out.append(header_buf);
+
+  for (const auto& bh : r->experimental_sst_hash_block_dir) {
+    EncodeExperimentalSstHashIndexBlockDirEntry(bh.offset(), bh.size(), &out);
+  }
+  for (const auto& s : slots) {
+    EncodeExperimentalSstHashIndexSlotV1(s, &out);
+  }
+
+  BlockHandle hash_index_handle;
+  WriteMaybeCompressedBlock(out, kNoCompression, &hash_index_handle,
+                            BlockType::kUserDefinedIndex);
+  if (LIKELY(ok())) {
+    meta_index_builder->Add(kExperimentalSstHashIndexMetaBlockName,
+                            hash_index_handle);
+  }
+}
+
 void BlockBasedTableBuilder::WritePropertiesBlock(
     MetaIndexBuilder* meta_index_builder) {
   BlockHandle properties_block_handle;
@@ -2766,15 +3057,17 @@ Status BlockBasedTableBuilder::Finish() {
   // Write meta blocks, metaindex block and footer in the following order.
   //    1. [meta block: filter]
   //    2. [meta block: index]
-  //    3. [meta block: compression dictionary]
-  //    4. [meta block: range deletion tombstone]
-  //    5. [meta block: properties]
-  //    6. [metaindex block]
-  //    7. Footer
+  //    3. [meta block: experimental sst_hash_index (optional)]
+  //    4. [meta block: compression dictionary]
+  //    5. [meta block: range deletion tombstone]
+  //    6. [meta block: properties]
+  //    7. [metaindex block]
+  //    8. Footer
   BlockHandle metaindex_block_handle, index_block_handle;
   MetaIndexBuilder meta_index_builder;
   WriteFilterBlock(&meta_index_builder);
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
+  WriteExperimentalSstHashIndexBlock(&meta_index_builder);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
   WritePropertiesBlock(&meta_index_builder);

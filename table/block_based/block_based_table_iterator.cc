@@ -8,6 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "table/block_based/block_based_table_iterator.h"
 
+#include "util/hash.h"
+
 namespace ROCKSDB_NAMESPACE {
 
 void BlockBasedTableIterator::SeekToFirst() { SeekImpl(nullptr, false); }
@@ -116,6 +118,83 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
           user_comparator_.Compare(ExtractUserKey(*target),
                                    index_iter_->user_key()) < 0) {
         need_seek_index = false;
+      }
+    }
+  }
+
+  // EXPERIMENTAL: use per-SST hash index to position index iterator directly
+  // (mixgraph Seek-heavy path). This avoids an index block binary seek on point
+  // seeks, while preserving iterator correctness for subsequent Next().
+  if (need_seek_index && target != nullptr) {
+    const auto* rep = table_->get_rep();
+    if (rep->experimental_sst_hash_index_available &&
+        rep->internal_comparator.user_comparator()->timestamp_size() == 0 &&
+        (rep->index_type == BlockBasedTableOptions::kBinarySearch ||
+         rep->index_type == BlockBasedTableOptions::kBinarySearchWithFirstKey) &&
+        rep->table_options.index_block_restart_interval == 1) {
+      const Slice user_key = ExtractUserKey(*target);
+      const uint32_t mask = rep->experimental_sst_hash_index_slots_mask;
+      const uint64_t hash =
+          Hash64(user_key.data(), user_key.size(),
+                 rep->experimental_sst_hash_index_header.hash_seed);
+      const uint16_t fp16 = static_cast<uint16_t>((hash >> 48) & 0xFFFFu);
+
+      uint32_t idx = static_cast<uint32_t>(hash) & mask;
+      for (uint32_t probe = 0; probe <= mask; ++probe) {
+        const char* p = rep->experimental_sst_hash_index_slots +
+                        static_cast<size_t>(idx) * 12u;
+        ExperimentalSstHashIndexSlotV1 slot =
+            DecodeExperimentalSstHashIndexSlotV1(p);
+        if (slot.block_id == kExperimentalSstHashIndexEmptyBlockId) {
+          break;
+        }
+        if (slot.fp16 == fp16 &&
+            slot.block_id < rep->experimental_sst_hash_index_header
+                                .num_data_blocks) {
+          const uint32_t block_id = slot.block_id;
+          const uint16_t restart_idx = slot.restart_idx;
+
+          auto* idx_iter = static_cast<IndexBlockIter*>(index_iter_.get());
+          idx_iter->SeekToRestartPoint(block_id);
+          idx_iter->Next();
+          if (idx_iter->Valid()) {
+            // Validate the chosen index entry using user-key bounds from
+            // neighboring index entries. This protects correctness under
+            // fingerprint collisions.
+            const Slice upper = idx_iter->user_key();
+            Slice lower;
+            bool has_lower = false;
+            if (block_id > 0) {
+              idx_iter->Prev();
+              if (idx_iter->Valid()) {
+                lower = idx_iter->user_key();
+                has_lower = true;
+              }
+              idx_iter->Next();
+              assert(idx_iter->Valid());
+            }
+
+            const Slice target_user = ExtractUserKey(*target);
+            bool ok = true;
+            if (has_lower && user_comparator_.Compare(target_user, lower) <= 0) {
+              ok = false;
+            }
+            const uint32_t last_block_id =
+                rep->experimental_sst_hash_index_header.num_data_blocks - 1u;
+            if (block_id < last_block_id &&
+                user_comparator_.Compare(target_user, upper) >= 0) {
+              ok = false;
+            }
+
+            if (ok) {
+              (void)restart_idx;  // MVP: hint reserved for later use.
+              is_index_at_curr_block_ = true;
+              need_seek_index = false;
+              break;
+            }
+          }
+        }
+        idx = (idx + 1u) & mask;
       }
     }
   }

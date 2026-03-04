@@ -376,6 +376,45 @@ class BlockBasedTableReaderTest
 
 class BlockBasedTableReaderGetTest : public BlockBasedTableReaderTest {};
 
+class ExperimentalSstHashIndexReaderTest : public BlockBasedTableReaderBaseTest {
+ protected:
+  void ConfigureTableFactory() override {
+    BlockBasedTableOptions opts;
+    opts.index_type = BlockBasedTableOptions::kBinarySearch;
+    opts.index_block_restart_interval = 1;
+    opts.filter_policy.reset(NewBloomFilterPolicy(10, false));
+    opts.experimental_sst_hash_index_enable = true;
+    opts.experimental_sst_hash_index_pin = true;
+    options_.table_factory.reset(
+        static_cast<BlockBasedTableFactory*>(NewBlockBasedTableFactory(opts)));
+  }
+};
+
+TEST_F(ExperimentalSstHashIndexReaderTest, LoadsMetaBlock) {
+  std::vector<std::pair<std::string, std::string>> kv =
+      BlockBasedTableReaderBaseTest::GenerateKVMap(
+          10 /* num_block */, false /* mixed_with_human_readable_string_value */,
+          0 /* ts_sz */, false /* same_key_diff_ts */);
+  std::string table_name = "ExperimentalSstHashIndexReaderTest_LoadsMetaBlock";
+
+  Options options;
+  ImmutableOptions ioptions(options);
+  CreateTable(table_name, ioptions, kNoCompression, kv,
+              1 /* compression_parallel_threads */, 0 /* compression_dict */);
+
+  std::unique_ptr<BlockBasedTable> table;
+  FileOptions foptions;
+  InternalKeyComparator comparator(options.comparator);
+  NewBlockBasedTableReader(foptions, ioptions, comparator, table_name, &table);
+
+  ASSERT_TRUE(table);
+  ASSERT_TRUE(table->get_rep()->table_options.experimental_sst_hash_index_enable);
+  ASSERT_TRUE(table->get_rep()->experimental_sst_hash_index_available);
+  ASSERT_GE(table->get_rep()->experimental_sst_hash_index_header.num_slots, 2u);
+  ASSERT_GT(table->get_rep()->experimental_sst_hash_index_header.num_entries,
+            0u);
+}
+
 TEST_P(BlockBasedTableReaderGetTest, Get) {
   Options options;
   if (udt_enabled_) {

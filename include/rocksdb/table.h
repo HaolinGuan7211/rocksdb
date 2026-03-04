@@ -263,6 +263,23 @@ struct BlockBasedTableOptions {
 
   IndexType index_type = kBinarySearch;
 
+  // EXPERIMENTAL: Per-SST point-lookup hash index stored as a meta block.
+  // When enabled (and when the user comparator is bytewise with no user
+  // timestamps), the table builder writes a compact hash index that maps
+  // user_key -> data block id + restart hint. The table reader can use it to
+  // bypass index block binary search on point lookups / iterator Seek, without
+  // changing data block format or increasing I/O amplification.
+  bool experimental_sst_hash_index_enable = false;
+  // Target load factor for the hash table (cuckoo/2-choice). Higher values save
+  // space but can increase build retries and false positives.
+  double experimental_sst_hash_index_load_factor = 0.90;
+  // Fingerprint bits stored per slot. 16 is a good MVP tradeoff; larger reduces
+  // false positives but increases meta block size.
+  uint32_t experimental_sst_hash_index_fingerprint_bits = 16;
+  // If true, pin the hash index meta block for the lifetime of the table
+  // reader to avoid extra reads on lookups.
+  bool experimental_sst_hash_index_pin = true;
+
   // The index type that will be used for the data block.
   enum DataBlockIndexType : char {
     kDataBlockBinarySearch = 0,   // traditional block type
