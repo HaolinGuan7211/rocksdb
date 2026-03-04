@@ -2679,6 +2679,29 @@ void BlockBasedTableBuilder::WriteExperimentalSstSeekDirBlock(
     h.flags |= kExperimentalSstSeekDirFlagNoOffsets;
   }
 
+  if (h.user_key_fixed_len == 16u && !r->experimental_sst_seek_dir_keys.empty()) {
+    // Detect db_bench's default fixed-len key layout:
+    //   [ uint64_be(v) ][ '0' * 8 ]
+    //
+    // This is a strict check over all boundary keys. When true, Seek() can
+    // compare only the first 8 bytes during directory binary search.
+    const char* p = r->experimental_sst_seek_dir_keys.data();
+    bool ok = (r->experimental_sst_seek_dir_keys.size() ==
+               static_cast<size_t>(num_data_blocks) * 16u);
+    for (uint32_t i = 0; ok && i < num_data_blocks; ++i) {
+      const char* k = p + static_cast<size_t>(i) * 16u;
+      for (size_t j = 8; j < 16u; ++j) {
+        if (k[j] != '0') {
+          ok = false;
+          break;
+        }
+      }
+    }
+    if (ok) {
+      h.flags |= kExperimentalSstSeekDirFlagSuffixAllAscii0_8B;
+    }
+  }
+
   std::string header_buf;
   EncodeExperimentalSstSeekDirHeaderV1(h, &header_buf);
 

@@ -12,6 +12,7 @@
 
 #include "util/coding.h"
 #include "util/hash.h"
+#include "util/math.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -236,13 +237,41 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
             ++perf->experimental_sst_seek_dir_seek_used_direct_index;
           }
           const char* const target_p = target_user.data();
+          const bool can_compare_8b =
+              (fixed_len == 16u) &&
+              ((flags & kExperimentalSstSeekDirFlagSuffixAllAscii0_8B) != 0u) &&
+              target_p[8] == '0' && target_p[9] == '0' && target_p[10] == '0' &&
+              target_p[11] == '0' && target_p[12] == '0' &&
+              target_p[13] == '0' && target_p[14] == '0' &&
+              target_p[15] == '0';
+          uint64_t target_be64 = 0;
+          if (can_compare_8b) {
+            std::memcpy(&target_be64, target_p, sizeof(target_be64));
+            if (port::kLittleEndian) {
+              target_be64 = EndianSwapValue(target_be64);
+            }
+          }
           while (lo < hi) {
             const uint32_t mid = lo + (hi - lo) / 2u;
             const char* const boundary_p =
                 keys + static_cast<size_t>(mid) * fixed_len;
-            const int cmp = memcmp(boundary_p, target_p, fixed_len);
+            int cmp = 0;
+            if (can_compare_8b) {
+              uint64_t boundary_be64 = 0;
+              std::memcpy(&boundary_be64, boundary_p, sizeof(boundary_be64));
+              if (port::kLittleEndian) {
+                boundary_be64 = EndianSwapValue(boundary_be64);
+              }
+              cmp = (boundary_be64 < target_be64) ? -1
+                                                  : (boundary_be64 > target_be64)
+                                                        ? 1
+                                                        : 0;
+              cmp_bytes += 8u;
+            } else {
+              cmp = memcmp(boundary_p, target_p, fixed_len);
+              cmp_bytes += fixed_len;
+            }
             ++binary_steps;
-            cmp_bytes += fixed_len;
             if (cmp < 0) {
               lo = mid + 1u;
             } else {

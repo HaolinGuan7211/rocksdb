@@ -23,6 +23,13 @@ inline constexpr const char kExperimentalSstSeekDirMetaBlockName[] =
 // When set, the meta block uses a fixed-len layout without offsets:
 //   [header][keys_blob], where keys_blob has (num_data_blocks * user_key_fixed_len) bytes.
 inline constexpr uint32_t kExperimentalSstSeekDirFlagNoOffsets = 1u << 0;
+// When set, all boundary user keys in the meta block have:
+//   user_key_fixed_len == 16 and key[8..15] == '0' * 8 (ASCII),
+// matching db_bench's default fixed-len key layout:
+//   [ uint64_be(v) ][ '0' * 8 ]
+// In this case, Seek() binary search can compare only the first 8 bytes.
+inline constexpr uint32_t kExperimentalSstSeekDirFlagSuffixAllAscii0_8B =
+    1u << 1;
 
 // On-disk header (fixed-size, little endian).
 //
