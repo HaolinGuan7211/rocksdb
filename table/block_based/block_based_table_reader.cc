@@ -74,6 +74,7 @@
 #include "util/coding.h"
 #include "util/crc32c.h"
 #include "util/hash.h"
+#include "util/math.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 
@@ -1303,12 +1304,33 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
               const size_t expect_keys_bytes =
                   static_cast<size_t>(h.num_data_blocks) *
                   static_cast<size_t>(h.user_key_fixed_len);
-              if (keys_bytes == expect_keys_bytes && keys_bytes <= 0xFFFFFFFFu) {
+              if (keys_bytes == expect_keys_bytes &&
+                  keys_bytes <= 0xFFFFFFFFu) {
                 rep_->experimental_sst_seek_dir_header = h;
                 rep_->experimental_sst_seek_dir_key_offsets = nullptr;
                 rep_->experimental_sst_seek_dir_keys_blob = content.data() + need;
                 rep_->experimental_sst_seek_dir_keys_bytes =
                     static_cast<uint32_t>(keys_bytes);
+                rep_->experimental_sst_seek_dir_keys_prefix_u64.clear();
+                if (h.user_key_fixed_len == 16u &&
+                    (h.flags &
+                     kExperimentalSstSeekDirFlagSuffixAllAscii0_8B) != 0u) {
+                  // Pre-decode the first 8 bytes of each boundary key into a
+                  // host-order integer for iterator Seek() binary search.
+                  rep_->experimental_sst_seek_dir_keys_prefix_u64.resize(
+                      h.num_data_blocks);
+                  const char* const p =
+                      rep_->experimental_sst_seek_dir_keys_blob;
+                  for (uint32_t i = 0; i < h.num_data_blocks; ++i) {
+                    uint64_t be64 = 0;
+                    std::memcpy(&be64, p + static_cast<size_t>(i) * 16u,
+                                sizeof(be64));
+                    if (port::kLittleEndian) {
+                      be64 = EndianSwapValue(be64);
+                    }
+                    rep_->experimental_sst_seek_dir_keys_prefix_u64[i] = be64;
+                  }
+                }
                 rep_->experimental_sst_seek_dir_available = true;
               }
             }
@@ -1324,6 +1346,7 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
                   rep_->experimental_sst_seek_dir_key_offsets + offsets_bytes;
               rep_->experimental_sst_seek_dir_keys_bytes =
                   static_cast<uint32_t>(content.size() - need);
+              rep_->experimental_sst_seek_dir_keys_prefix_u64.clear();
               rep_->experimental_sst_seek_dir_available = true;
             }
           }

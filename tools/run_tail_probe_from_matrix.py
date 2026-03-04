@@ -534,6 +534,12 @@ def build_sample_row(
         "sst_seek_dir_seek_used_direct_index": to_int(
             tr.get("delta_experimental_sst_seek_dir_seek_used_direct_index", 0)
         ),
+        "sst_seek_dir_seek_used_predecoded_prefix_u64": to_int(
+            tr.get(
+                "delta_experimental_sst_seek_dir_seek_used_predecoded_prefix_u64",
+                0,
+            )
+        ),
         "stage_memtable_route_us": stage["memtable_route"],
         "stage_table_open_meta_us": stage["table_open_meta"],
         "stage_filter_maymatch_cpu_us": stage["filter_maymatch_cpu"],

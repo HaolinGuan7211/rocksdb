@@ -251,12 +251,25 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
               target_be64 = EndianSwapValue(target_be64);
             }
           }
+          const bool use_predecoded_prefix_u64 =
+              can_compare_8b &&
+              rep->experimental_sst_seek_dir_keys_prefix_u64.size() == n;
+          if (perf != nullptr && use_predecoded_prefix_u64) {
+            ++perf->experimental_sst_seek_dir_seek_used_predecoded_prefix_u64;
+          }
           while (lo < hi) {
             const uint32_t mid = lo + (hi - lo) / 2u;
             const char* const boundary_p =
                 keys + static_cast<size_t>(mid) * fixed_len;
             int cmp = 0;
-            if (can_compare_8b) {
+            if (use_predecoded_prefix_u64) {
+              const uint64_t boundary_be64 =
+                  rep->experimental_sst_seek_dir_keys_prefix_u64[mid];
+              cmp = (boundary_be64 < target_be64)
+                        ? -1
+                        : (boundary_be64 > target_be64) ? 1 : 0;
+              cmp_bytes += 8u;
+            } else if (can_compare_8b) {
               uint64_t boundary_be64 = 0;
               std::memcpy(&boundary_be64, boundary_p, sizeof(boundary_be64));
               if (port::kLittleEndian) {

@@ -269,6 +269,9 @@ struct PerfContextBase {
   // Number of lookups where the code path used direct indexing into the keys
   // blob (fixed-len key layout), avoiding offset decoding.
   uint64_t experimental_sst_seek_dir_seek_used_direct_index;
+  // Number of lookups where the code path used pre-decoded 8B boundary prefixes
+  // (numeric compare on the first 8 bytes of 16B keys with suffix "00000000").
+  uint64_t experimental_sst_seek_dir_seek_used_predecoded_prefix_u64;
 
   // Time spent waiting on key locks in transaction lock manager.
   // This metric gets collected starting from

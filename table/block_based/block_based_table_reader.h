@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
@@ -741,6 +742,12 @@ struct BlockBasedTable::Rep {
   const char* experimental_sst_seek_dir_key_offsets = nullptr;
   const char* experimental_sst_seek_dir_keys_blob = nullptr;
   uint32_t experimental_sst_seek_dir_keys_bytes = 0;
+  // Optional derived view for a common fixed-len key pattern used by db_bench:
+  // user_key_fixed_len==16 and suffix == "00000000". In that case, comparisons
+  // between boundary keys and the target key can be reduced to comparing only
+  // the first 8 bytes. We pre-decode those bytes for all boundary keys to avoid
+  // per-step loads and endian swaps during binary search.
+  std::vector<uint64_t> experimental_sst_seek_dir_keys_prefix_u64;
 
   SequenceNumber get_global_seqno(BlockType block_type) const {
     return (block_type == BlockType::kFilterPartitionIndex ||

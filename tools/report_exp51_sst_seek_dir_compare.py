@@ -135,6 +135,7 @@ def summarize_samples(samples: List[Dict[str, str]]) -> Dict[str, object]:
     sd_num_blocks_sum: List[float] = []
     sd_layout_no_offsets: List[float] = []
     sd_used_direct_index: List[float] = []
+    sd_used_predecoded_prefix_u64: List[float] = []
     for r in samples:
         v = _safe_float(r.get("latency_us"))
         if v is not None:
@@ -172,6 +173,9 @@ def summarize_samples(samples: List[Dict[str, str]]) -> Dict[str, object]:
         s_di = _safe_float(r.get("sst_seek_dir_seek_used_direct_index"))
         if s_di is not None:
             sd_used_direct_index.append(s_di)
+        s_u64 = _safe_float(r.get("sst_seek_dir_seek_used_predecoded_prefix_u64"))
+        if s_u64 is not None:
+            sd_used_predecoded_prefix_u64.append(s_u64)
 
     out: Dict[str, object] = {"samples": len(samples)}
     out["lat_p50_us"] = _quantile(lat, 0.50) or ""
@@ -202,6 +206,11 @@ def summarize_samples(samples: List[Dict[str, str]]) -> Dict[str, object]:
     )
     out["avg_sst_seek_dir_seek_used_direct_index"] = (
         (sum(sd_used_direct_index) / len(sd_used_direct_index)) if sd_used_direct_index else ""
+    )
+    out["avg_sst_seek_dir_seek_used_predecoded_prefix_u64"] = (
+        (sum(sd_used_predecoded_prefix_u64) / len(sd_used_predecoded_prefix_u64))
+        if sd_used_predecoded_prefix_u64
+        else ""
     )
 
     total_lookups = sum(sd_lookups) if sd_lookups else 0.0
