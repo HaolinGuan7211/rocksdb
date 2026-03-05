@@ -8,7 +8,11 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "table/block_based/block_based_table_iterator.h"
 
+#include <algorithm>
+
+#include "util/coding.h"
 #include "util/hash.h"
+#include "util/math.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -118,6 +122,323 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
           user_comparator_.Compare(ExtractUserKey(*target),
                                    index_iter_->user_key()) < 0) {
         need_seek_index = false;
+      }
+    }
+  }
+
+  // EXPERIMENTAL: per-SST Seek() directory for Seek-heavy workloads.
+  //
+  // Unlike exact-key hashing, this directory is lower_bound-friendly: it maps
+  // the target user key to a candidate data-block id by binary searching
+  // per-data-block boundary user keys. It then positions the index iterator in
+  // O(1) using restart-point access (requires index_block_restart_interval==1).
+  if (need_seek_index && target != nullptr) {
+    const auto* rep = table_->get_rep();
+    if (rep->experimental_sst_seek_dir_available &&
+        rep->internal_comparator.user_comparator()->timestamp_size() == 0 &&
+        (rep->index_type == BlockBasedTableOptions::kBinarySearch ||
+         rep->index_type == BlockBasedTableOptions::kBinarySearchWithFirstKey) &&
+        rep->table_options.index_block_restart_interval == 1) {
+      PerfContext* const perf = get_perf_context();
+      if (perf != nullptr) {
+        ++perf->experimental_sst_seek_dir_seek_lookups;
+      }
+
+      const Slice target_user = ExtractUserKey(*target);
+      const bool is_bytewise =
+          rep->internal_comparator.user_comparator() == BytewiseComparator();
+      const uint32_t n = rep->experimental_sst_seek_dir_header.num_data_blocks;
+      if (perf != nullptr) {
+        perf->experimental_sst_seek_dir_seek_num_data_blocks_sum += n;
+      }
+      const char* keys = rep->experimental_sst_seek_dir_keys_blob;
+      const uint32_t keys_bytes = rep->experimental_sst_seek_dir_keys_bytes;
+
+      const uint32_t flags = rep->experimental_sst_seek_dir_header.flags;
+      const bool no_offsets =
+          (flags & kExperimentalSstSeekDirFlagNoOffsets) != 0u;
+      const char* offs = rep->experimental_sst_seek_dir_key_offsets;
+
+      uint32_t fixed_len =
+          rep->experimental_sst_seek_dir_header.user_key_fixed_len;
+      bool direct_index = false;
+      bool valid_layout = true;
+      if (no_offsets) {
+        if (perf != nullptr) {
+          ++perf->experimental_sst_seek_dir_seek_layout_no_offsets;
+        }
+        if (fixed_len > 0 &&
+            static_cast<uint64_t>(n) * fixed_len == keys_bytes) {
+          direct_index = true;
+        } else {
+          // Invalid layout; fall back to the normal index seek path.
+          valid_layout = false;
+        }
+      } else if (is_bytewise && n > 0) {
+        if (fixed_len > 0) {
+          direct_index = true;
+        } else if (keys_bytes % n == 0) {
+          const uint32_t cand = keys_bytes / n;
+          if (cand > 0) {
+            const uint32_t verify = std::min<uint32_t>(n, 8u);
+            bool ok = true;
+            for (uint32_t i = 0; i < verify; ++i) {
+              const uint32_t off_i =
+                  DecodeFixed32(offs + static_cast<size_t>(i) * 4u);
+              if (off_i != i * cand) {
+                ok = false;
+                break;
+              }
+            }
+            const uint32_t off_last =
+                DecodeFixed32(offs + static_cast<size_t>(n) * 4u);
+            if (ok && off_last == keys_bytes) {
+              fixed_len = cand;
+              direct_index = true;
+            }
+          }
+        }
+      }
+
+      auto key_at = [&](uint32_t i) -> Slice {
+        if (direct_index) {
+          const uint64_t s = static_cast<uint64_t>(i) * fixed_len;
+          const uint64_t e = s + fixed_len;
+          if (UNLIKELY(e > keys_bytes)) {
+            return Slice();
+          }
+          return Slice(keys + s, fixed_len);
+        }
+        if (UNLIKELY(offs == nullptr)) {
+          return Slice();
+        }
+        const uint32_t s = DecodeFixed32(offs + static_cast<size_t>(i) * 4u);
+        const uint32_t e =
+            DecodeFixed32(offs + static_cast<size_t>(i + 1u) * 4u);
+        if (UNLIKELY(e < s || e > keys_bytes)) {
+          return Slice();
+        }
+        return Slice(keys + s, e - s);
+      };
+
+      bool used = false;
+      bool fallback = false;
+      uint64_t binary_steps = 0;
+      uint64_t cmp_bytes = 0;
+      if (!valid_layout) {
+        used = false;
+        fallback = true;
+      } else {
+        uint32_t lo = 0, hi = n;
+        if (direct_index && is_bytewise && fixed_len > 0 &&
+            target_user.size() == fixed_len) {
+          // Fast path: fixed-len bytewise compare without Slice construction.
+          if (perf != nullptr) {
+            ++perf->experimental_sst_seek_dir_seek_used_direct_index;
+          }
+          const char* const target_p = target_user.data();
+          const auto& prefixes = rep->experimental_sst_seek_dir_keys_prefix_u64;
+          const bool use_predecoded_prefix_u64 =
+              (fixed_len == 16u) && target_user.size() == 16u &&
+              prefixes.size() == n;
+          uint64_t target_prefix_be64 = 0;
+          if (use_predecoded_prefix_u64) {
+            std::memcpy(&target_prefix_be64, target_p, sizeof(target_prefix_be64));
+            if (port::kLittleEndian) {
+              target_prefix_be64 = EndianSwapValue(target_prefix_be64);
+            }
+          }
+          const bool can_compare_8b =
+              (fixed_len == 16u) &&
+              ((flags & kExperimentalSstSeekDirFlagSuffixAllAscii0_8B) != 0u) &&
+              target_p[8] == '0' && target_p[9] == '0' && target_p[10] == '0' &&
+              target_p[11] == '0' && target_p[12] == '0' &&
+              target_p[13] == '0' && target_p[14] == '0' &&
+              target_p[15] == '0';
+          const uint64_t target_be64 = target_prefix_be64;
+          if (perf != nullptr && use_predecoded_prefix_u64) {
+            ++perf->experimental_sst_seek_dir_seek_used_predecoded_prefix_u64;
+          }
+          if (use_predecoded_prefix_u64 && can_compare_8b) {
+            // Interpolation + bounded binary search on numeric key ids.
+            //
+            // In typical db_bench fillseq setups, user keys are essentially an
+            // increasing 64-bit id with a constant suffix. Boundary keys are
+            // sampled from those ids, so we can often estimate the correct
+            // block id with a very small window search, reducing the number of
+            // comparisons per lookup.
+            if (UNLIKELY(prefixes.empty())) {
+              fallback = true;
+            } else {
+              uint32_t lo2 = 0;
+              uint32_t hi2 = n;
+              const uint64_t first = prefixes.front();
+              const uint64_t last = prefixes.back();
+              if (target_be64 <= first) {
+                lo2 = 0;
+                hi2 = 0;
+              } else if (target_be64 > last) {
+                lo2 = n;
+                hi2 = n;
+              } else if (last > first) {
+                const uint64_t span = last - first;
+                const uint64_t rel = target_be64 - first;
+                const uint32_t guess = static_cast<uint32_t>(
+                    (static_cast<__int128>(rel) * static_cast<__int128>(n - 1u)) /
+                    static_cast<__int128>(span));
+                constexpr uint32_t kWindow = 32u;
+                lo2 = (guess > kWindow) ? (guess - kWindow) : 0u;
+                hi2 = std::min<uint32_t>(n, guess + kWindow + 1u);
+                // If the estimate is wildly off (e.g., due to skew), fall back
+                // to full-range binary search to preserve correctness.
+                if (UNLIKELY(target_be64 < prefixes[lo2] ||
+                             target_be64 > prefixes[hi2 - 1u])) {
+                  lo2 = 0;
+                  hi2 = n;
+                }
+              }
+
+              lo = lo2;
+              hi = hi2;
+              while (lo < hi) {
+                const uint32_t mid = lo + (hi - lo) / 2u;
+                const uint64_t boundary_be64 = prefixes[mid];
+                const int cmp = (boundary_be64 < target_be64)
+                                    ? -1
+                                    : (boundary_be64 > target_be64) ? 1 : 0;
+                cmp_bytes += 8u;
+                ++binary_steps;
+                if (cmp < 0) {
+                  lo = mid + 1u;
+                } else {
+                  hi = mid;
+                }
+              }
+            }
+          } else if (use_predecoded_prefix_u64) {
+            while (lo < hi) {
+              const uint32_t mid = lo + (hi - lo) / 2u;
+              const uint64_t boundary_prefix_be64 = prefixes[mid];
+              int cmp = 0;
+              cmp_bytes += 8u;
+              if (boundary_prefix_be64 < target_prefix_be64) {
+                cmp = -1;
+              } else if (boundary_prefix_be64 > target_prefix_be64) {
+                cmp = 1;
+              } else {
+                const char* const boundary_p =
+                    keys + static_cast<size_t>(mid) * fixed_len;
+                cmp = memcmp(boundary_p + 8u, target_p + 8u, 8u);
+                cmp_bytes += 8u;
+              }
+              ++binary_steps;
+              if (cmp < 0) {
+                lo = mid + 1u;
+              } else {
+                hi = mid;
+              }
+            }
+          } else {
+            while (lo < hi) {
+              const uint32_t mid = lo + (hi - lo) / 2u;
+              const char* const boundary_p =
+                  keys + static_cast<size_t>(mid) * fixed_len;
+              int cmp = 0;
+              if (can_compare_8b) {
+                uint64_t boundary_be64 = 0;
+                std::memcpy(&boundary_be64, boundary_p, sizeof(boundary_be64));
+                if (port::kLittleEndian) {
+                  boundary_be64 = EndianSwapValue(boundary_be64);
+                }
+                cmp = (boundary_be64 < target_be64)
+                          ? -1
+                          : (boundary_be64 > target_be64) ? 1 : 0;
+                cmp_bytes += 8u;
+              } else {
+                cmp = memcmp(boundary_p, target_p, fixed_len);
+                cmp_bytes += fixed_len;
+              }
+              ++binary_steps;
+              if (cmp < 0) {
+                lo = mid + 1u;
+              } else {
+                hi = mid;
+              }
+            }
+          }
+        } else {
+          while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2u;
+            const Slice boundary = key_at(mid);
+            if (UNLIKELY(boundary.data() == nullptr)) {
+              fallback = true;
+              break;
+            }
+            int cmp = 0;
+            if (is_bytewise) {
+              if (fixed_len > 0 && boundary.size() == fixed_len &&
+                  target_user.size() == fixed_len) {
+                cmp = memcmp(boundary.data(), target_user.data(), fixed_len);
+                cmp_bytes += fixed_len;
+              } else {
+                const size_t ncmp =
+                    std::min(boundary.size(), target_user.size());
+                cmp = (ncmp == 0)
+                          ? 0
+                          : memcmp(boundary.data(), target_user.data(), ncmp);
+                cmp_bytes += ncmp;
+                if (cmp == 0 && boundary.size() != target_user.size()) {
+                  cmp = (boundary.size() < target_user.size()) ? -1 : 1;
+                }
+              }
+            } else {
+              cmp = user_comparator_.Compare(boundary, target_user);
+            }
+            ++binary_steps;
+            if (cmp < 0) {
+              lo = mid + 1u;
+            } else {
+              hi = mid;
+            }
+          }
+        }
+
+        if (!fallback) {
+          used = true;
+          if (lo >= n) {
+            // Target is beyond the max user key in this SST.
+            index_iter_->SeekToLast();
+            index_iter_->Next();  // make invalid (like Seek beyond last).
+            is_index_at_curr_block_ = true;
+            need_seek_index = false;
+            if (perf != nullptr) {
+              ++perf->experimental_sst_seek_dir_seek_hits;
+            }
+          }
+
+          if (need_seek_index) {
+            auto* idx_iter = static_cast<IndexBlockIter*>(index_iter_.get());
+            idx_iter->SeekToRestartPoint(lo);
+            idx_iter->Next();
+            if (idx_iter->Valid()) {
+              is_index_at_curr_block_ = true;
+              need_seek_index = false;
+              if (perf != nullptr) {
+                ++perf->experimental_sst_seek_dir_seek_hits;
+              }
+            } else {
+              fallback = true;
+            }
+          }
+        }
+      }
+
+      if (perf != nullptr && (!used || fallback)) {
+        ++perf->experimental_sst_seek_dir_seek_fallbacks;
+      }
+      if (perf != nullptr) {
+        perf->experimental_sst_seek_dir_seek_binary_steps += binary_steps;
+        perf->experimental_sst_seek_dir_seek_cmp_bytes += cmp_bytes;
       }
     }
   }

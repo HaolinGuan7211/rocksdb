@@ -74,6 +74,7 @@
 #include "util/coding.h"
 #include "util/crc32c.h"
 #include "util/hash.h"
+#include "util/math.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 
@@ -1265,6 +1266,97 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
                                    &rep_->compression_dict_handle);
   if (!s.ok()) {
     return s;
+  }
+
+  // Optional experimental per-SST Seek() directory meta block.
+  if (table_options.experimental_sst_seek_dir_enable) {
+    BlockHandle sst_seek_dir_handle;
+    s = FindOptionalMetaBlock(meta_iter, kExperimentalSstSeekDirMetaBlockName,
+                              &sst_seek_dir_handle);
+    if (!s.ok()) {
+      return s;
+    }
+    if (sst_seek_dir_handle.size() > 0) {
+      const bool use_cache_for_seek_dir =
+          table_options.experimental_sst_seek_dir_pin
+              ? table_options.cache_index_and_filter_blocks
+              : false;
+
+      Status sd = RetrieveBlock(
+          prefetch_buffer, ro, sst_seek_dir_handle, rep_->decompressor.get(),
+          &rep_->experimental_sst_seek_dir_block, /*get_context=*/nullptr,
+          lookup_context, /*for_compaction=*/false, use_cache_for_seek_dir,
+          /*async_read=*/false, /*use_block_cache_for_lookup=*/false);
+      if (sd.ok() && !rep_->experimental_sst_seek_dir_block.IsEmpty()) {
+        const Slice content =
+            rep_->experimental_sst_seek_dir_block.GetValue()->ContentSlice();
+        size_t header_bytes = 0;
+        ExperimentalSstSeekDirHeaderV1 h;
+        Status ps =
+            DecodeExperimentalSstSeekDirHeaderV1(content, &h, &header_bytes);
+        if (ps.ok() && h.version == 1u && h.num_data_blocks > 0) {
+          const bool no_offsets =
+              (h.flags & kExperimentalSstSeekDirFlagNoOffsets) != 0u;
+          if (no_offsets) {
+            const size_t need = header_bytes;
+            if (h.user_key_fixed_len > 0u && need <= content.size()) {
+              const size_t keys_bytes = content.size() - need;
+              const size_t expect_keys_bytes =
+                  static_cast<size_t>(h.num_data_blocks) *
+                  static_cast<size_t>(h.user_key_fixed_len);
+              if (keys_bytes == expect_keys_bytes &&
+                  keys_bytes <= 0xFFFFFFFFu) {
+                rep_->experimental_sst_seek_dir_header = h;
+                rep_->experimental_sst_seek_dir_key_offsets = nullptr;
+                rep_->experimental_sst_seek_dir_keys_blob = content.data() + need;
+                rep_->experimental_sst_seek_dir_keys_bytes =
+                    static_cast<uint32_t>(keys_bytes);
+                rep_->experimental_sst_seek_dir_keys_prefix_u64.clear();
+                if (h.user_key_fixed_len == 16u) {
+                  // Pre-decode the first 8 bytes of each boundary key into a
+                  // host-order integer for iterator Seek() binary search.
+                  //
+                  // This benefits both:
+                  // 1) ASCII-suffix numeric keys (interpolation + bounded
+                  //    binary search), and
+                  // 2) generic 16B bytewise keys (prefix-first comparisons
+                  //    with full-compare fallback on prefix ties).
+                  rep_->experimental_sst_seek_dir_keys_prefix_u64.resize(
+                      h.num_data_blocks);
+                  const char* const p =
+                      rep_->experimental_sst_seek_dir_keys_blob;
+                  for (uint32_t i = 0; i < h.num_data_blocks; ++i) {
+                    uint64_t be64 = 0;
+                    std::memcpy(&be64, p + static_cast<size_t>(i) * 16u,
+                                sizeof(be64));
+                    if (port::kLittleEndian) {
+                      be64 = EndianSwapValue(be64);
+                    }
+                    rep_->experimental_sst_seek_dir_keys_prefix_u64[i] = be64;
+                  }
+                }
+                rep_->experimental_sst_seek_dir_available = true;
+              }
+            }
+          } else {
+            const size_t offsets_bytes =
+                static_cast<size_t>(h.num_data_blocks + 1u) * 4u;
+            const size_t need = header_bytes + offsets_bytes;
+            if (need <= content.size() && (content.size() - need) <= 0xFFFFFFFFu) {
+              rep_->experimental_sst_seek_dir_header = h;
+              rep_->experimental_sst_seek_dir_key_offsets =
+                  content.data() + header_bytes;
+              rep_->experimental_sst_seek_dir_keys_blob =
+                  rep_->experimental_sst_seek_dir_key_offsets + offsets_bytes;
+              rep_->experimental_sst_seek_dir_keys_bytes =
+                  static_cast<uint32_t>(content.size() - need);
+              rep_->experimental_sst_seek_dir_keys_prefix_u64.clear();
+              rep_->experimental_sst_seek_dir_available = true;
+            }
+          }
+        }
+      }
+    }
   }
 
   // Optional experimental per-SST hash index meta block.
