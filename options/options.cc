@@ -78,6 +78,13 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       compaction_pri(options.compaction_pri),
       compaction_options_universal(options.compaction_options_universal),
       compaction_options_fifo(options.compaction_options_fifo),
+      zigzag_staging_enabled(options.zigzag_staging_enabled),
+      zigzag_staging_source_level(options.zigzag_staging_source_level),
+      zigzag_staging_max_source_level(options.zigzag_staging_max_source_level),
+      zigzag_staging_level_capacity_bytes(
+          options.zigzag_staging_level_capacity_bytes),
+      zigzag_staging_partition_flush_threshold_bytes(
+          options.zigzag_staging_partition_flush_threshold_bytes),
       max_sequential_skip_in_iterations(
           options.max_sequential_skip_in_iterations),
       memtable_factory(options.memtable_factory),
@@ -333,6 +340,19 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   }
   ROCKS_LOG_HEADER(log, "                         Options.compaction_pri: %s",
                    str_compaction_pri.c_str());
+  ROCKS_LOG_HEADER(log, "                  Options.zigzag_staging_enabled: %d",
+                   zigzag_staging_enabled);
+  ROCKS_LOG_HEADER(log, "             Options.zigzag_staging_source_level: %d",
+                   zigzag_staging_source_level);
+  ROCKS_LOG_HEADER(log, "         Options.zigzag_staging_max_source_level: %d",
+                   zigzag_staging_max_source_level);
+  ROCKS_LOG_HEADER(log,
+                   "     Options.zigzag_staging_level_capacity_bytes: %" PRIu64,
+                   zigzag_staging_level_capacity_bytes);
+  ROCKS_LOG_HEADER(
+      log,
+      "Options.zigzag_staging_partition_flush_threshold_bytes: %" PRIu64,
+      zigzag_staging_partition_flush_threshold_bytes);
   ROCKS_LOG_HEADER(log, "Options.compaction_options_universal.size_ratio: %u",
                    compaction_options_universal.size_ratio);
   ROCKS_LOG_HEADER(log,

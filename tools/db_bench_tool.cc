@@ -545,6 +545,28 @@ DEFINE_int32(compaction_pri,
              (int32_t)ROCKSDB_NAMESPACE::Options().compaction_pri,
              "priority of files to compaction: by size or by data age");
 
+DEFINE_bool(zigzag_staging_enabled,
+            ROCKSDB_NAMESPACE::Options().zigzag_staging_enabled,
+            "Enable ZigZag-style staging mirror during compaction.");
+
+DEFINE_int32(zigzag_staging_source_level,
+             ROCKSDB_NAMESPACE::Options().zigzag_staging_source_level,
+             "Source level for ZigZag staging migration.");
+
+DEFINE_int32(zigzag_staging_max_source_level,
+             ROCKSDB_NAMESPACE::Options().zigzag_staging_max_source_level,
+             "Maximum source level for ZigZag staging migration.");
+
+DEFINE_uint64(zigzag_staging_level_capacity_bytes,
+              ROCKSDB_NAMESPACE::Options().zigzag_staging_level_capacity_bytes,
+              "Capacity trigger for one ZigZag staging level in bytes.");
+
+DEFINE_uint64(
+    zigzag_staging_partition_flush_threshold_bytes,
+    ROCKSDB_NAMESPACE::Options()
+        .zigzag_staging_partition_flush_threshold_bytes,
+    "Per-partition flush threshold for ZigZag staging in bytes.");
+
 DEFINE_int32(universal_size_ratio, 0,
              "Percentage flexibility while comparing file size "
              "(for universal compaction only).");
@@ -6027,6 +6049,14 @@ class Benchmark {
     options.max_background_flushes = FLAGS_max_background_flushes;
     options.compaction_style = FLAGS_compaction_style_e;
     options.compaction_pri = FLAGS_compaction_pri_e;
+    options.zigzag_staging_enabled = FLAGS_zigzag_staging_enabled;
+    options.zigzag_staging_source_level = FLAGS_zigzag_staging_source_level;
+    options.zigzag_staging_max_source_level =
+        FLAGS_zigzag_staging_max_source_level;
+    options.zigzag_staging_level_capacity_bytes =
+        FLAGS_zigzag_staging_level_capacity_bytes;
+    options.zigzag_staging_partition_flush_threshold_bytes =
+        FLAGS_zigzag_staging_partition_flush_threshold_bytes;
     options.allow_mmap_reads = FLAGS_mmap_read;
     options.allow_mmap_writes = FLAGS_mmap_write;
     options.use_direct_reads = FLAGS_use_direct_reads;

@@ -2,10 +2,11 @@
 
 ## 1. 目标与分层
 - 本文档是总纲，只定义全局强制规范与流程边界。
-- 具体流程拆分为 3 份专项规范，统一放在 `experiment/workflow_specs/`：
+- 具体流程拆分为 4 份专项规范，统一放在 `experiment/workflow_specs/`：
   - `01_overall_performance_workflow.md`：总体性能分析流程（宏观性能层）。
   - `02_module_macro_analysis_workflow.md`：模块级宏观归因流程（资源账本层）。
   - `03_p99_tail_probe_workflow.md`：P99 长尾探针流程（尾部样本层）。
+  - `04_zigzag_staging_mvp_workflow.md`：ZigZag staging MVP 对照流程（功能与收益验证层）。
 - 三层关系固定：先总体性能，再模块宏观，再 P99 长尾。禁止跳层直接下细粒度结论。
 
 ## 2. 命名与目录规范（强制）
@@ -44,6 +45,7 @@
 - 总体性能流程：`experiment/workflow_specs/01_overall_performance_workflow.md`
 - 模块宏观归因流程：`experiment/workflow_specs/02_module_macro_analysis_workflow.md`
 - P99 长尾探针流程：`experiment/workflow_specs/03_p99_tail_probe_workflow.md`
+- ZigZag staging MVP 流程：`experiment/workflow_specs/04_zigzag_staging_mvp_workflow.md`
 
 ## 7. 快速执行顺序
 1. 按总体性能流程完成 A/B/C 变量矩阵与基础结论。

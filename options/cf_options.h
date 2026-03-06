@@ -84,6 +84,12 @@ struct ImmutableCFOptions {
   bool persist_user_defined_timestamps;
 
   bool cf_allow_ingest_behind;
+
+  bool zigzag_staging_enabled;
+  int zigzag_staging_source_level;
+  int zigzag_staging_max_source_level;
+  uint64_t zigzag_staging_level_capacity_bytes;
+  uint64_t zigzag_staging_partition_flush_threshold_bytes;
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {

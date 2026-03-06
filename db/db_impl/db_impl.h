@@ -83,6 +83,7 @@ class Version;
 class VersionEdit;
 class VersionSet;
 class WriteCallback;
+class ZigZagStagingManager;
 struct JobContext;
 struct ExternalSstFileInfo;
 struct MemTableInfo;
@@ -1493,6 +1494,21 @@ class DBImpl : public DB {
                               ColumnFamilyHandle* column_family,
                               const Slice* begin, const Slice* end,
                               const std::string& trim_ts);
+
+  Status MaybeZigZagStageCompaction(Compaction* c, JobContext* job_context,
+                                    LogBuffer* log_buffer, bool* staged);
+  Status MaybeFlushZigZagStaging(ColumnFamilyData* cfd, int source_level,
+                                 LogBuffer* log_buffer, bool* flushed);
+  Status MaybeFlushAllZigZagStaging(ColumnFamilyData* cfd,
+                                    LogBuffer* log_buffer, bool* flushed_any);
+  Status PersistZigZagStagingMetadata(ColumnFamilyData* cfd);
+  Status RecoverZigZagStagingMetadata(ColumnFamilyData* cfd);
+
+  Status GetFromZigZagStaging(ColumnFamilyData* cfd,
+                              const ReadOptions& read_options,
+                              const Slice& key, PinnableSlice* value,
+                              std::string* timestamp,
+                              bool* found);
 
   // The following two functions can only be called when:
   // 1. WriteThread::Writer::EnterUnbatched() is used.
@@ -3175,6 +3191,7 @@ class DBImpl : public DB {
   // results sequentially. Flush results of memtables with lower IDs get
   // installed to MANIFEST first.
   InstrumentedCondVar atomic_flush_install_cv_;
+  std::unique_ptr<ZigZagStagingManager> zigzag_staging_manager_;
 
   bool wal_in_db_path_;
   std::atomic<uint64_t> max_total_wal_size_;

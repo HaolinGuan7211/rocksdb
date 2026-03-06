@@ -910,6 +910,28 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableCFOptions, cf_allow_ingest_behind),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"zigzag_staging_enabled",
+         {offsetof(struct ImmutableCFOptions, zigzag_staging_enabled),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"zigzag_staging_source_level",
+         {offsetof(struct ImmutableCFOptions, zigzag_staging_source_level),
+          OptionType::kInt, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"zigzag_staging_max_source_level",
+         {offsetof(struct ImmutableCFOptions, zigzag_staging_max_source_level),
+          OptionType::kInt, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"zigzag_staging_level_capacity_bytes",
+         {offsetof(struct ImmutableCFOptions,
+                   zigzag_staging_level_capacity_bytes),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"zigzag_staging_partition_flush_threshold_bytes",
+         {offsetof(struct ImmutableCFOptions,
+                   zigzag_staging_partition_flush_threshold_bytes),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
 };
 
 const std::string OptionsHelper::kCFOptionsName = "ColumnFamilyOptions";
@@ -1050,7 +1072,15 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       blob_cache(cf_options.blob_cache),
       persist_user_defined_timestamps(
           cf_options.persist_user_defined_timestamps),
-      cf_allow_ingest_behind(cf_options.cf_allow_ingest_behind) {}
+      cf_allow_ingest_behind(cf_options.cf_allow_ingest_behind),
+      zigzag_staging_enabled(cf_options.zigzag_staging_enabled),
+      zigzag_staging_source_level(cf_options.zigzag_staging_source_level),
+      zigzag_staging_max_source_level(
+          cf_options.zigzag_staging_max_source_level),
+      zigzag_staging_level_capacity_bytes(
+          cf_options.zigzag_staging_level_capacity_bytes),
+      zigzag_staging_partition_flush_threshold_bytes(
+          cf_options.zigzag_staging_partition_flush_threshold_bytes) {}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 

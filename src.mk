@@ -96,6 +96,8 @@ LIB_SOURCES =                                                   \
   db/version_edit.cc                                            \
   db/version_edit_handler.cc                                    \
   db/version_set.cc                                             \
+  db/zigzag_sst_internal_reader.cc                              \
+  db/zigzag_staging_manager.cc                                  \
   db/wal_edit.cc                                                \
   db/wal_manager.cc                                             \
   db/wide/wide_column_serialization.cc                          \
@@ -517,6 +519,7 @@ TEST_MAIN_SOURCES =                                                     \
   db/db_secondary_test.cc                                               \
   db/db_sst_test.cc                                                     \
   db/db_statistics_test.cc                                              \
+  db/zigzag_staging_test.cc                                             \
   db/db_table_properties_test.cc                                        \
   db/db_tailing_iter_test.cc                                            \
   db/db_test.cc                                                         \

@@ -684,6 +684,44 @@ struct AdvancedColumnFamilyOptions {
   // SetOptions("compaction_options_fifo", "{max_table_files_size=100;}")
   CompactionOptionsFIFO compaction_options_fifo;
 
+  // EXPERIMENTAL: ZigZag-style staging for delayed merge compaction.
+  //
+  // When enabled, RocksDB can mirror selected compaction input files into
+  // an intermediate staging structure (Li+0.5 equivalent) before normal
+  // compaction proceeds. This does not change SST/WAL/MANIFEST file formats.
+  //
+  // Default: false
+  bool zigzag_staging_enabled = false;
+
+  // Source level for triggering no-merge migration.
+  //
+  // For MVP, this is expected to be 0 (L0 -> L0.5 staging).
+  //
+  // Default: 0
+  int zigzag_staging_source_level = 0;
+
+  // Maximum source level for triggering no-merge migration.
+  //
+  // When this is larger than `zigzag_staging_source_level`, ZigZag staging
+  // applies to all source levels in the inclusive range
+  // [`zigzag_staging_source_level`, `zigzag_staging_max_source_level`].
+  //
+  // Default: 0
+  int zigzag_staging_max_source_level = 0;
+
+  // Capacity budget for one staging level (bytes).
+  // Scheduler uses this as the capacity trigger for flush candidate picking.
+  //
+  // Default: 4GiB
+  uint64_t zigzag_staging_level_capacity_bytes = 4ULL * 1024 * 1024 * 1024;
+
+  // Per-partition flush threshold (bytes).
+  // Scheduler treats partitions over this threshold as flush candidates.
+  //
+  // Default: 64MiB
+  uint64_t zigzag_staging_partition_flush_threshold_bytes =
+      64ULL * 1024 * 1024;
+
   // An iteration->Next() sequentially skips over keys with the same
   // user-key unless this option is set. This number specifies the number
   // of keys (with the same userkey) that will be sequentially

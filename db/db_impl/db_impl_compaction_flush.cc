@@ -6,16 +6,21 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include <algorithm>
 #include <cinttypes>
 #include <deque>
 
 #include "db/builder.h"
+#include "db/compaction/compaction_picker.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "db/zigzag_sst_internal_reader.h"
+#include "db/zigzag_staging_manager.h"
 #include "file/file_util.h"
 #include "file/sst_file_manager_impl.h"
 #include "logging/logging.h"
+#include "memory/arena.h"
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/thread_status_updater.h"
@@ -25,6 +30,8 @@
 #include "rocksdb/io_status.h"
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
+#include "table/compaction_merging_iterator.h"
+#include "table/merging_iterator.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
@@ -32,6 +39,677 @@
 #include "util/udt_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+bool HasSameUserRange(const FileMetaData& lhs, const FileMetaData& rhs) {
+  return lhs.smallest.user_key().compare(rhs.smallest.user_key()) == 0 &&
+         lhs.largest.user_key().compare(rhs.largest.user_key()) == 0;
+}
+
+FileMetaData* FindLevelFileByNumber(VersionStorageInfo* vstorage, int level,
+                                    uint64_t file_number) {
+  if (level < 0 || level >= vstorage->num_levels()) {
+    return nullptr;
+  }
+  for (FileMetaData* file : vstorage->LevelFiles(level)) {
+    if (file->fd.GetNumber() == file_number) {
+      return file;
+    }
+  }
+  return nullptr;
+}
+
+const InternalKey* ValidateZigZagTombstoneBound(const InternalKey& key,
+                                                ParsedInternalKey* parsed) {
+  Status s = ParseInternalKey(key.Encode(), parsed, false /* log_err_key */);
+  if (!s.ok()) {
+    return nullptr;
+  }
+  return &key;
+}
+
+Status RefreshZigZagPointKeyBounds(const Options& options,
+                                   const std::string& file_path,
+                                   FileMetaData* meta) {
+  ZigZagSstInternalReader reader(options);
+  Status s = reader.Open(file_path);
+  if (!s.ok()) {
+    return s;
+  }
+
+  ReadOptions read_options(Env::IOActivity::kCompaction);
+  read_options.total_order_seek = true;
+  std::unique_ptr<InternalIterator> iter(
+      reader.NewIterator(read_options, TableReaderCaller::kCompaction));
+  iter->SeekToFirst();
+  s = iter->status();
+  if (!s.ok()) {
+    return s;
+  }
+  if (!iter->Valid()) {
+    return Status::Corruption("empty staged sst");
+  }
+  meta->smallest.DecodeFrom(iter->key());
+
+  iter->SeekToLast();
+  s = iter->status();
+  if (!s.ok()) {
+    return s;
+  }
+  if (!iter->Valid()) {
+    return Status::Corruption("empty staged sst");
+  }
+  meta->largest.DecodeFrom(iter->key());
+  return Status::OK();
+}
+
+uint64_t MinTimestampOr(uint64_t lhs, uint64_t rhs, uint64_t fallback) {
+  if (lhs == 0) {
+    return rhs == 0 ? fallback : rhs;
+  }
+  if (rhs == 0) {
+    return lhs;
+  }
+  return std::min(lhs, rhs);
+}
+
+}  // namespace
+
+Status DBImpl::MaybeZigZagStageCompaction(Compaction* c, JobContext* job_context,
+                                          LogBuffer* log_buffer,
+                                          bool* staged) {
+  *staged = false;
+  if (c == nullptr || zigzag_staging_manager_ == nullptr ||
+      !zigzag_staging_manager_->ShouldProcessCompaction(*c)) {
+    return Status::OK();
+  }
+
+  if (c->num_input_levels() == 0 || c->num_input_files(0) == 0) {
+    return Status::OK();
+  }
+
+  ColumnFamilyData* cfd = c->column_family_data();
+  const int source_level = c->start_level();
+  const int target_level = source_level + 1;
+  const uint64_t now_micros = immutable_db_options_.clock->NowMicros();
+  auto* vstorage = cfd->current()->storage_info();
+  FileMetaData* input_file = nullptr;
+  bool is_shadow = false;
+  uint64_t shadow_file_number = 0;
+  std::vector<FileMetaData*> overlaps;
+  for (size_t file_idx = 0; file_idx < c->num_input_files(0); ++file_idx) {
+    FileMetaData* candidate = c->input(0, file_idx);
+    overlaps.clear();
+    vstorage->GetOverlappingInputs(target_level, &candidate->smallest,
+                                   &candidate->largest, &overlaps);
+    if (overlaps.empty()) {
+      input_file = candidate;
+      break;
+    }
+    if (overlaps.size() == 1 && HasSameUserRange(*candidate, *overlaps[0])) {
+      input_file = candidate;
+      is_shadow = true;
+      shadow_file_number = overlaps[0]->fd.GetNumber();
+      break;
+    }
+  }
+  if (input_file == nullptr) {
+    ROCKS_LOG_BUFFER(
+        log_buffer,
+        "[%s] ZigZag skipped compaction at L%d because no input file "
+        "matched exact-shadow/non-overlap constraints",
+        cfd->GetName().c_str(), source_level);
+    return Status::OK();
+  }
+
+  const std::string smallest = input_file->smallest.user_key().ToString();
+  const std::string largest = input_file->largest.user_key().ToString();
+  const uint64_t partition_id = zigzag_staging_manager_->FindOrCreatePartition(
+      cfd->GetID(), source_level, smallest, largest, is_shadow,
+      shadow_file_number);
+
+  const std::string stage_root = dbname_ + "/zigzag_stage";
+  const std::string cf_stage_dir =
+      stage_root + "/cf_" + std::to_string(cfd->GetID());
+  const std::string level_stage_dir =
+      cf_stage_dir + "/L" + std::to_string(source_level) + "_5";
+  Status s = env_->CreateDirIfMissing(stage_root);
+  if (s.ok()) {
+    s = env_->CreateDirIfMissing(cf_stage_dir);
+  }
+  if (s.ok()) {
+    s = env_->CreateDirIfMissing(level_stage_dir);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+
+  const std::string src_path = TableFileName(cfd->ioptions().cf_paths,
+                                             input_file->fd.GetNumber(),
+                                             input_file->fd.GetPathId());
+  const std::string staged_path = level_stage_dir + "/" +
+                                  std::to_string(input_file->fd.GetNumber()) +
+                                  ".sst";
+
+  IOStatus delete_old_stage =
+      fs_->DeleteFile(staged_path, IOOptions(), nullptr);
+  delete_old_stage.PermitUncheckedError();
+
+  uint64_t src_file_size = 0;
+  IOStatus src_size_s =
+      fs_->GetFileSize(src_path, IOOptions(), &src_file_size, nullptr);
+  if (!src_size_s.ok()) {
+    return src_size_s;
+  }
+
+  IOStatus copy_s = CopyFile(
+      fs_.get(), src_path, input_file->temperature, staged_path,
+      input_file->temperature, src_file_size,
+      immutable_db_options_.use_fsync, io_tracer_);
+  if (!copy_s.ok()) {
+    return copy_s;
+  }
+
+  FileMetaData staged_meta = *input_file;
+  uint64_t staged_file_size = 0;
+  IOStatus staged_size_s =
+      fs_->GetFileSize(staged_path, IOOptions(), &staged_file_size, nullptr);
+  if (!staged_size_s.ok()) {
+    return staged_size_s;
+  }
+  staged_meta.fd =
+      FileDescriptor(staged_meta.fd.GetNumber(), staged_meta.fd.GetPathId(),
+                     staged_file_size, staged_meta.fd.smallest_seqno,
+                     staged_meta.fd.largest_seqno);
+  ColumnFamilyOptions cf_options;
+  UpdateColumnFamilyOptions(cfd->ioptions(), &cf_options);
+  UpdateColumnFamilyOptions(cfd->GetLatestMutableCFOptions(), &cf_options);
+  Options sst_reader_options(BuildDBOptions(immutable_db_options_,
+                                            mutable_db_options_),
+                             cf_options);
+  s = RefreshZigZagPointKeyBounds(sst_reader_options, staged_path, &staged_meta);
+  if (!s.ok()) {
+    return s;
+  }
+
+  VersionEdit edit;
+  edit.SetColumnFamily(cfd->GetID());
+  edit.DeleteFile(source_level, input_file->fd.GetNumber());
+  s = versions_->LogAndApply(cfd, ReadOptions(), WriteOptions(), &edit, &mutex_,
+                             directories_.GetDbDir());
+  if (!s.ok()) {
+    return s;
+  }
+
+  zigzag_staging_manager_->RegisterStagedFile(
+      cfd->GetID(), source_level, partition_id, staged_meta, staged_path,
+      src_path, now_micros);
+  InstallSuperVersionAndScheduleWork(cfd, job_context->superversion_contexts.data());
+  s = PersistZigZagStagingMetadata(cfd);
+  if (!s.ok()) {
+    return s;
+  }
+
+  ROCKS_LOG_BUFFER(
+      log_buffer,
+      "[%s] ZigZag staged file %" PRIu64
+      " from L%d to %s (range=[%s,%s], mode=%s)",
+      cfd->GetName().c_str(), input_file->fd.GetNumber(), source_level,
+      staged_path.c_str(), smallest.c_str(), largest.c_str(),
+      is_shadow ? "shadow" : "non-overlap");
+  *staged = true;
+  return Status::OK();
+}
+
+Status DBImpl::MaybeFlushZigZagStaging(ColumnFamilyData* cfd, int source_level,
+                                       LogBuffer* log_buffer, bool* flushed) {
+  *flushed = false;
+  if (zigzag_staging_manager_ == nullptr ||
+      !cfd->ioptions().zigzag_staging_enabled) {
+    return Status::OK();
+  }
+
+  const int target_level = source_level + 1;
+  auto staged_files = zigzag_staging_manager_->GetFlushableFiles(
+      cfd->GetID(), source_level,
+      cfd->ioptions().zigzag_staging_partition_flush_threshold_bytes);
+  if (staged_files.empty()) {
+    return Status::OK();
+  }
+
+  auto* vstorage = cfd->current()->storage_info();
+  const MutableCFOptions mutable_cf_options = cfd->GetLatestMutableCFOptions();
+  for (const auto& staged_file : staged_files) {
+    std::vector<FileMetaData*> overlaps;
+    vstorage->GetOverlappingInputs(
+        target_level, &staged_file.metadata.smallest,
+        &staged_file.metadata.largest, &overlaps);
+
+    FileMetaData* shadow_target = nullptr;
+    if (staged_file.is_shadow && staged_file.shadow_file_number != 0) {
+      shadow_target = FindLevelFileByNumber(vstorage, target_level,
+                                            staged_file.shadow_file_number);
+    }
+    if (shadow_target == nullptr && overlaps.size() == 1 &&
+        HasSameUserRange(staged_file.metadata, *overlaps[0])) {
+      shadow_target = overlaps[0];
+    }
+
+    if (shadow_target != nullptr &&
+        HasSameUserRange(staged_file.metadata, *shadow_target)) {
+      VersionEdit edit;
+      edit.SetColumnFamily(cfd->GetID());
+      edit.DeleteFile(target_level, shadow_target->fd.GetNumber());
+
+      FileMetaData merged_meta;
+      std::vector<BlobFileAddition> blob_file_additions;
+      TableProperties table_properties;
+      IOStatus io_s;
+      int64_t current_time_secs = 0;
+      immutable_db_options_.clock->GetCurrentTime(&current_time_secs)
+          .PermitUncheckedError();
+      const uint64_t current_time =
+          static_cast<uint64_t>(std::max<int64_t>(0, current_time_secs));
+      merged_meta.fd =
+          FileDescriptor(versions_->NewFileNumber(), shadow_target->fd.GetPathId(), 0);
+      merged_meta.temperature = shadow_target->temperature;
+      merged_meta.oldest_blob_file_number =
+          std::min(staged_file.metadata.oldest_blob_file_number,
+                   shadow_target->oldest_blob_file_number);
+      merged_meta.oldest_ancester_time =
+          MinTimestampOr(staged_file.metadata.oldest_ancester_time,
+                         shadow_target->oldest_ancester_time, current_time);
+      merged_meta.file_creation_time = current_time;
+      merged_meta.epoch_number = cfd->NewEpochNumber();
+
+      std::unique_ptr<std::list<uint64_t>::iterator>
+          pending_outputs_inserted_elem(new std::list<uint64_t>::iterator(
+              CaptureCurrentFileNumberInPendingOutputs()));
+
+      ColumnFamilyOptions cf_options;
+      UpdateColumnFamilyOptions(cfd->ioptions(), &cf_options);
+      UpdateColumnFamilyOptions(mutable_cf_options, &cf_options);
+      Options sst_reader_options(BuildDBOptions(immutable_db_options_,
+                                                mutable_db_options_),
+                                 cf_options);
+      ZigZagSstInternalReader stage_reader(sst_reader_options);
+      ZigZagSstInternalReader shadow_reader(sst_reader_options);
+      Status s = stage_reader.Open(staged_file.path);
+      if (s.IsPathNotFound() || s.IsNotFound()) {
+        zigzag_staging_manager_->RemoveStagedFile(cfd->GetID(), source_level,
+                                                  staged_file.file_number);
+        s = PersistZigZagStagingMetadata(cfd);
+        if (!s.ok()) {
+          return s;
+        }
+        continue;
+      }
+      if (s.ok()) {
+        const std::string shadow_path =
+            TableFileName(cfd->ioptions().cf_paths, shadow_target->fd.GetNumber(),
+                          shadow_target->fd.GetPathId());
+        s = shadow_reader.Open(shadow_path);
+      }
+
+      Version* version = cfd->current();
+      version->Ref();
+      if (s.ok()) {
+        ReadOptions build_read_options(Env::IOActivity::kCompaction);
+        build_read_options.total_order_seek = true;
+        WriteOptions build_write_options(Env::IO_LOW,
+                                         Env::IOActivity::kCompaction);
+        InternalIterator* children[2] = {
+            stage_reader.NewIterator(build_read_options,
+                                     TableReaderCaller::kCompaction),
+            shadow_reader.NewIterator(build_read_options,
+                                      TableReaderCaller::kCompaction)};
+        std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
+            range_del_iters;
+        std::vector<std::pair<std::unique_ptr<TruncatedRangeDelIterator>,
+                              std::unique_ptr<TruncatedRangeDelIterator>**>>
+            range_tombstones;
+        range_tombstones.reserve(2);
+
+        auto append_range_tombstones =
+            [&](ZigZagSstInternalReader* reader, const FileMetaData& file_meta)
+                -> Status {
+          std::unique_ptr<TruncatedRangeDelIterator> truncated = nullptr;
+          std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_for_merge(
+              reader->NewRangeTombstoneIterator(build_read_options));
+          if (range_del_for_merge != nullptr) {
+            Status range_status = range_del_for_merge->status();
+            if (!range_status.ok()) {
+              return range_status;
+            }
+            if (!range_del_for_merge->empty()) {
+              ParsedInternalKey parsed_smallest;
+              ParsedInternalKey parsed_largest;
+              truncated = std::make_unique<TruncatedRangeDelIterator>(
+                  std::move(range_del_for_merge), &cfd->internal_comparator(),
+                  ValidateZigZagTombstoneBound(file_meta.smallest,
+                                               &parsed_smallest),
+                  ValidateZigZagTombstoneBound(file_meta.largest,
+                                               &parsed_largest));
+            }
+          }
+          range_tombstones.emplace_back(std::move(truncated), nullptr);
+
+          std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_for_build(
+              reader->NewRangeTombstoneIterator(build_read_options));
+          if (range_del_for_build != nullptr) {
+            Status range_status = range_del_for_build->status();
+            if (!range_status.ok()) {
+              return range_status;
+            }
+            if (!range_del_for_build->empty()) {
+              range_del_iters.emplace_back(std::move(range_del_for_build));
+            }
+          }
+          return Status::OK();
+        };
+        s = append_range_tombstones(&stage_reader, staged_file.metadata);
+        if (s.ok()) {
+          s = append_range_tombstones(&shadow_reader, *shadow_target);
+        }
+        InternalIterator* merged_iter = nullptr;
+        if (s.ok()) {
+          merged_iter = NewCompactionMergingIterator(
+              &cfd->internal_comparator(), children, 2, range_tombstones,
+              nullptr /* arena */, cfd->internal_stats());
+        }
+        CompressionType compression_type = GetCompressionType(
+            vstorage, mutable_cf_options, target_level, vstorage->base_level());
+        CompressionOptions compression_options =
+            GetCompressionOptions(mutable_cf_options, vstorage, target_level);
+        auto write_hint = vstorage->CalculateSSTWriteHint(
+            target_level,
+            immutable_db_options_.calculate_sst_write_lifetime_hint_set);
+        SequenceNumber earliest_write_conflict_snapshot;
+        std::vector<SequenceNumber> snapshot_seqs =
+            snapshots_.GetAll(&earliest_write_conflict_snapshot);
+        SequenceNumber earliest_snapshot =
+            snapshot_seqs.empty() ? kMaxSequenceNumber : snapshot_seqs.front();
+        auto snapshot_checker = snapshot_checker_.get();
+        if (use_custom_gc_ && snapshot_checker == nullptr) {
+          snapshot_checker = DisableGCSnapshotChecker::Instance();
+        }
+        TableBuilderOptions tboptions(
+            cfd->ioptions(), mutable_cf_options, build_read_options,
+            build_write_options, cfd->internal_comparator(),
+            cfd->internal_tbl_prop_coll_factories(), compression_type,
+            compression_options, cfd->GetID(), cfd->GetName(), target_level,
+            static_cast<int64_t>(current_time), false /* is_bottommost */,
+            TableFileCreationReason::kCompaction,
+            static_cast<int64_t>(merged_meta.oldest_ancester_time),
+            merged_meta.file_creation_time, db_id_, db_session_id_,
+            mutable_cf_options.target_file_size_base, merged_meta.fd.GetNumber(),
+            kMaxSequenceNumber);
+
+        mutex_.Unlock();
+        const std::string& full_history_ts_low_ref = cfd->GetFullHistoryTsLow();
+        const std::string* full_history_ts_low =
+            full_history_ts_low_ref.empty() ? nullptr : &full_history_ts_low_ref;
+        s = BuildTable(
+            dbname_, versions_.get(), immutable_db_options_,
+            tboptions, file_options_for_compaction_, cfd->table_cache(),
+            merged_iter, std::move(range_del_iters), &merged_meta,
+            &blob_file_additions,
+            snapshot_seqs, earliest_snapshot, earliest_write_conflict_snapshot,
+            kMaxSequenceNumber, snapshot_checker,
+            mutable_cf_options.paranoid_file_checks, cfd->internal_stats(),
+            &io_s, io_tracer_, BlobFileCreationReason::kCompaction,
+            &seqno_to_time_mapping_, &event_logger_, 0 /* job_id */,
+            &table_properties, write_hint, full_history_ts_low,
+            &blob_callback_, version);
+        mutex_.Lock();
+        if (!io_s.ok() && s.ok()) {
+          s = io_s;
+        }
+      }
+      version->Unref();
+      ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
+      if (!s.ok()) {
+        return s;
+      }
+
+      if (merged_meta.fd.GetFileSize() > 0) {
+        edit.AddFile(
+            target_level, merged_meta.fd.GetNumber(), merged_meta.fd.GetPathId(),
+            merged_meta.fd.GetFileSize(), merged_meta.smallest,
+            merged_meta.largest, merged_meta.fd.smallest_seqno,
+            merged_meta.fd.largest_seqno, merged_meta.marked_for_compaction,
+            merged_meta.temperature, merged_meta.oldest_blob_file_number,
+            merged_meta.oldest_ancester_time, merged_meta.file_creation_time,
+            merged_meta.epoch_number, merged_meta.file_checksum,
+            merged_meta.file_checksum_func_name, merged_meta.unique_id,
+            merged_meta.compensated_range_deletion_size, merged_meta.tail_size,
+            merged_meta.user_defined_timestamps_persisted);
+      }
+
+      s = versions_->LogAndApply(cfd, ReadOptions(), WriteOptions(), &edit,
+                                 &mutex_, directories_.GetDbDir());
+      if (!s.ok()) {
+        return s;
+      }
+
+      IOStatus remove_stage_copy =
+          fs_->DeleteFile(staged_file.path, IOOptions(), nullptr);
+      remove_stage_copy.PermitUncheckedError();
+      zigzag_staging_manager_->RemoveStagedFile(cfd->GetID(), source_level,
+                                                staged_file.file_number);
+      s = PersistZigZagStagingMetadata(cfd);
+      if (!s.ok()) {
+        return s;
+      }
+      ROCKS_LOG_BUFFER(log_buffer,
+                       "[%s] ZigZag shadow-merged staged file %" PRIu64
+                       " with L%d file %" PRIu64 " into file %" PRIu64,
+                       cfd->GetName().c_str(), staged_file.file_number,
+                       target_level, shadow_target->fd.GetNumber(),
+                       merged_meta.fd.GetNumber());
+      *flushed = true;
+      return Status::OK();
+    }
+
+    if (!overlaps.empty()) {
+      continue;
+    }
+
+    FileMetaData output_meta;
+    std::vector<BlobFileAddition> blob_file_additions;
+    TableProperties table_properties;
+    IOStatus io_s;
+    int64_t current_time_secs = 0;
+    immutable_db_options_.clock->GetCurrentTime(&current_time_secs)
+        .PermitUncheckedError();
+    const uint64_t current_time =
+        static_cast<uint64_t>(std::max<int64_t>(0, current_time_secs));
+    output_meta.fd = FileDescriptor(versions_->NewFileNumber(),
+                                    staged_file.metadata.fd.GetPathId(), 0);
+    output_meta.temperature = staged_file.metadata.temperature;
+    output_meta.oldest_blob_file_number =
+        staged_file.metadata.oldest_blob_file_number;
+    output_meta.oldest_ancester_time = MinTimestampOr(
+        staged_file.metadata.oldest_ancester_time, 0, current_time);
+    output_meta.file_creation_time = current_time;
+    output_meta.epoch_number = cfd->NewEpochNumber();
+
+    std::unique_ptr<std::list<uint64_t>::iterator>
+        pending_outputs_inserted_elem(new std::list<uint64_t>::iterator(
+            CaptureCurrentFileNumberInPendingOutputs()));
+
+    ColumnFamilyOptions cf_options;
+    UpdateColumnFamilyOptions(cfd->ioptions(), &cf_options);
+    UpdateColumnFamilyOptions(mutable_cf_options, &cf_options);
+    Options sst_reader_options(BuildDBOptions(immutable_db_options_,
+                                              mutable_db_options_),
+                               cf_options);
+    ZigZagSstInternalReader stage_reader(sst_reader_options);
+    Status s = stage_reader.Open(staged_file.path);
+    if (s.IsPathNotFound() || s.IsNotFound()) {
+      zigzag_staging_manager_->RemoveStagedFile(cfd->GetID(), source_level,
+                                                staged_file.file_number);
+      s = PersistZigZagStagingMetadata(cfd);
+      if (!s.ok()) {
+        return s;
+      }
+      continue;
+    }
+
+    Version* version = cfd->current();
+    version->Ref();
+    if (s.ok()) {
+      ReadOptions build_read_options(Env::IOActivity::kCompaction);
+      build_read_options.total_order_seek = true;
+      WriteOptions build_write_options(Env::IO_LOW,
+                                       Env::IOActivity::kCompaction);
+      InternalIterator* stage_iter = stage_reader.NewIterator(
+          build_read_options, TableReaderCaller::kCompaction);
+      std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
+          range_del_iters;
+      std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+          stage_reader.NewRangeTombstoneIterator(build_read_options));
+      if (range_del_iter != nullptr) {
+        Status range_status = range_del_iter->status();
+        if (!range_status.ok()) {
+          s = range_status;
+        } else if (!range_del_iter->empty()) {
+          range_del_iters.emplace_back(std::move(range_del_iter));
+        }
+      }
+
+      if (s.ok()) {
+        CompressionType compression_type = GetCompressionType(
+            vstorage, mutable_cf_options, target_level, vstorage->base_level());
+        CompressionOptions compression_options =
+            GetCompressionOptions(mutable_cf_options, vstorage, target_level);
+        auto write_hint = vstorage->CalculateSSTWriteHint(
+            target_level,
+            immutable_db_options_.calculate_sst_write_lifetime_hint_set);
+        SequenceNumber earliest_write_conflict_snapshot;
+        std::vector<SequenceNumber> snapshot_seqs =
+            snapshots_.GetAll(&earliest_write_conflict_snapshot);
+        SequenceNumber earliest_snapshot =
+            snapshot_seqs.empty() ? kMaxSequenceNumber : snapshot_seqs.front();
+        auto snapshot_checker = snapshot_checker_.get();
+        if (use_custom_gc_ && snapshot_checker == nullptr) {
+          snapshot_checker = DisableGCSnapshotChecker::Instance();
+        }
+        TableBuilderOptions tboptions(
+            cfd->ioptions(), mutable_cf_options, build_read_options,
+            build_write_options, cfd->internal_comparator(),
+            cfd->internal_tbl_prop_coll_factories(), compression_type,
+            compression_options, cfd->GetID(), cfd->GetName(), target_level,
+            static_cast<int64_t>(current_time), false /* is_bottommost */,
+            TableFileCreationReason::kCompaction,
+            static_cast<int64_t>(output_meta.oldest_ancester_time),
+            output_meta.file_creation_time, db_id_, db_session_id_,
+            mutable_cf_options.target_file_size_base,
+            output_meta.fd.GetNumber(), kMaxSequenceNumber);
+
+        mutex_.Unlock();
+        const std::string& full_history_ts_low_ref = cfd->GetFullHistoryTsLow();
+        const std::string* full_history_ts_low =
+            full_history_ts_low_ref.empty() ? nullptr : &full_history_ts_low_ref;
+        s = BuildTable(
+            dbname_, versions_.get(), immutable_db_options_, tboptions,
+            file_options_for_compaction_, cfd->table_cache(), stage_iter,
+            std::move(range_del_iters), &output_meta, &blob_file_additions,
+            snapshot_seqs, earliest_snapshot, earliest_write_conflict_snapshot,
+            kMaxSequenceNumber, snapshot_checker,
+            mutable_cf_options.paranoid_file_checks, cfd->internal_stats(),
+            &io_s, io_tracer_, BlobFileCreationReason::kCompaction,
+            &seqno_to_time_mapping_, &event_logger_, 0 /* job_id */,
+            &table_properties, write_hint, full_history_ts_low,
+            &blob_callback_, version);
+        mutex_.Lock();
+        if (!io_s.ok() && s.ok()) {
+          s = io_s;
+        }
+      }
+    }
+    version->Unref();
+    ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
+    if (!s.ok()) {
+      return s;
+    }
+
+    output_meta.smallest = staged_file.metadata.smallest;
+    output_meta.largest = staged_file.metadata.largest;
+
+    VersionEdit edit;
+    edit.SetColumnFamily(cfd->GetID());
+    const FileMetaData& meta = output_meta;
+    edit.AddFile(target_level, meta.fd.GetNumber(), meta.fd.GetPathId(),
+                 meta.fd.GetFileSize(), meta.smallest, meta.largest,
+                 meta.fd.smallest_seqno, meta.fd.largest_seqno,
+                 meta.marked_for_compaction, meta.temperature,
+                 meta.oldest_blob_file_number, meta.oldest_ancester_time,
+                 meta.file_creation_time, meta.epoch_number, meta.file_checksum,
+                 meta.file_checksum_func_name, meta.unique_id,
+                 meta.compensated_range_deletion_size, meta.tail_size,
+                 meta.user_defined_timestamps_persisted);
+    s = versions_->LogAndApply(cfd, ReadOptions(), WriteOptions(), &edit,
+                               &mutex_, directories_.GetDbDir());
+    if (!s.ok()) {
+      return s;
+    }
+
+    IOStatus remove_stage_copy =
+        fs_->DeleteFile(staged_file.path, IOOptions(), nullptr);
+    remove_stage_copy.PermitUncheckedError();
+    zigzag_staging_manager_->RemoveStagedFile(cfd->GetID(), source_level,
+                                              staged_file.file_number);
+    s = PersistZigZagStagingMetadata(cfd);
+    if (!s.ok()) {
+      return s;
+    }
+    ROCKS_LOG_BUFFER(log_buffer,
+                     "[%s] ZigZag flushed staged file %" PRIu64 " into L%d",
+                     cfd->GetName().c_str(), meta.fd.GetNumber(), target_level);
+    *flushed = true;
+    return Status::OK();
+  }
+
+  return Status::OK();
+}
+
+Status DBImpl::MaybeFlushAllZigZagStaging(ColumnFamilyData* cfd,
+                                          LogBuffer* log_buffer,
+                                          bool* flushed_any) {
+  *flushed_any = false;
+  if (zigzag_staging_manager_ == nullptr ||
+      !cfd->ioptions().zigzag_staging_enabled) {
+    return Status::OK();
+  }
+
+  const int min_source_level = cfd->ioptions().zigzag_staging_source_level;
+  const int max_source_level =
+      std::max(min_source_level,
+               std::min(cfd->ioptions().zigzag_staging_max_source_level,
+                        cfd->ioptions().num_levels - 2));
+
+  bool made_progress = false;
+  do {
+    made_progress = false;
+    for (int source_level = min_source_level; source_level <= max_source_level;
+         ++source_level) {
+      bool flushed = false;
+      Status s =
+          MaybeFlushZigZagStaging(cfd, source_level, log_buffer, &flushed);
+      if (!s.ok()) {
+        return s;
+      }
+      if (flushed) {
+        made_progress = true;
+        *flushed_any = true;
+      }
+    }
+  } while (made_progress);
+
+  return Status::OK();
+}
 
 bool DBImpl::EnoughRoomForCompaction(
     ColumnFamilyData* cfd, const std::vector<CompactionInputFiles>& inputs,
@@ -1560,6 +2238,38 @@ Status DBImpl::CompactFilesImpl(
 
   // deletion compaction currently not allowed in CompactFiles.
   assert(!c->deletion_compaction());
+
+  bool zigzag_compaction_released = false;
+  bool zigzag_staged = false;
+  bool zigzag_flushed = false;
+  s = MaybeZigZagStageCompaction(c.get(), job_context, log_buffer,
+                                 &zigzag_staged);
+  if (s.ok() && zigzag_staged) {
+    s = MaybeFlushAllZigZagStaging(c->column_family_data(), log_buffer,
+                                   &zigzag_flushed);
+    if (s.ok()) {
+      InstallSuperVersionAndScheduleWork(
+          c->column_family_data(), job_context->superversion_contexts.data());
+    }
+  }
+  if (zigzag_staged || !s.ok()) {
+    if (!zigzag_compaction_released) {
+      c->ReleaseCompactionFiles(s);
+      zigzag_compaction_released = true;
+    }
+    auto sfm = static_cast<SstFileManagerImpl*>(
+        immutable_db_options_.sst_file_manager.get());
+    if (sfm && sfm_reserved_compact_space) {
+      sfm->OnCompactionCompletion(c.get());
+    }
+    c.reset();
+    bg_compaction_scheduled_--;
+    if (bg_compaction_scheduled_ == 0) {
+      bg_cv_.SignalAll();
+    }
+    MaybeScheduleFlushOrCompaction();
+    return s;
+  }
 
   // Check if this can be a trivial move (metadata-only update)
   // Similar to the logic in DBImpl::BackgroundCompaction
@@ -3883,9 +4593,27 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
 
   IOStatus io_s;
   bool compaction_released = false;
+  bool zigzag_staged = false;
+  bool zigzag_flushed = false;
+  if (c != nullptr) {
+    status = MaybeZigZagStageCompaction(c.get(), job_context, log_buffer,
+                                        &zigzag_staged);
+    if (status.ok() && zigzag_staged) {
+      Status flush_s = MaybeFlushAllZigZagStaging(
+          c->column_family_data(), log_buffer, &zigzag_flushed);
+      if (!flush_s.ok()) {
+        status = flush_s;
+      } else {
+        InstallSuperVersionAndScheduleWork(
+            c->column_family_data(), job_context->superversion_contexts.data());
+      }
+    }
+  }
   if (!c) {
     // Nothing to do
     ROCKS_LOG_BUFFER(log_buffer, "Compaction nothing to do");
+  } else if (zigzag_staged) {
+    *made_progress = true;
   } else if (c->deletion_compaction()) {
     // TODO(icanadi) Do we want to honor snapshots here? i.e. not delete old
     // file if there is alive snapshot pointing to it

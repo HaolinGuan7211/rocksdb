@@ -1512,6 +1512,9 @@ db_sst_test: $(OBJ_DIR)/db/db_sst_test.o $(TEST_LIBRARY) $(LIBRARY)
 db_statistics_test: $(OBJ_DIR)/db/db_statistics_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+zigzag_staging_test: $(OBJ_DIR)/db/zigzag_staging_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_write_test: $(OBJ_DIR)/db/db_write_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

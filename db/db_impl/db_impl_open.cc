@@ -14,6 +14,7 @@
 #include "db/periodic_task_scheduler.h"
 #include "env/composite_env_wrapper.h"
 #include "file/filename.h"
+#include "file/file_util.h"
 #include "file/read_write_util.h"
 #include "file/sst_file_manager_impl.h"
 #include "file/writable_file_writer.h"
@@ -2539,6 +2540,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     impl->PrepopulateSeqnoToTimeMapping(preserve_info);
   }
 
+  if (s.ok() && recovery_ctx.is_new_db_) {
+    s = DestroyDir(impl->env_, impl->dbname_ + "/zigzag_stage");
+  }
+
   if (s.ok()) {
     // set column family handles
     for (const auto& cf : column_families) {
@@ -2551,6 +2556,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         SuperVersionContext sv_context(/* create_superversion */ true);
         impl->InstallSuperVersionForConfigChange(cfd, &sv_context);
         sv_context.Clean();
+        if (s.ok()) {
+          s = impl->RecoverZigZagStagingMetadata(cfd);
+        }
       } else {
         if (db_options.create_missing_column_families) {
           // missing column family, create it

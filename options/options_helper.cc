@@ -348,6 +348,14 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
       ioptions.persist_user_defined_timestamps;
   cf_opts->default_temperature = ioptions.default_temperature;
   cf_opts->cf_allow_ingest_behind = ioptions.cf_allow_ingest_behind;
+  cf_opts->zigzag_staging_enabled = ioptions.zigzag_staging_enabled;
+  cf_opts->zigzag_staging_source_level = ioptions.zigzag_staging_source_level;
+  cf_opts->zigzag_staging_max_source_level =
+      ioptions.zigzag_staging_max_source_level;
+  cf_opts->zigzag_staging_level_capacity_bytes =
+      ioptions.zigzag_staging_level_capacity_bytes;
+  cf_opts->zigzag_staging_partition_flush_threshold_bytes =
+      ioptions.zigzag_staging_partition_flush_threshold_bytes;
 
   // TODO(yhchiang): find some way to handle the following derived options
   // * max_file_size
